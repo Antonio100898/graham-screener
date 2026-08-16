@@ -1,0 +1,9 @@
+.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+dist/
+# build artifacts and data, all reproducible from `make build` / `make export`
+api/screener/static/ui/
+api/screener/static/dashboard.json
+*.db
