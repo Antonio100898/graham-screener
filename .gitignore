@@ -7,3 +7,6 @@ dist/
 api/screener/static/ui/
 api/screener/static/dashboard.json
 *.db
+*.png
+FINDINGS.md
+HOW-IT-WORKS.md
