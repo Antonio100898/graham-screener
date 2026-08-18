@@ -816,3 +816,117 @@ def test_a_dollar_total_tagged_as_earnings_per_share_is_discarded():
     s = build(gaap)
     assert s.annual_eps == {}
     assert s.ttm_eps is None
+
+
+def test_vintage_ttm_sees_only_what_was_filed():
+    from screener.normalize import vintage_ttm_eps
+    v = {d: float(x) for d, x in vintage_ttm_eps(GAAP).items()}
+    # end of 2025: FY2025's 10-K (filed Feb 2026) is future knowledge; the newest
+    # filed figure is FY2024, and Q1'25 has no prior-year comparative to roll with
+    assert v["2025-12-31"] == 5.0
+    # end of 2024: FY2023 stands at its ORIGINAL 4.0 — the 4.1 restatement was
+    # filed in 2025 and must be invisible a year earlier
+    assert v["2024-12-31"] == 4.0
+    assert v["2022-12-31"] == 3.0   # only the FY2021 10-K existed then
+    assert "2021-12-31" not in v    # nothing at all was filed yet
+
+
+REVENUE = [
+    # pre-606 element carries the old years, ending right where the new one begins
+    dur("2021-01-01", "2021-12-31", 140e9, accn="k21", filed="2022-02-15"),
+    dur("2022-01-01", "2022-12-31", 150e9, accn="k22", filed="2023-02-15"),
+    dur("2023-01-01", "2023-12-31", 160e9, accn="k23", filed="2024-02-15"),
+]
+REVENUE_606 = [
+    # ...and the ASC 606 element takes over without overlap
+    dur("2024-01-01", "2024-12-31", 180e9, accn="k24", filed="2025-02-15"),
+    dur("2025-01-01", "2025-12-31", 200e9, accn="k25", filed="2026-02-15"),
+    dur("2026-01-01", "2026-03-31", 60e9, form="10-Q", accn="q126", filed="2026-05-05"),
+    dur("2025-01-01", "2025-03-31", 40e9, form="10-Q", accn="q125", filed="2025-05-05"),
+]
+
+
+def test_revenue_series_survives_the_asc606_tag_switch():
+    gaap = dict(GAAP)
+    gaap["SalesRevenueNet"] = tagdata("USD", REVENUE)
+    gaap["RevenueFromContractWithCustomerExcludingAssessedTax"] = tagdata("USD", REVENUE_606)
+    s = build(gaap)
+    assert {y: f.value for y, f in s.annual_revenue.items()} == {
+        2021: 140e9, 2022: 150e9, 2023: 160e9, 2024: 180e9, 2025: 200e9,
+    }
+    # TTM = FY2025 + Q1'26 - Q1'25
+    assert s.ttm_revenue == Decimal("2.2E+11")
+
+
+def test_no_revenue_tags_leaves_revenue_empty():
+    s = build()
+    assert s.annual_revenue == {} and s.ttm_revenue is None
+
+
+def test_operating_income_annual_series():
+    gaap = dict(GAAP)
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 30e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 35e9, accn="k25", filed="2026-02-15"),
+    ])
+    s = build(gaap)
+    assert {y: f.value for y, f in s.annual_operating_income.items()} == {
+        2024: 30e9, 2025: 35e9,
+    }
+
+
+def test_dividend_record_streak_and_interruption():
+    gaap = dict(GAAP)
+    quarters = []
+    for year in (2020, 2021, 2023, 2024, 2025):     # skipped 2022 entirely
+        quarters.append(dur(f"{year}-01-01", f"{year}-03-31", 1e8, form="10-Q",
+                            accn=f"q{year}", filed=f"{year}-05-05"))
+    gaap["PaymentsOfDividendsCommonStock"] = tagdata("USD", quarters)
+    s = build(gaap)
+    assert s.dividend_record == {"first": 2020, "latest": 2025,
+                                 "streak_from": 2023, "paid_years": 5}
+
+
+def test_bvps_keeps_intangibles_that_tbvps_removes():
+    from screener.sync import _bvps, _tbvps
+    s = build()
+    # assets 1000 - liabilities 400 = 600 over 10B shares
+    assert _bvps(s) == 60.0
+    # tangible additionally sheds goodwill 50 and intangibles 30
+    assert _tbvps(s) == 52.0
+
+
+def test_revenue_fill_rejects_a_different_scope():
+    """ConAgra pattern: umbrella `Revenues` carries a $1.6B sub-scope while the
+    goods element holds the true $13B history — the small series must not fill."""
+    gaap = dict(GAAP)
+    gaap["RevenueFromContractWithCustomerExcludingAssessedTax"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 12e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 12.5e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["SalesRevenueGoodsNet"] = tagdata("USD", [
+        dur("2022-01-01", "2022-12-31", 13e9, accn="k22", filed="2023-02-15"),
+        dur("2023-01-01", "2023-12-31", 11e9, accn="k23", filed="2024-02-15"),
+    ])
+    gaap["Revenues"] = tagdata("USD", [   # wrong scope, an order of magnitude off
+        dur("2022-01-01", "2022-12-31", 1.6e9, accn="k22", filed="2023-02-15"),
+        dur("2021-01-01", "2021-12-31", 1.5e9, accn="k21", filed="2022-02-15"),
+    ])
+    s = build(gaap)
+    got = {y: f.value for y, f in s.annual_revenue.items()}
+    # goods element joins via the continuous 2023 boundary, then extends to 2022;
+    # the umbrella's 1.6B is 8x off its neighbour and 2021 never gets a foothold
+    assert got == {2022: 13e9, 2023: 11e9, 2024: 12e9, 2025: 12.5e9}
+
+
+def test_revenue_fill_refuses_a_disconnected_island():
+    gaap = dict(GAAP)
+    gaap["RevenueFromContractWithCustomerExcludingAssessedTax"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["SalesRevenueNet"] = tagdata("USD", [   # ends three years before the winner starts
+        dur("2020-01-01", "2020-12-31", 11e9, accn="k20", filed="2021-02-15"),
+    ])
+    s = build(gaap)
+    # no adjacent year to prove the scopes match, so the island stays out
+    assert sorted(s.annual_revenue) == [2025]

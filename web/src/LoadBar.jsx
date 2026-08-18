@@ -2,45 +2,50 @@ import { useEffect, useRef, useState } from "react";
 import { send } from "./api.js";
 
 // Each action touches exactly one stage of the pipeline; the labels say which.
+// Recomputation after an engine change has no button: it starts by itself the
+// moment the app notices snapshots below the current engine version.
 const ACTIONS = [
   {
     cmd: "bulk",
-    label: "Load all companies",
+    label: "Load all",
     sub: "every US filer, one download",
     hint: "Downloads SEC's complete 1.4 GB archive of every filer's financials, then screens them all. Do this once.",
     confirm:
       "Load every US filer from SEC?\n\n" +
       "• downloads a 1.4 GB archive\n• needs roughly 15 GB of disk\n• takes a while — you can Stop at any point\n\n" +
-      "Afterwards, 'Fetch new filings' keeps it current.",
+      "Afterwards, 'Fetch filings' keeps it current.",
     heavy: true,
   },
   {
     cmd: "daily",
-    label: "Fetch new filings",
+    label: "Fetch filings",
     sub: "only companies that filed",
     hint: "Reads SEC's daily index to see who filed a 10-K or 10-Q, and refetches only those companies.",
   },
   {
     cmd: "export",
-    label: "Refresh prices & table",
-    sub: "rebuilds what you see",
+    label: "Refresh prices",
+    sub: "rebuilds the table",
     hint: "Fetches current share prices, recomputes the valuation criteria, and rebuilds the table below.",
   },
-  {
-    cmd: "derive",
-    label: "Recompute",
-    sub: "after an engine update",
-    hint: "The screening logic changed since these results were computed. Re-runs the maths over data already on disk — no downloading.",
-    // only shown when snapshots predate the current engine; otherwise it is noise
-    onlyIfStale: true,
-  },
 ];
+
+// "3h ago" reads faster than a timestamp; the exact moment is in the tooltip
+function ago(iso) {
+  if (!iso) return "never";
+  const mins = Math.max(0, (Date.now() - new Date(iso)) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${Math.round(mins)}m ago`;
+  if (mins < 48 * 60) return `${Math.round(mins / 60)}h ago`;
+  return `${Math.round(mins / 1440)}d ago`;
+}
 
 export default function LoadBar({ onFinished, shown }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
   const [help, setHelp] = useState(false);
   const wasRunning = useRef(false);
+  const autoDerived = useRef(false);
 
   const poll = () =>
     fetch("/sync/status")
@@ -52,6 +57,15 @@ export default function LoadBar({ onFinished, shown }) {
           onFinished?.();
         }
         if (s.status === "running") wasRunning.current = true;
+        // engine moved since these snapshots were computed: recompute without
+        // being asked, once per page load so a failure cannot loop
+        if (!autoDerived.current && s.status !== "running" && (s.store?.stale ?? 0) > 0) {
+          autoDerived.current = true;
+          send("/sync", { body: { command: "derive" } }).then(() => {
+            wasRunning.current = true;
+            poll();
+          }).catch(() => {});
+        }
       })
       .catch(() => {});
 
@@ -81,10 +95,10 @@ export default function LoadBar({ onFinished, shown }) {
     <div className="loadbar">
       <div className="topline">
         <div className="actions">
-          {ACTIONS.filter((a) => !a.onlyIfStale || (st?.stale ?? 0) > 0).map((a) => (
+          {ACTIONS.map((a) => (
             <button key={a.cmd} onClick={() => run(a)} disabled={running} title={a.hint}
-                    className={a.heavy ? "heavy" : a.onlyIfStale ? "stale" : ""}>
-              <b>{a.label}{a.onlyIfStale ? ` (${st.stale.toLocaleString()})` : ""}</b>
+                    className={a.heavy ? "heavy" : ""}>
+              <b>{a.label}</b>
               <em>{a.sub}</em>
             </button>
           ))}
@@ -109,6 +123,19 @@ export default function LoadBar({ onFinished, shown }) {
       ) : (
         st && (
           <div className="coverage">
+            <span className="fresh">
+              <span title={st.last_fetch ?? "no fetch recorded"}>
+                filings fetched <b>{ago(st.last_fetch)}</b>
+              </span>
+              {" · "}
+              <span title={st.computed_at ?? "nothing computed"}>
+                computed <b>{ago(st.computed_at)}</b>
+              </span>
+              {" · "}
+              <span title={st.last_export ?? "no price refresh recorded"}>
+                prices <b>{ago(st.last_export)}</b>
+              </span>
+            </span>
             <span>
               <b>{st.snapshots.toLocaleString()}</b> of {st.companies.toLocaleString()} companies have
               financial data
@@ -147,8 +174,9 @@ export default function LoadBar({ onFinished, shown }) {
             anything missing a recent quarter".
           </p>
           <p className="dim">
-            To cover the whole market: <b>Load all companies</b> once, then <b>Refresh prices &amp;
-            table</b>. Afterwards <b>Fetch new filings</b> daily or weekly keeps it current.
+            To cover the whole market: <b>Load all</b> once, then <b>Refresh prices</b>.
+            Afterwards <b>Fetch filings</b> daily or weekly keeps it current. When the
+            screening engine itself changes, results are recomputed automatically.
           </p>
         </div>
       )}

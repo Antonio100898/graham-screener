@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from "react";
  *
  * options: [name, count][] — selected: Set — onChange(Set)
  */
-export default function MultiSelect({ label, options, selected, onChange, renderOption }) {
+export default function MultiSelect({ label, options, selected, onChange, renderOption, formatName }) {
   const [open, setOpen] = useState(false);
   const box = useRef(null);
 
@@ -33,7 +33,7 @@ export default function MultiSelect({ label, options, selected, onChange, render
     selected.size === 0
       ? "All"
       : selected.size === 1
-        ? [...selected][0]
+        ? (formatName ? formatName([...selected][0]) : [...selected][0])
         : `${selected.size} selected`;
 
   return (

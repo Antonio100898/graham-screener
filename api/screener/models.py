@@ -1,7 +1,7 @@
 """Shared data model. Decimal for all financial arithmetic; float never."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -105,6 +105,16 @@ class FinancialSnapshot:
     # criterion 1 can turn on a single non-recurring line, so they are surfaced
     earnings_quality: tuple[str, ...] = ()
     owner_earnings: OwnerEarnings | None = None
+    # "Dec 31" -> TTM EPS computable from facts FILED by that date, rebased onto
+    # today's share count; the hindsight-free denominator for historical P/E
+    ttm_eps_vintage: dict[str, Decimal] = field(default_factory=dict)
+    # chapter-13 comparison inputs: sales, operating income, dividend continuity
+    annual_revenue: dict[int, Fact] = field(default_factory=dict)
+    ttm_revenue: Decimal | None = None
+    annual_operating_income: dict[int, Fact] = field(default_factory=dict)
+    # {"first", "latest", "streak_from", "paid_years"} — calendar years with a
+    # positive common dividend; None when the record holds none
+    dividend_record: dict | None = None
 
 
 @dataclass(frozen=True)

@@ -2,11 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import Detail from "./Detail.jsx";
 import LoadBar from "./LoadBar.jsx";
 import MultiSelect from "./MultiSelect.jsx";
-import Trend, { trendOf } from "./Trend.jsx";
+import EarningsEvidence, { earningsQuality, epsEvidence } from "./EarningsEvidence.jsx";
 import { send } from "./api.js";
 import { below, spell } from "./format.js";
 import { loadView, saveView, takeOverScrollRestoration } from "./view.js";
-import { TOTAL_CRITERIA, byN, closeness, pe3, whyBlocked } from "./screen.js";
+import { TOTAL_CRITERIA, byN, pe3 } from "./screen.js";
+import { AlignmentCompact, alignmentRank } from "./Alignment.jsx";
 
 
 // OR semantics: any typed word matching any field keeps the row. Short and
@@ -27,7 +28,25 @@ function matcher(query) {
 
 // These columns sort best-first by negating their value, so ascending order puts the
 // largest at the top. The arrow must describe what the reader sees, not the sign.
-const DESCENDING_BY_DEFAULT = new Set(["n_pass", "mcap", "ni", "trend", "offhigh"]);
+const DESCENDING_BY_DEFAULT = new Set(["n_pass", "mcap", "ni", "trend", "offhigh", "eps10"]);
+const EPS_POSITIVE_FLOORS = [5, 6, 7, 9, 10];
+const LENSES = ["BOTH", "ENTERPRISING", "DEFENSIVE"];
+const FITS = ["ALL", "ALIGNED", "EVIDENCE_INCOMPLETE", "BLOCKED"];
+const PROFILE_NAMES = {
+  OPERATING: "Operating businesses", UTILITY: "Public utilities",
+  FINANCIAL: "Financials & real estate", SPECIAL: "Special structures",
+  REVIEW: "Manual review",
+};
+function enterprisingGap(row) {
+  const screen = row.alignment?.enterprising;
+  if (!screen || row.profile !== "OPERATING") return "OUT_OF_SCOPE";
+  if (screen.unknown > 0 || screen.verdict === "EVIDENCE_INCOMPLETE") return "INCOMPLETE";
+  const gaps = (screen.total ?? 0) - (screen.passed ?? 0);
+  if (gaps === 0) return "ALL_PASS";
+  if (gaps === 1) return "ONE_GAP";
+  if (gaps === 2) return "TWO_GAPS";
+  return "THREE_PLUS";
+}
 
 function Th({ id, sort, onSort, children, className = "" }) {
   const active = sort.key === id;
@@ -44,8 +63,9 @@ function Th({ id, sort, onSort, children, className = "" }) {
   );
 }
 
-const GRADES = ["NEAR-PASS", "CLOSE", "BLOCKED", "UNGRADEABLE"];
-const GRADE_RANK = Object.fromEntries(["PASSES", ...GRADES].map((g, i) => [g, i]));
+// narrowest first: 30 companies beat 500 beat ~100 beat every Nasdaq listing
+const INDEX_RANK = { "DJIA": 0, "S&P 500": 1, "Nasdaq 100": 2, "Nasdaq Comp": 3 };
+const INDEX_SHORT = { "DJIA": "DJIA", "S&P 500": "S&P", "Nasdaq 100": "N100", "Nasdaq Comp": "NDQ" };
 
 const saved = loadView();
 takeOverScrollRestoration();
@@ -54,14 +74,19 @@ export default function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [q, setQ] = useState(saved.q);
-  const [grades, setGrades] = useState(new Set(saved.grades));
-  const [sort, setSort] = useState(saved.sort);
+  const [lens, setLens] = useState(saved.lens);
+  const [fit, setFit] = useState(saved.fit);
+  const [gaps, setGaps] = useState(saved.gaps);
+  const [sort, setSort] = useState(["grade", "ptbv"].includes(saved.sort?.key) ? { key: "fit", dir: 1 } : saved.sort);
   const [sectors_, setSectors] = useState(new Set(saved.sectors));
+  const [profiles, setProfiles] = useState(new Set(saved.profiles));
+  const [idxSel, setIdxSel] = useState(new Set(saved.indexes));
   const [venues, setVenues] = useState(new Set(saved.venues));
   const [minCap, setMinCap] = useState(saved.minCap);   // micro caps are mostly noise here
   // criteria satisfied, 0 = no floor; a floor saved when the screen had more
   // criteria would now match nothing, so it is clamped to what exists today
   const [minMet, setMinMet] = useState(Math.min(saved.minMet, TOTAL_CRITERIA));
+  const [minPositiveEps, setMinPositiveEps] = useState(saved.minPositiveEps);
   const [minRoic, setMinRoic] = useState(saved.minRoic); // return on capital, 0 = no floor
   const [selected, setSelected] = useState(null);
   const [tracked, setTracked] = useState(new Set());
@@ -82,10 +107,11 @@ export default function App() {
 
   useEffect(() => {
     saveView({
-      q, grades: [...grades], sectors: [...sectors_], venues: [...venues],
-      minCap, minMet, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort,
+      q, lens, fit, gaps, sectors: [...sectors_], profiles: [...profiles], venues: [...venues],
+      indexes: [...idxSel],
+      minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort,
     });
-  }, [q, grades, sectors_, venues, minCap, minMet, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort]);
+  }, [q, lens, fit, gaps, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort]);
 
   useEffect(() => {
     const onScroll = () => saveView({ scroll: window.scrollY });
@@ -125,24 +151,24 @@ export default function App() {
   const rows = useMemo(() => {
     if (!data) return [];
     return data.rows.map((r) => {
-      const g = closeness(r);
-      const blocked = whyBlocked(r);
+      const quality = earningsQuality(r.annual_eps, r.annual_net_income);
       return {
-        ...r, grade: g.label, gradeNote: g.note, blocked,
+        ...r,
         mcap: r.price && r.shares ? r.price * r.shares : null,
-        trend: trendOf(r.annual_eps, r.ttm_eps),
+        eps10: epsEvidence(r.annual_eps),
+        quality,
         // any criterion we could not decide either way leaves the verdict incomplete
         unjudged: r.criteria.some((c) => c.status !== "PASS" && c.status !== "FAIL"),
         // criteria 2 and 3 cannot be asked of a filer with no classified balance
         // sheet — unlike a missing figure, no later filing will ever supply it
         inapplicable: r.criteria.some((c) => c.status === "NOT_APPLICABLE"),
         netNet: r.ncavps != null && r.price != null && r.ncavps > 0 && r.price <= r.ncavps,
+        idx: r.index_memberships ?? [],
         pe3: pe3(r),
         roic: r.owner_earnings?.roic ?? null,
-        niTrend: trendOf(r.annual_net_income, r.ttm_net_income),
-        // searched fields, flattened once: ticker, name, both sector levels,
-        // the plain-English blocker, and the grade itself
-        hay: [r.ticker, r.name, r.sector, r.industry, r.exchange, blocked, g.label]
+        profile: r.graham_profile ?? "REVIEW",
+        // searched fields, flattened once: ticker, name, sector, and issuer profile
+        hay: [r.ticker, r.name, r.sector, r.industry, r.exchange, r.graham_profile]
           .filter(Boolean).join(" ").toLowerCase(),
       };
     });
@@ -150,13 +176,35 @@ export default function App() {
 
   const view = useMemo(() => {
     const match = matcher(q);
-    let out = rows.filter((r) => grades.size === 0 || grades.has(r.grade));
+    let out = rows;
+    if (profiles.size) out = out.filter((r) => profiles.has(r.profile));
+    if (lens !== "BOTH") {
+      const key = lens.toLowerCase();
+      // Selecting one lens also hides companies to which that historical method
+      // does not apply; their valuation evidence remains available under Both.
+      out = out.filter((r) => r.alignment?.[key]?.verdict !== "OUT_OF_SCOPE");
+    }
+    if (fit !== "ALL") {
+      const key = lens === "BOTH" ? null : lens.toLowerCase();
+      out = out.filter((r) => key
+        ? r.alignment?.[key]?.verdict === fit
+        : [r.alignment?.enterprising?.verdict, r.alignment?.defensive?.verdict].includes(fit));
+    }
+    // Gaps are meaningful only for Chapter 15's industrial direct tests.
+    if (lens === "ENTERPRISING" && gaps !== "ALL")
+      out = out.filter((r) => enterprisingGap(r) === gaps);
     if (sectors_.size) out = out.filter((r) => sectors_.has(r.sector ?? "Unclassified"));
     if (venues.size) out = out.filter((r) => venues.has(r.exchange));
+    if (idxSel.size)
+      out = out.filter((r) =>
+        r.idx.some((m) => idxSel.has(m)) || (idxSel.has("Outside") && r.idx.length === 0));
     // a company with no price or no share count cannot be sized, so a floor excludes it
     if (minCap) out = out.filter((r) => (r.mcap ?? 0) >= minCap);
     if (trackedOnly) out = out.filter((r) => tracked.has(r.cik));
     if (minMet) out = out.filter((r) => r.n_pass >= minMet);
+    // Uses the same completed FY(L-9)..FY(L) evidence window shown in the table.
+    // Missing years stay missing; they are never silently filled with zero.
+    if (minPositiveEps) out = out.filter((r) => r.eps10?.positive >= minPositiveEps);
     // a company whose return on capital could not be computed cannot clear a floor
     if (minRoic) out = out.filter((r) => r.roic != null && r.roic >= minRoic);
     if (hideNoApply) out = out.filter((r) => !r.inapplicable);
@@ -167,9 +215,10 @@ export default function App() {
     // null means "no value" — never a number. Returning Infinity here would park
     // those rows at the top as soon as the sort flipped to descending.
     const val = (r) => {
-      if (key === "grade") return GRADE_RANK[r.grade] ?? 99;
+      if (key === "fit") return alignmentRank(r, lens);
       if (key === "ticker") return r.ticker ?? "";
       if (key === "sector") return r.sector ?? null;
+      if (key === "index") return r.idx.length ? INDEX_RANK[r.idx[0]] ?? 8 : 9;
       if (key === "name") return r.name ?? "";
       if (key === "n_pass") return -r.n_pass;
       if (key === "pe") return byN(r, 1).value ?? null;
@@ -178,17 +227,13 @@ export default function App() {
       if (key === "offhigh")
         return r.price_stats?.pct_below_52w_high == null
           ? null : -r.price_stats.pct_below_52w_high;
-      if (key === "ptbv") return byN(r, 7).value ?? null;
       if (key === "price") return r.price ?? null;
       if (key === "mcap") return r.mcap == null ? null : -r.mcap;
-      if (key === "ni") {
-        if (!r.niTrend) return null;
-        return r.niTrend.change == null ? -r.niTrend.ups : -r.niTrend.change;
-      }
-      // sort by the real 8-year path, not the two endpoints the growth note compares
-      if (key === "trend") {
-        if (!r.trend) return null;
-        return r.trend.change == null ? -r.trend.ups : -r.trend.change;
+      if (key === "eps10") {
+        // The column is sorted by the visible positive-year count, not by its
+        // separate Graham growth calculation.  A negative value puts the most
+        // positive years first on the initial descending-style sort.
+        return r.eps10 ? -r.eps10.positive : null;
       }
       return 0;
     };
@@ -202,8 +247,11 @@ export default function App() {
       const cmp = typeof x === "string" ? x.localeCompare(y) : x - y;
       return cmp * dir || (a.ticker ?? "").localeCompare(b.ticker ?? "");
     });
-  }, [rows, q, grades, sort, sectors_, venues, minCap, minMet, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
+  }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
 
+  const positiveEpsCounts = useMemo(() => Object.fromEntries(
+    EPS_POSITIVE_FLOORS.map((floor) => [floor, rows.filter((r) => r.eps10?.positive >= floor).length])
+  ), [rows]);
   const naCount = useMemo(() => rows.filter((r) => r.unjudged).length, [rows]);
   const netNetCount = useMemo(() => rows.filter((r) => r.netNet).length, [rows]);
   const noApplyCount = useMemo(() => rows.filter((r) => r.inapplicable).length, [rows]);
@@ -224,10 +272,24 @@ export default function App() {
     });
     return Object.entries(c).sort((a, b) => b[1] - a[1]);
   }, [rows]);
+  const profileCounts = useMemo(() => {
+    const c = {};
+    rows.forEach((r) => (c[r.profile] = (c[r.profile] ?? 0) + 1));
+    return Object.entries(c).sort((a, b) => a[0].localeCompare(b[0]));
+  }, [rows]);
   const exchanges = useMemo(() => {
     const c = {};
     rows.forEach((r) => r.exchange && (c[r.exchange] = (c[r.exchange] ?? 0) + 1));
     return Object.entries(c).sort((a, b) => b[1] - a[1]);
+  }, [rows]);
+  const indexCounts = useMemo(() => {
+    const c = { Outside: 0 };
+    rows.forEach((r) => {
+      if (!r.idx.length) c.Outside += 1;
+      r.idx.forEach((m) => (c[m] = (c[m] ?? 0) + 1));
+    });
+    return Object.entries(c)
+      .sort((a, b) => (INDEX_RANK[a[0]] ?? 9) - (INDEX_RANK[b[0]] ?? 9));
   }, [rows]);
 
   // a search that hits nothing inside the active filters, but matches elsewhere,
@@ -237,11 +299,6 @@ export default function App() {
     return match ? match(rows).length : 0;
   }, [rows, q]);
 
-  const gradeCounts = useMemo(() => {
-    const c = {};
-    rows.forEach((r) => (c[r.grade] = (c[r.grade] ?? 0) + 1));
-    return GRADES.map((g) => [g, c[g] ?? 0]);
-  }, [rows]);
 
   if (error)
     return (
@@ -258,36 +315,15 @@ export default function App() {
 
   const sortBy = (key) =>
     setSort((s) => ({ key, dir: s.key === key ? -s.dir : 1 }));
-  const toggleGrade = (g) =>
-    setGrades((s) => {
-      const n = new Set(s);
-      n.has(g) ? n.delete(g) : n.add(g);
-      return n;
-    });
 
   return (
     <div className="app">
       <header>
         <div>
-          <h1>Graham Enterprising Screener</h1>
+          <h1>Graham Screener</h1>
           <p className="sub">
-            {rows.length.toLocaleString()} companies · engine v{data.engine_version} · generated{" "}
-            {data.generated?.slice(0, 16).replace("T", " ")}
+            {rows.length.toLocaleString()} companies · enterprising and defensive evidence · engine v{data.engine_version}
           </p>
-          {(data.indexes?.sp500 || data.indexes?.nasdaq) && (
-            <p className="sub" title="Median of price ÷ trailing-twelve-month EPS across index members. Loss-makers have no P/E and are left out — the counts say how many members carried one.">
-              Median P/E
-              {data.indexes.sp500 && (
-                <> · S&amp;P 500 <b>{data.indexes.sp500.median_pe}</b>
-                  <span className="dim"> ({data.indexes.sp500.n} of {data.indexes.sp500.members})</span></>
-              )}
-              {data.indexes.nasdaq && (
-                <> · Nasdaq <b>{data.indexes.nasdaq.median_pe}</b>
-                  <span className="dim"> ({data.indexes.nasdaq.n} of {data.indexes.nasdaq.members})</span></>
-              )}
-            </p>
-          )}
-          <IndexHistory indexes={data.indexes} />
         </div>
         <div className="searchwrap">
         <input
@@ -306,15 +342,48 @@ export default function App() {
 
       <LoadBar onFinished={load} shown={rows.length} />
 
-      <div className="filters">
-        <MultiSelect label="How close" options={gradeCounts} selected={grades} onChange={setGrades} />
+      <div className="filters graham-controls">
+        <select className="mincap lens" value={lens} onChange={(e) => setLens(e.target.value)}
+                title="Choose which Graham framework to use for the alignment view and ranking.">
+          <option value="BOTH">Graham lens: Both</option>
+          <option value="ENTERPRISING">Graham lens: Enterprising</option>
+          <option value="DEFENSIVE">Graham lens: Defensive</option>
+        </select>
+        {lens === "ENTERPRISING" && <select className="mincap lens" value={gaps} onChange={(e) => setGaps(e.target.value)}
+          title="A research filter for operating companies only. It counts measured gaps in the six direct Enterprising tests.">
+          <option value="ALL">Any Enterprising gaps</option>
+          <option value="ALL_PASS">All 6 direct tests</option>
+          <option value="ONE_GAP">One measured gap</option>
+          <option value="TWO_GAPS">Two measured gaps</option>
+          <option value="INCOMPLETE">Incomplete evidence</option>
+        </select>}
+        <select className="mincap lens" value={fit} onChange={(e) => setFit(e.target.value)}
+                title="Filter by the selected framework's alignment status. Under Both, a company is kept if either framework has that status.">
+          <option value="ALL">Any alignment evidence</option>
+          <option value="ALIGNED">Aligned only</option>
+          <option value="EVIDENCE_INCOMPLETE">Evidence incomplete</option>
+          <option value="BLOCKED">Blocked by a measured test</option>
+        </select>
+        <MultiSelect label="Applicability" options={profileCounts} selected={profiles} onChange={setProfiles}
+          formatName={(profile) => PROFILE_NAMES[profile] ?? profile}
+          renderOption={(profile) => PROFILE_NAMES[profile] ?? profile} />
         <MultiSelect label="Sector" options={sectorCounts} selected={sectors_} onChange={setSectors} />
         <MultiSelect label="Exchange" options={exchanges} selected={venues} onChange={setVenues} />
+        <MultiSelect label="Index" options={indexCounts} selected={idxSel} onChange={setIdxSel} />
         <select className="mincap" value={minMet} onChange={(e) => setMinMet(Number(e.target.value))}>
           <option value={0}>Any criteria met</option>
           {[...Array(4)].map((_, i) => TOTAL_CRITERIA - i).map((n) => (
             <option key={n} value={n}>
               {n}/{TOTAL_CRITERIA} and above{metCounts[n] ? ` (${metCounts[n].toLocaleString()})` : ""}
+            </option>
+          ))}
+        </select>
+        <select className="mincap" value={minPositiveEps} onChange={(e) => setMinPositiveEps(Number(e.target.value))}
+                title="Keeps companies with at least the chosen count of positive annual EPS observations in the completed FY(L-9)..FY(L) window. Missing years do not count as positive.">
+          <option value={0}>Any 10Y positive EPS count</option>
+          {EPS_POSITIVE_FLOORS.map((floor) => (
+            <option key={floor} value={floor}>
+              {floor}+ positive EPS years{positiveEpsCounts[floor] ? ` (${positiveEpsCounts[floor].toLocaleString()})` : ""}
             </option>
           ))}
         </select>
@@ -351,9 +420,9 @@ export default function App() {
                 onClick={() => setTrackedOnly((v) => !v)}>
           ★ Tracked <span className="count">{tracked.size}</span>
         </button>
-        {(grades.size > 0 || sectors_.size > 0 || venues.size > 0 || minMet > 0 || minRoic > 0 || hideNA || !hideNoApply || belowNcav) && (
+        {(lens !== "BOTH" || fit !== "ALL" || gaps !== "ALL" || profiles.size > 0 || sectors_.size > 0 || venues.size > 0 || idxSel.size > 0 || minMet > 0 || minPositiveEps > 0 || minRoic > 0 || hideNA || !hideNoApply || belowNcav) && (
           <button className="chip clear" onClick={() => {
-            setGrades(new Set()); setSectors(new Set()); setVenues(new Set()); setMinMet(0); setMinRoic(0); setHideNA(false); setHideNoApply(true); setBelowNcav(false);
+            setLens("BOTH"); setFit("ALL"); setGaps("ALL"); setProfiles(new Set()); setSectors(new Set()); setVenues(new Set()); setIdxSel(new Set()); setMinMet(0); setMinPositiveEps(0); setMinRoic(0); setHideNA(false); setHideNoApply(true); setBelowNcav(false);
           }}>clear all</button>
         )}
         <span className="showing">
@@ -368,20 +437,19 @@ export default function App() {
             <Th id="ticker" sort={sort} onSort={sortBy}>Ticker</Th>
             <Th id="name" sort={sort} onSort={sortBy}>Company</Th>
             <Th id="sector" sort={sort} onSort={sortBy}>Sector</Th>
-            <Th id="grade" sort={sort} onSort={sortBy}>How close</Th>
-            <Th id="n_pass" sort={sort} onSort={sortBy}>Met</Th>
-            <Th id="ni" sort={sort} onSort={sortBy}>Net income<em className="sub2">5-year shape</em></Th>
-            <Th id="trend" sort={sort} onSort={sortBy}>EPS trend</Th>
+            <Th id="fit" sort={sort} onSort={sortBy}>Graham fit<em className="sub2">E · D</em></Th>
+            <Th id="index" sort={sort} onSort={sortBy}>Index</Th>
+            <Th id="eps10" sort={sort} onSort={sortBy}>10Y EPS evidence<em className="sub2">positive years · growth</em></Th>
+            <th>Earnings quality<em className="sub2">exception only</em></th>
             <Th id="mcap" sort={sort} onSort={sortBy} className="num">Mkt cap</Th>
             <Th id="price" sort={sort} onSort={sortBy} className="num">Price</Th>
             <Th id="offhigh" sort={sort} onSort={sortBy} className="num">
-              Off high<em className="sub2">52w · 5y</em>
+              Off high<em className="sub2">52w · 3y</em>
             </Th>
             <Th id="pe" sort={sort} onSort={sortBy} className="num">P/E</Th>
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
-            <Th id="ptbv" sort={sort} onSort={sortBy} className="num">P/TBV</Th>
           </tr>
         </thead>
         <tbody>
@@ -397,7 +465,6 @@ export default function App() {
               </td>
               <td className="tick" data-label="Ticker">
                 {r.ticker}
-                {r.earnings_quality?.length ? <span className="warn" title="earnings caveats">⚠</span> : null}
                 {r.netNet && (
                   <span className="netnetmark" title="trading at or below net current asset value">
                     net-net
@@ -405,20 +472,21 @@ export default function App() {
                 )}
               </td>
               <td className="name" data-label="Company">{r.name}</td>
-              <td className="sector" data-label="Sector" title={r.industry ?? ""}>{r.sector ?? "—"}{r.exchange === "OTC" && <span className="otc">OTC</span>}</td>
-              <td data-label="How close">
-                <span className={`chip sm ${r.grade.toLowerCase()} ${r.unknownCount ? "partial" : ""}`}
-                      title={r.gradeNote}>
-                  {r.grade}
-                  {r.unknownCount > 0 && <sup className="unk">?{r.unknownCount}</sup>}
-                </span>
+              <td className="sector" data-label="Sector" title={r.industry ?? ""}>
+                <span className={`profile-mini ${r.profile.toLowerCase()}`}>{r.graham_profile_meta?.short ?? r.profile}</span>
+                <span className="sector-name">{r.sector ?? "Unclassified"}</span>
+                {r.exchange === "OTC" && <span className="otc">OTC</span>}
               </td>
-              <td className="num" data-label="Met">{r.n_pass}/{TOTAL_CRITERIA}</td>
-              <td data-label="Net income" title={niTitle(r)}>
-                <Trend trend={r.niTrend} format={(v) => fmtCap(v)} />
-                {divergence(r) && <span className="diverge">{divergence(r)}</span>}
+              <td data-label="Graham fit"><AlignmentCompact row={r} /></td>
+              <td className="idxcell" data-label="Index" title={r.idx.join(" · ") || "not in a tracked index"}>
+                {r.idx.length
+                  ? r.idx.map((m) => <span key={m} className="idxbadge">{INDEX_SHORT[m] ?? m}</span>)
+                  : <span className="dim">—</span>}
               </td>
-              <td data-label="EPS trend"><Trend trend={r.trend} /></td>
+              <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
+              <td data-label="Earnings quality">
+                {r.quality ? <span className="earnings-quality" title={r.quality.title}>YES</span> : <span className="dim">—</span>}
+              </td>
               <td className="num" data-label="Mkt cap">{fmtCap(r.mcap)}</td>
               <td className="num" data-label="Price">{fmtPrice(r.price)}</td>
               <td className="num offhigh" data-label="Off high" title={drawdownTitle(r)}>
@@ -427,7 +495,7 @@ export default function App() {
                 ) : (
                   <>
                     <b>{below(r.price_stats.pct_below_52w_high)}</b>
-                    <span className="dim"> · {below(r.price_stats.pct_below_5y_high)}</span>
+                    <span className="dim"> · {below(r.price_stats.pct_below_3y_high)}</span>
                   </>
                 )}
               </td>
@@ -436,7 +504,6 @@ export default function App() {
                   title="current price over the average of the three latest annual EPS — one lucky or disastrous year moves it a third as much as it moves the TTM P/E">
                 {fmt(r.pe3)}
               </td>
-              <td className="num" data-label="P/TBV">{fmt(byN(r, 7).value)}</td>
             </tr>
           ))}
         </tbody>
@@ -445,7 +512,7 @@ export default function App() {
         <p className="msg">
           No match inside the current filters, but <b>{matchesAnywhere.toLocaleString()}</b>{" "}
           elsewhere.{" "}
-          <button className="linkish" onClick={() => { setGrades(new Set()); setSectors(new Set()); setVenues(new Set()); }}>
+          <button className="linkish" onClick={() => { setGaps("ALL"); setSectors(new Set()); setVenues(new Set()); }}>
             search everything
           </button>
         </p>
@@ -461,39 +528,6 @@ export default function App() {
 }
 
 const fmt = (v) => (v == null ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
-
-function IndexHistory({ indexes }) {
-  const sp = indexes?.sp500?.history, nq = indexes?.nasdaq?.history;
-  if (!sp && !nq) return null;
-  const years = [...new Set([...(sp ?? []), ...(nq ?? [])].map((h) => h.year))].sort();
-  const at = (hist, y) => hist?.find((h) => h.year === y) ?? {};
-  const pct = (v) => (v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`);
-  return (
-    <table className="idxhist"
-           title={"Median across today's members (past years carry survivorship bias)."
-             + "\nΔ price — the member's price change over that calendar year; the current year runs to the live quote."
-             + "\nP/E — December's last close over the annual EPS reported for that fiscal year; loss-makers excluded. The current year has no closed annual figure yet."}>
-      <thead>
-        <tr><th></th><th colSpan={2}>S&amp;P 500</th><th colSpan={2}>Nasdaq</th></tr>
-        <tr><th></th><th>Δ price</th><th>P/E</th><th>Δ price</th><th>P/E</th></tr>
-      </thead>
-      <tbody>
-        {years.map((y) => {
-          const s = at(sp, y), n = at(nq, y);
-          return (
-            <tr key={y}>
-              <td>{y}{(s.ytd || n.ytd) ? " YTD" : ""}</td>
-              <td className={s.ret < 0 ? "neg" : ""}>{pct(s.ret)}</td>
-              <td>{s.pe ?? "—"}</td>
-              <td className={n.ret < 0 ? "neg" : ""}>{pct(n.ret)}</td>
-              <td>{n.pe ?? "—"}</td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
-  );
-}
 
 // penny stocks rounded to 2dp all read "$0.00", which looks like missing data
 const fmtPrice = (v) => {
@@ -530,9 +564,8 @@ export function drawdownTitle(r) {
     `${p.pct_below_52w_high}% below the 52-week high`,
     `${p.pct_above_52w_low}% above the 52-week low`,
     `${p.pct_below_3y_high}% below the 3-year high`,
-    `${p.pct_below_5y_high}% below the 5-year high`,
+    `${p.pct_vs_3y_average >= 0 ? "+" : ""}${p.pct_vs_3y_average}% versus the 3-year average (${fmtPrice(p.average_3y)})`,
     `${p.price_to_3y_median}× the 3-year median price`,
-    `last at its 5-year peak ${spell(p.drawdown_weeks)} ago`,
     "\nweekly closing prices — a high here is the best weekly close, not an intraday spike",
   ].join("\n");
 }

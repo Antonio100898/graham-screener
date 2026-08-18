@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 27  # price-history statistics are about price alone; EPS filing dates dropped
+ENGINE_VERSION = 33  # displayed two-decimal defensive valuation boundary
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 
@@ -149,11 +149,17 @@ def put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
     )
 
 
+# a filer with no XBRL on SEC's side has nothing a recompute could read — only a
+# refetch can change it, so it never counts as "stale under the current engine"
+_UNRECOMPUTABLE = "('no_xbrl')"
+
+
 def needs_recompute(conn) -> list[str]:
     """Companies whose derived snapshot predates the current engine — recomputed
     from stored raw facts, never refetched."""
     rows = conn.execute(
-        "SELECT cik FROM snapshot WHERE engine_version < ?", (ENGINE_VERSION,)
+        f"SELECT cik FROM snapshot WHERE engine_version < ? AND status NOT IN {_UNRECOMPUTABLE}",
+        (ENGINE_VERSION,),
     ).fetchall()
     return [r["cik"] for r in rows]
 
@@ -260,7 +266,8 @@ def stats(conn) -> dict:
         "snapshots": q("SELECT COUNT(*) FROM snapshot"),
         "ok": q("SELECT COUNT(*) FROM snapshot WHERE status='ok'"),
         "stale": conn.execute(
-            "SELECT COUNT(*) FROM snapshot WHERE engine_version < ?", (ENGINE_VERSION,)
+            f"SELECT COUNT(*) FROM snapshot WHERE engine_version < ? "
+            f"AND status NOT IN {_UNRECOMPUTABLE}", (ENGINE_VERSION,)
         ).fetchone()[0],
         "pending_refetch": q(
             """SELECT COUNT(*) FROM company WHERE last_filing IS NOT NULL
@@ -268,6 +275,11 @@ def stats(conn) -> dict:
         "last_daily_index": get_state(conn, "last_daily_index"),
         "price_histories": q("SELECT COUNT(*) FROM price_history"),
         "engine_version": ENGINE_VERSION,
+        # freshness for the UI: when filings were last fetched, when the newest
+        # snapshot was computed, when prices/dashboard were last rebuilt
+        "last_fetch": q("SELECT MAX(facts_synced) FROM company"),
+        "computed_at": q("SELECT MAX(computed_at) FROM snapshot"),
+        "last_export": get_state(conn, "last_export"),
     }
 
 

@@ -41,6 +41,9 @@ def test_a_live_quote_above_every_close_is_a_new_high_not_a_negative_distance():
     """The quote is this week's price, so it belongs inside the range it is
     measured against — otherwise a stock making a new high reads as -3% below it."""
     s = compute(series([10, 20, 30]), Decimal("40"))
+    assert s["high_52w"] == Decimal("40.00")
+    assert s["average_3y"] == Decimal("20.00")
+    assert s["pct_vs_3y_average"] == Decimal("100.00")
     assert s["pct_below_52w_high"] == Decimal("0.00")
     assert s["pct_below_5y_high"] == Decimal("0.00")
     assert s["drawdown_weeks"] == 0

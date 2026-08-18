@@ -55,7 +55,9 @@ def compute(closes: tuple[tuple[date, Decimal], ...], price: Decimal) -> dict | 
     end = closes[-1][0]
     w52, w3y, w5y = (_window(closes, end, n * _YEAR) for n in (1, 3, 5))
     low52 = min(min(w52), price) if w52 else None
+    high52 = max(max(w52), price) if w52 else None
     median3y = median(w3y) if w3y else None
+    average3y = sum(w3y, Decimal(0)) / len(w3y) if w3y else None
 
     # a price at a new high has no drawdown to date, whatever the closes say
     peak = max(((d, c) for d, c in closes if d >= end - timedelta(days=5 * _YEAR)),
@@ -63,13 +65,20 @@ def compute(closes: tuple[tuple[date, Decimal], ...], price: Decimal) -> dict | 
     peak_date = end if price >= peak[1] else peak[0]
 
     return {
+        "high_52w": high52.quantize(_CENT) if high52 is not None else None,
         "pct_below_52w_high": _below_high(price, w52),
         # a stock pinned to its low has not begun to recover; one far above it has
         "pct_above_52w_low": _pct((price - low52) / low52 * 100)
                              if low52 and low52 > 0 else None,
         "pct_below_3y_high": _below_high(price, w3y),
         "pct_below_5y_high": _below_high(price, w5y),
-        # the median refuses to be impressed by one irrational peak
+        # The average provides the requested current-versus-three-year reference;
+        # it is contextual market history, never a Graham pass/fail input.
+        "average_3y": average3y.quantize(_CENT) if average3y is not None else None,
+        "pct_vs_3y_average": _pct((price - average3y) / average3y * 100)
+                              if average3y and average3y > 0 else None,
+        # The median remains available for tooltip context because it refuses to
+        # be impressed by one irrational peak.
         "price_to_3y_median": _pct(price / median3y)
                               if median3y and median3y > 0 else None,
         # weeks since the last time the price stood at its five-year best: a

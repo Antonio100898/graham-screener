@@ -24,6 +24,15 @@ def test_price_settles_valuation_criteria():
     assert r["verdict"] == "FAIL"
 
 
+def test_live_price_removes_obsolete_missing_price_quote_note():
+    r = row(ttm=5.0, tbvps=None)
+    r["criteria"][-1]["note"] = "missing: intangibles, price quote"
+    out = apply_price(r, price=40.0)
+    c7 = {x["n"]: x for x in out["criteria"]}[7]
+    assert c7["status"] == "INSUFFICIENT_DATA"
+    assert c7["note"] == "missing: intangibles"
+
+
 def test_every_criterion_passing_gives_pass_verdict():
     r = apply_price(row(ttm=5.0, tbvps=40.0), price=40.0)  # P/E 8, P/TBV 1.0
     assert r["n_pass"] == 6
@@ -140,54 +149,29 @@ def test_track_and_untrack(tmp_path):
     assert store.untrack(conn, "0000000001") is False    # already gone
 
 
-def test_median_pe_excludes_loss_makers_and_discloses_counts():
-    from screener.sync import _median_pe
-    rows = [
-        {"price": 100.0, "ttm_eps": 10.0},   # P/E 10
-        {"price": 100.0, "ttm_eps": 5.0},    # P/E 20
-        {"price": 100.0, "ttm_eps": 2.0},    # P/E 50
-        {"price": 100.0, "ttm_eps": -3.0},   # loss — no P/E
-        {"price": None, "ttm_eps": 4.0},     # unpriced — no P/E
-    ]
-    stats = _median_pe(rows)
-    assert stats == {"median_pe": 20.0, "n": 3, "members": 5}
-    assert _median_pe([{"price": None, "ttm_eps": None}]) is None
-    # even count averages the middle pair
-    assert _median_pe(rows[:2])["median_pe"] == 15.0
+def test_index_membership_parsers():
+    from screener.sources.indexes import djia_ciks, nasdaq100, sp500
+    row = ('<tr><td><a href="/wiki/Comp_{i}">C{i}</a></td>'
+           '<td>000000{i:04d}\n</td></tr>')
+    sp_html = ('<table id="constituents">'
+               + "".join(row.format(i=i) for i in range(1, 502)) + "</table>")
+    sp = sp500(sp_html)
+    assert len(sp) == 500 and sp["0000000002"] == "Comp_2"  # first row is the header
+    # under ~480 rows means the page layout broke — refuse, never half an index
+    assert sp500('<table id="constituents"><tr><td>x</td></tr></table>') is None
 
+    cells = "".join(f'<td><a href="/wiki/Comp_{i}">Company {i}</a> ↑ </td>' for i in range(2, 32))
+    dj_html = f'<table class="wikitable"><tr>{cells}</tr></table>'
+    dj = djia_ciks(sp, dj_html)
+    assert len(dj) == 30 and "0000000030" in dj
+    # a footnote cell with extra prose must not add a 31st member
+    noisy = dj_html.replace("</table>",
+        '<tr><td>spun off <a href="/wiki/Comp_99">Company 99</a> in 2023</td></tr></table>')
+    assert djia_ciks(sp, noisy) == dj
 
-def test_sp500_parser_reads_only_the_constituents_table():
-    from screener.sources.indexes import parse_sp500_ciks
-    cell = "<tr><td>MMM</td><td>0000{i:06d}</td></tr>"
-    rows = "".join(cell.format(i=i) for i in range(1, 502))
-    html = f'<table>>9999999999<</table><table id="constituents">{rows}</table>'
-    ciks = parse_sp500_ciks(html)
-    assert len(ciks) == 501 and "0000000001" in ciks and "9999999999" not in ciks
-    # a broken layout must return None, never a half-parsed index
-    assert parse_sp500_ciks("<p>no table</p>") is None
-    assert parse_sp500_ciks('<table id="constituents"><td>0000000001</td></table>') is None
-
-
-def test_index_history_medians_returns_and_year_end_pe():
-    from datetime import date
-    from screener.sync import _index_history
-    closes = {
-        # doubles every year: Dec closes 10, 20, 40; live price 60 mid-2024
-        "A": [(date(2021, 12, 27), 10.0), (date(2022, 12, 26), 20.0),
-              (date(2023, 12, 25), 40.0), (date(2024, 6, 3), 55.0)],
-        # flat at 100
-        "B": [(date(2021, 12, 27), 100.0), (date(2022, 12, 26), 100.0),
-              (date(2023, 12, 25), 100.0), (date(2024, 6, 3), 100.0)],
-    }
-    rows = [
-        {"cik": "A", "price": 60.0, "annual_eps": {"2021": 1.0, "2022": 2.0, "2023": -1.0}},
-        {"cik": "B", "price": 100.0, "annual_eps": {"2021": 10.0, "2022": 5.0, "2023": 4.0}},
-    ]
-    hist = {h["year"]: h for h in _index_history(rows, closes)}
-    y22, y23, y24 = hist[2022], hist[2023], hist[2024]
-    assert y22["ret"] == 50.0 and y22["ret_n"] == 2          # median of +100% and 0%
-    assert y22["pe"] == 15.0 and y22["pe_n"] == 2            # median of 20/2 and 100/5
-    assert y23["pe"] == 25.0 and y23["pe_n"] == 1            # A's loss year excluded
-    assert y24["ytd"] and y24["ret"] == 25.0                 # to live quote: +50% and 0%
-    assert y24["pe"] is None                                 # no December close yet
-    assert 2021 in hist and hist[2021]["ret"] is None        # no 2020 base in a 5y series
+    def tick(i):
+        return f"T{chr(65 + i // 26)}{chr(65 + i % 26)}"
+    n_html = ('<table id="constituents">'
+              + "".join(f'<tr><td>{tick(i)}</td><td><a href="/wiki/X">X</a></td></tr>'
+                        for i in range(102)) + "</table>")
+    assert len(nasdaq100(n_html)) == 101  # first row is the header

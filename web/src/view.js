@@ -5,11 +5,16 @@ const KEY = "screener-view";
 
 const DEFAULTS = {
   q: "",
-  grades: ["NEAR-PASS", "CLOSE"],
+  gaps: "ALL",
+  lens: "BOTH",
+  fit: "ALL",
+  profiles: [],
   sectors: [],
   venues: [],
+  indexes: [],
   minCap: 500e6,
   minMet: 0,
+  minPositiveEps: 0,
   minRoic: 0,
   trackedOnly: false,
   hideNA: false,
@@ -17,7 +22,7 @@ const DEFAULTS = {
   // balance sheet, so these companies are unreachable rather than merely unmeasured
   hideNoApply: true,
   belowNcav: false,
-  sort: { key: "grade", dir: 1 },
+  sort: { key: "fit", dir: 1 },
   scroll: 0,
 };
 

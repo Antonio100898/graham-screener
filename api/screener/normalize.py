@@ -34,6 +34,13 @@ EPS_TAGS = (
 # Last resort per missing year only. Basic >= diluted, so it flatters EPS slightly —
 # but a year dropped entirely is worse: it staled the whole series and the TTM anchor.
 EPS_BASIC_TAGS = ("EarningsPerShareBasic", "IncomeLossFromContinuingOperationsPerBasicShare")
+_WEIGHTED_SHARE_TAGS = (
+    "WeightedAverageNumberOfDilutedSharesOutstanding",
+    "WeightedAverageNumberOfSharesOutstandingBasic",
+    "WeightedAverageNumberOfBasicAndDilutedSharesOutstanding",
+    "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+    "WeightedAverageNumberOfSharesIssuedBasic",
+)
 # EPS moves when the share count moves, so the numerator is carried separately:
 # a company can grow EPS on buybacks alone while earnings are flat or falling.
 NET_INCOME_TAGS = (
@@ -41,6 +48,29 @@ NET_INCOME_TAGS = (
     "NetIncomeLossAvailableToCommonStockholdersBasic",
     "ProfitLoss",                                           # includes noncontrolling interests
 )
+# ASC 606 (2018) moved most filers from the SalesRevenue* elements onto
+# RevenueFromContractWithCustomer*, so nearly every mature series switches tags
+# mid-history — selection must be recency-first with per-year fill, like EPS.
+REVENUE_TAGS = (
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",                                             # umbrella total, incl. non-contract
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "SalesRevenueNet",                                      # pre-606
+    "SalesRevenueGoodsNet",
+    "SalesRevenueServicesNet",
+    # sector top lines — for REITs, utilities, banks and insurers the generic
+    # elements above are absent or carry sub-scope scraps (Camden's `Revenues`
+    # is $13M against $1.5B of lease income)
+    "RegulatedAndUnregulatedOperatingRevenue",
+    "OperatingLeaseLeaseIncome",
+    "OperatingLeasesIncomeStatementLeaseRevenue",
+    "RealEstateRevenueNet",
+    "RevenuesNetOfInterestExpense",
+    "InterestAndDividendIncomeOperating",
+    "PremiumsEarnedNet",
+)
+# Banks and insurers have no operating-income subtotal; absent stays absent.
+OPERATING_INCOME_TAGS = ("OperatingIncomeLoss",)
 DIVIDEND_TAGS = (
     ("PaymentsOfDividendsCommonStock", ("USD",)),
     ("DividendsCommonStockCash", ("USD",)),
@@ -110,6 +140,8 @@ def build_snapshot(
     ttm_eps, ttm_inputs = _ttm_eps(gaap, annual_eps)
     annual_net_income = _annual_net_income(gaap)
     ttm_net_income, _ = _ttm_eps(gaap, annual_net_income, unit=("USD",), per_share=False)
+    annual_revenue = _annual_revenue(gaap)
+    ttm_revenue, _ = _ttm_eps(gaap, annual_revenue, unit=("USD",), per_share=False)
 
     # LiabilitiesAndStockholdersEquity equals total assets by the accounting identity,
     # so it both stands in for an untagged Assets total and keeps the staleness
@@ -212,6 +244,11 @@ def build_snapshot(
         ttm_net_income=ttm_net_income,
         ttm_eps=ttm_eps,
         ttm_eps_inputs=ttm_inputs,
+        ttm_eps_vintage=vintage_ttm_eps(gaap),
+        annual_revenue=annual_revenue,
+        ttm_revenue=ttm_revenue,
+        annual_operating_income=_annual_operating_income(gaap),
+        dividend_record=_dividend_record(gaap),
         current_assets=current_assets,
         current_liabilities=current_liabilities,
         long_term_debt=long_term_debt,
@@ -520,24 +557,94 @@ def _fill_missing_years(series: dict[int, Fact], gaap: dict) -> dict[int, Fact]:
     return dict(sorted(series.items()))
 
 
-def _annual_net_income(gaap: dict) -> dict[int, Fact]:
-    """Filers switch net-income elements the same way they switch EPS elements —
+def _annual_dollar_series(gaap: dict, tags: tuple[str, ...]) -> dict[int, Fact]:
+    """Filers switch elements mid-history the same way they switch EPS elements —
     Advanced Energy's NetIncomeLoss series stops in 2024 while ProfitLoss runs on.
     Taking the first tag that returns anything would freeze the series a year back,
     so candidates are ranked by recency, then by depth, then by tag preference."""
     candidates = [
         (tag, series)
-        for tag in NET_INCOME_TAGS
+        for tag in tags
         if (series := _annual_series(gaap, tag, unit=("USD",)))
     ]
     if not candidates:
         return {}
-    order = {tag: i for i, tag in enumerate(NET_INCOME_TAGS)}
+    order = {tag: i for i, tag in enumerate(tags)}
     _, best = max(candidates, key=lambda c: (max(c[1]), len(c[1]), -order[c[0]]))
     for _, other in candidates:                      # fill gaps the winner lacks
         for fy, fact in other.items():
             best.setdefault(fy, fact)
     return dict(sorted(best.items()))
+
+
+def _annual_net_income(gaap: dict) -> dict[int, Fact]:
+    return _annual_dollar_series(gaap, NET_INCOME_TAGS)
+
+
+# staying on one element tolerates real business swings (Carnival's COVID
+# collapse and 6x recovery are one tag's honest numbers); moving to a different
+# element demands tight agreement, because elements differ in SCOPE and a large
+# step at a boundary is a scope mismatch, not history
+_SAME_TAG_RATIO = (Decimal(1) / 10, Decimal(10))
+_SWITCH_RATIO = (Decimal(1) / 3, Decimal(3))
+
+
+def _annual_revenue(gaap: dict) -> dict[int, Fact]:
+    """The revenue series is STITCHED, not merged: revenue elements carry wildly
+    different scopes (ConAgra's umbrella `Revenues` holds a $1.6B sub-item beside
+    $13B of true sales; Westlake's own `Revenues` changes meaning mid-history), so
+    every year must prove continuity with the year it joins. The walk starts from
+    the top line's latest year and extends one year at a time; a year no element
+    can prove is where the series honestly ends."""
+    candidates = [
+        (tag, series)
+        for tag in REVENUE_TAGS
+        if (series := _annual_series(gaap, tag, unit=("USD",)))
+    ]
+    if not candidates:
+        return {}
+    order = {tag: i for i, tag in enumerate(REVENUE_TAGS)}
+    # top-line pick: among elements current within a year of the freshest, a series
+    # whose latest value is under half the biggest is a sub-scope scrap, not revenue
+    latest_fy = max(max(s) for _, s in candidates)
+    pool = [(t, s) for t, s in candidates if max(s) >= latest_fy - 1]
+    peak = max((float(s[max(s)].value) for _, s in pool if s[max(s)].value > 0), default=0)
+    strong = [(t, s) for t, s in pool if float(s[max(s)].value) >= peak / 2] or pool
+    tag0, s0 = max(strong, key=lambda c: (max(c[1]), len(c[1]), -order[c[0]]))
+    start = max(s0)
+    chosen: dict[int, Fact] = {start: s0[start]}
+    by_tag = dict(candidates)
+
+    def _fits(v, ref, span) -> bool:
+        return v > 0 and ref > 0 and span[0] <= v / ref <= span[1]
+
+    for step in (-1, 1):                    # backward through history, then forward
+        cur, ref_fy = tag0, start
+        y = start + step
+        floor, ceil = min(min(s) for _, s in candidates), max(max(s) for _, s in candidates)
+        while floor <= y <= ceil:
+            ref = chosen[ref_fy].value
+            same = by_tag[cur].get(y)
+            if same is not None and abs(ref_fy - y) <= 3 \
+                    and _fits(same.value, ref, _SAME_TAG_RATIO):
+                chosen[y] = same
+            else:
+                for tag, s in candidates:
+                    f = s.get(y)
+                    if tag != cur and f is not None and abs(ref_fy - y) <= 2 \
+                            and _fits(f.value, ref, _SWITCH_RATIO):
+                        chosen[y] = f
+                        cur = tag
+                        break
+                else:
+                    break                    # nothing can prove this year: stop
+            ref_fy = y
+            y += step
+    return dict(sorted(chosen.items()))
+
+
+def _annual_operating_income(gaap: dict) -> dict[int, Fact]:
+    return _annual_dollar_series(gaap, OPERATING_INCOME_TAGS)
 
 
 def _latest_annual_end(annual_eps: dict[int, Fact]) -> date | None:
@@ -610,6 +717,52 @@ def _ttm_eps(gaap: dict, annual_eps: dict[int, Fact],
         return latest.value, (latest,)
     value = latest.value + delta
     return value, (latest, _fact(tag, tag, cur), _fact(tag, tag, prior))
+
+
+# the vintage runs only walk the EPS chains and the share-comparability guard,
+# so only those tags need their history rewound
+_VINTAGE_TAGS = frozenset(EPS_TAGS + EPS_BASIC_TAGS + (EPS_CONTINUING_TAG,) + _WEIGHTED_SHARE_TAGS)
+
+
+def _filed_by(gaap: dict, cutoff: str) -> dict:
+    """The filer's EPS-related facts as the record stood on `cutoff` — everything
+    filed later removed, so restatements and splits are invisible until filed."""
+    cut = {}
+    for tag in _VINTAGE_TAGS:
+        data = gaap.get(tag)
+        if not data:
+            continue
+        units = {u: kept for u, entries in data.get("units", {}).items()
+                 if (kept := [e for e in entries if e.get("filed", "") <= cutoff])}
+        if units:
+            cut[tag] = {**data, "units": units}
+    return cut
+
+
+def vintage_ttm_eps(gaap: dict) -> dict[str, Decimal]:
+    """TTM EPS as it was knowable at each of the last six December 31sts: the
+    ordinary composite, run only on facts FILED by that date. No look-ahead —
+    a 10-K published in February was not knowledge the previous December.
+
+    Each figure is then rebased onto today's share count (splits filed after the
+    cutoff divided out), because the price series it will be divided into is
+    split-adjusted to today as well."""
+    newest = max((e["filed"] for tag in EPS_TAGS + EPS_BASIC_TAGS + (EPS_CONTINUING_TAG,)
+                  for e in _entries(gaap, tag, ("USD/shares",)) if e.get("filed")),
+                 default=None)
+    if newest is None:
+        return {}
+    periods = _per_share_periods(gaap)
+    out: dict[str, Decimal] = {}
+    for year in range(int(newest[:4]) - 6, int(newest[:4])):
+        iso = f"{year}-12-31"
+        cut = _filed_by(gaap, iso)
+        ttm, _ = _ttm_eps(cut, _annual_eps(cut))
+        if ttm is None:
+            continue
+        factor = _split_factor(periods, iso) if periods else Decimal(1)
+        out[iso] = ttm / factor
+    return out
 
 
 def _duration_fact(gaap: dict, tag: str, start: str, end: str, unit=("USD",)) -> Decimal | None:
@@ -724,11 +877,7 @@ def _shares_incomparable(gaap: dict, cur: dict, prior: dict) -> bool:
     # hard-coded diluted tag and gave up. Every other extractor here walks a chain; this
     # one now does too, and both legs must come from the same tag or the comparison is
     # between two different measures rather than two periods.
-    for tag in ("WeightedAverageNumberOfDilutedSharesOutstanding",
-                "WeightedAverageNumberOfSharesOutstandingBasic",
-                "WeightedAverageNumberOfBasicAndDilutedSharesOutstanding",
-                "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
-                "WeightedAverageNumberOfSharesIssuedBasic"):
+    for tag in _WEIGHTED_SHARE_TAGS:
         counts = [_duration_fact(gaap, tag, e["start"], e["end"], unit=("shares",))
                   for e in (cur, prior)]
         if all(c is not None and c > 0 for c in counts):
@@ -1191,6 +1340,29 @@ def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None) 
     if shares is None or shares.value <= 0:
         return None
     return ttm / shares.value
+
+
+def _dividend_record(gaap: dict) -> dict | None:
+    """Which calendar years the filer actually paid a common dividend, from the
+    chained tags' own facts. XBRL history only begins around 2009-2011, so the
+    start of the record is part of the answer: "paid since 2011" can mean "paid
+    for longer than the record can show" — display must say when the record begins."""
+    paid: set[int] = set()
+    for tag, unit in DIVIDEND_TAGS:
+        for e in _entries(gaap, tag, unit):
+            if "start" in e and e.get("form", "").startswith(("10-K", "10-Q")) \
+                    and _dec(e["val"]) > 0:
+                paid.add(int(e["end"][:4]))
+    if not paid:
+        return None
+    years = sorted(paid)
+    streak_from = years[-1]
+    for y in reversed(years[:-1]):
+        if y != streak_from - 1:
+            break
+        streak_from = y
+    return {"first": years[0], "latest": years[-1],
+            "streak_from": streak_from, "paid_years": len(years)}
 
 
 def _dividend(gaap: dict, reference: date | None) -> tuple[bool | None, Fact | None]:

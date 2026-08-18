@@ -101,8 +101,9 @@ def _c1_earnings_valuation(s: FinancialSnapshot, q: Quote | None) -> CriterionRe
     if s.ttm_eps <= 0:
         return CriterionResult(1, name, Status.FAIL, None, threshold, s.ttm_eps_inputs,
                                note="TTM EPS non-positive; P/E undefined")
+    # Decide with raw Decimal values. A rounded display ratio must never flip a pass.
     pe = (q.price / s.ttm_eps).quantize(_CENT)
-    status = Status.PASS if pe < PE_MAX else Status.FAIL
+    status = Status.PASS if q.price < PE_MAX * s.ttm_eps else Status.FAIL
     return CriterionResult(1, name, status, pe, threshold, s.ttm_eps_inputs)
 
 
@@ -118,7 +119,8 @@ def _c2_liquidity(s: FinancialSnapshot) -> CriterionResult:
                                (s.current_assets, s.current_liabilities),
                                note="non-positive current liabilities reported; ratio undefined")
     ratio = (s.current_assets.value / s.current_liabilities.value).quantize(_CENT)
-    status = Status.PASS if ratio >= CURRENT_RATIO_MIN else Status.FAIL
+    status = (Status.PASS if s.current_assets.value >= CURRENT_RATIO_MIN * s.current_liabilities.value
+              else Status.FAIL)
     return CriterionResult(2, name, status, ratio, threshold, (s.current_assets, s.current_liabilities))
 
 
@@ -157,21 +159,23 @@ def _c3_debt(s: FinancialSnapshot) -> CriterionResult:
 
 
 def _c4_earnings_stability(s: FinancialSnapshot) -> CriterionResult:
-    name, threshold = "Earnings stability", "EPS > 0 in each of the past 5 fiscal years"
+    name, threshold = "Earnings stability", "EPS >= 0 in each of the past 5 fiscal years"
     if not s.annual_eps:
         return CriterionResult(4, name, Status.INSUFFICIENT_DATA, None, threshold, (),
                                note="no annual EPS available")
     latest = max(s.annual_eps)
     window = range(latest - 4, latest + 1)
     present = [y for y in window if y in s.annual_eps]
-    losses = [y for y in present if s.annual_eps[y].value <= 0]
+    # Chapter 15 says "no deficit". A zero year is not a deficit; a product that
+    # wants a stricter positive-EPS adaptation can layer it separately.
+    losses = [y for y in present if s.annual_eps[y].value < 0]
     facts = tuple(s.annual_eps[y] for y in present)
     # A loss already in the window settles it: the years we are missing cannot
     # undo one that happened. Only an unbroken run of profits can be incomplete.
     if losses:
         return CriterionResult(
             4, name, Status.FAIL, min(f.value for f in facts), threshold, facts,
-            note="non-positive EPS in FY " + ", ".join(map(str, losses))
+            note="negative EPS in FY " + ", ".join(map(str, losses))
             + (f" (only {len(present)} of 5 years on file)" if len(present) < 5 else ""))
     missing = [y for y in window if y not in s.annual_eps]
     if missing:
@@ -227,7 +231,7 @@ def _eps_growth(s: FinancialSnapshot) -> EpsGrowth | None:
 
 
 def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> CriterionResult:
-    name, threshold = "Tangible-asset valuation", "Price <= 1.20 x TBVPS"
+    name, threshold = "Tangible-asset valuation", "Price < 1.20 x TBVPS"
     required = {
         "total assets": s.total_assets,
         "total liabilities": s.total_liabilities,
@@ -279,7 +283,8 @@ def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> Crite
         notes.insert(0, "non-positive tangible book value")
         return CriterionResult(7, name, Status.FAIL, None, threshold, inputs,
                                note="; ".join(notes))
+    # "Less than 120%" is strict. Compare raw inputs, not the rounded reader value.
     ratio = (q.price / tbvps).quantize(_CENT)
-    status = Status.PASS if ratio <= PRICE_TO_TBV_MAX else Status.FAIL
+    status = Status.PASS if q.price < PRICE_TO_TBV_MAX * tbvps else Status.FAIL
     return CriterionResult(7, name, status, ratio, threshold, inputs,
                            note="; ".join(notes) or None)

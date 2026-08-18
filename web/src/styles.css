@@ -19,11 +19,6 @@ header { display: flex; justify-content: space-between; align-items: flex-start;
   gap: 20px; border-bottom: 2px solid var(--accent); padding-bottom: 12px; }
 h1 { font-size: 19px; margin: 0; letter-spacing: -.3px; }
 .sub { color: var(--dim); font-size: 12px; margin: 3px 0 0; }
-.idxhist { border-collapse: collapse; margin-top: 8px; font-size: 11px; color: var(--dim); }
-.idxhist th { font-weight: 600; text-align: right; padding: 1px 0 1px 14px; }
-.idxhist td { text-align: right; padding: 1px 0 1px 14px; font-variant-numeric: tabular-nums; }
-.idxhist td:first-child, .idxhist th:first-child { text-align: left; padding-left: 0; }
-.idxhist .neg { color: var(--fail); }
 .search { padding: 7px 11px; border: 1px solid var(--line); border-radius: 7px;
   background: var(--soft); color: var(--ink); font-size: 13px; min-width: 260px; }
 .filters { display: flex; gap: 8px; align-items: center; margin: 12px 0 8px; flex-wrap: wrap; }
@@ -55,6 +50,10 @@ table.grid { width: 100%; border-collapse: collapse; font-size: 12px; }
 .why { color: var(--dim); font-size: 11px; max-width: 300px; }
 .warn { color: var(--insuf); margin-left: 4px; }
 .dim { color: var(--dim); }
+.idxcell { white-space: nowrap; }
+.idxbadge { display: inline-block; font-size: 9.5px; font-weight: 700; letter-spacing: .3px;
+  color: var(--dim); border: 1px solid var(--line); border-radius: 3px;
+  padding: 0 3px; margin-right: 3px; }
 .msg { padding: 40px 22px; color: var(--dim); }
 .msg.err, .err { color: var(--fail); }
 code { background: var(--soft); padding: 2px 6px; border-radius: 4px; }
@@ -228,11 +227,11 @@ tr.istracked td { background: color-mix(in srgb, var(--insuf-bg) 35%, transparen
 @media (max-width: 1150px) {
   td.name, .grid th:nth-child(3) { display: none; }
   /* the price-range column is context; the detail panel still carries all of it */
-  td.offhigh, .grid th:nth-child(12) { display: none; }
+  td.offhigh, .grid th:nth-child(11) { display: none; }
 }
 
 
-/* Phone and small tablet: a 13-column table cannot shrink, so each company becomes
+/* Phone and small tablet: a 12-column table cannot shrink, so each company becomes
    a card. Everything that made cells wide on desktop — nowrap, fixed max-widths,
    table layout — has to be undone, or the card overflows the screen. */
 @media (max-width: 860px) {
@@ -297,7 +296,177 @@ th.ttmcol { color: var(--accent); }
 sup.unk { font-size: 9px; margin-left: 3px; font-weight: 800; cursor: help; }
 
 .kv b.ok { color: var(--pass); }
+.ch13 .grp td { padding-top: 12px; font-weight: 700; font-size: 10.5px; letter-spacing: .4px;
+  text-transform: uppercase; color: var(--dim); border-bottom: none; }
+.ch13 b.ok { color: var(--pass); }
+.ch13 .neg { color: var(--fail); }
 
 .chip.netnet.on { background: var(--pass-bg); color: var(--pass); border-color: var(--pass); }
 .netnetmark { background: var(--pass-bg); color: var(--pass); font-size: 8px; font-weight: 800;
   padding: 1px 4px; border-radius: 3px; margin-left: 5px; letter-spacing: .3px; }
+
+/* Graham framework lens: profile eligibility belongs ahead of raw ratios so the
+   table cannot imply a bank and an industrial received the same screen. */
+.filters.graham-controls { padding: 8px 10px; background: color-mix(in srgb, var(--soft) 78%, var(--accent) 4%);
+  border: 1px solid var(--line); border-radius: 8px; }
+.mincap.lens { font-weight: 700; color: var(--accent); }
+.profile-mini { display: inline-block; min-width: 43px; margin-right: 5px; padding: 1px 4px;
+  border-radius: 3px; font-size: 8.5px; font-weight: 800; letter-spacing: .3px; text-align: center;
+  background: var(--soft); color: var(--dim); border: 1px solid var(--line); }
+.profile-mini.operating, .profile-pill.operating { background: var(--pass-bg); color: var(--pass); border-color: var(--pass); }
+.profile-mini.utility, .profile-pill.utility { background: #e8f1ff; color: #175da8; border-color: #77a8dd; }
+.profile-mini.financial, .profile-pill.financial { background: #f2ebff; color: #6d42a0; border-color: #b494dc; }
+.profile-mini.special, .profile-pill.special { background: var(--fail-bg); color: var(--fail); border-color: var(--fail); }
+.profile-mini.review, .profile-pill.review { background: var(--na-bg); color: var(--na); border-color: var(--na); }
+.sector-name { vertical-align: middle; }
+.align-compact { display: flex; gap: 5px; white-space: nowrap; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.align-compact span { border: 1px solid var(--line); background: var(--soft); border-radius: 3px; padding: 1px 4px; color: var(--dim); }
+.align-compact b { color: var(--ink); }
+.alignment-panel { margin: 14px 0 8px; padding: 10px 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 8px; }
+.profile-line { display: flex; align-items: flex-start; gap: 8px; font-size: 11.5px; }
+.profile-line p { margin: 2px 0 0; color: var(--dim); font-size: 10.5px; line-height: 1.35; }
+.profile-pill { display: inline-block; flex: 0 0 auto; padding: 3px 6px; border: 1px solid var(--line);
+  border-radius: 4px; font-size: 9px; font-weight: 800; letter-spacing: .35px; }
+.alignment-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.alignment-card { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--bg); }
+.alignment-card header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;
+  color: var(--dim); font-size: 9.5px; text-transform: uppercase; letter-spacing: .45px; }
+.alignment-card strong { display: block; font-size: 12px; }
+.alignment-card p { margin: 4px 0 0; font-size: 10px; color: var(--dim); line-height: 1.35; }
+.align-status { font-size: 8.5px; font-weight: 800; letter-spacing: .25px; }
+.align-status.aligned { color: var(--pass); }
+.align-status.blocked { color: var(--fail); }
+.align-status.evidence_incomplete { color: var(--insuf); }
+.align-status.out_of_scope { color: var(--na); }
+.growth-note { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--line); font-size: 10px; color: var(--dim); }
+.growth-note.pass { color: var(--pass); }
+.growth-note.fail { color: var(--fail); }
+@media (max-width: 620px) {
+  .alignment-cards { grid-template-columns: 1fr; }
+  .profile-line { align-items: flex-start; }
+}
+
+/* Clean company drawer: facts first, then the two Graham frameworks. */
+.clean-detail { width: min(720px, 96vw); }
+.detail-head { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; padding-right: 32px; }
+.detail-head .sub { margin-top: 4px; }
+.snapshot-section { margin: 16px 0 20px; }
+.snapshot-section h3, .criteria-title h3 { margin: 0; color: var(--ink); font-size: 12px; text-transform: none; letter-spacing: 0; }
+.snapshot-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--line); }
+.metric { min-height: 58px; padding: 9px 10px; background: var(--bg); display: flex; flex-direction: column; gap: 4px; }
+.metric span { color: var(--dim); font-size: 10px; line-height: 1.15; }
+.metric em { display: block; margin-top: 2px; color: var(--dim); font-size: 8.5px; font-style: normal; }
+.metric b { font-size: 13px; font-variant-numeric: tabular-nums; }
+.metric b.ok { color: var(--pass); }
+.criteria-section { margin-top: 20px; }
+.criteria-title { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; margin-bottom: 7px; }
+.criteria-title p { max-width: 540px; margin: 3px 0 0; color: var(--dim); font-size: 10.5px; line-height: 1.35; }
+.criteria-clean { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; font-size: 11px; }
+.criteria-clean th { padding: 6px 8px; background: var(--soft); color: var(--dim); border-bottom: 1px solid var(--line); text-align: left;
+  font-size: 9px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase; }
+.criteria-clean td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.criteria-clean tbody tr:last-child td { border-bottom: none; }
+.criteria-clean td:first-child { width: 29%; }
+.criteria-clean td.rule { width: 28%; color: var(--dim); font-size: 10px; }
+.criteria-clean small { display: block; margin-top: 2px; color: var(--dim); font-size: 9px; line-height: 1.25; }
+.criterion-status { white-space: nowrap; font-size: 9px; font-weight: 800; letter-spacing: .3px; }
+.criterion-status.pass, .criterion-status.aligned { color: var(--pass); }
+.criterion-status.fail, .criterion-status.blocked { color: var(--fail); }
+.criterion-status.insufficient_data, .criterion-status.evidence_incomplete { color: var(--insuf); }
+.criterion-status.not_applicable, .criterion-status.out_of_scope { color: var(--na); }
+.criteria-note { margin: 7px 1px 0; color: var(--dim); font-size: 10px; }
+.criteria-note .criterion-status { margin-left: 5px; }
+@media (max-width: 620px) {
+  .snapshot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .criteria-clean thead { display: none; }
+  .criteria-clean, .criteria-clean tbody, .criteria-clean tr, .criteria-clean td { display: block; width: 100%; box-sizing: border-box; }
+  .criteria-clean tr { position: relative; padding: 8px 86px 8px 10px; border-bottom: 1px solid var(--line); }
+  .criteria-clean tbody tr:last-child { border-bottom: none; }
+  .criteria-clean td { padding: 0; border: none; }
+  .criteria-clean td.rule { width: auto; margin-top: 2px; }
+  .criteria-clean td.num { margin-top: 4px; text-align: left; font-weight: 700; }
+  .criteria-clean td:last-child { position: absolute; top: 9px; right: 10px; width: auto; }
+}
+
+/* Ten completed fiscal years of Graham evidence: green means the complete
+   record is positive and clears the 33⅓% three-year-average growth threshold. */
+.eps-evidence { display: inline-flex; align-items: center; gap: 5px; min-width: 170px; font-variant-numeric: tabular-nums; }
+.eps-evidence svg { flex: 0 0 auto; overflow: visible; }
+.eps-proof { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.05; font-size: 10px; }
+.eps-proof b.ok, .eps-growth.ok { color: var(--pass); }
+.eps-proof em { color: var(--dim); font-size: 8px; font-style: normal; }
+.eps-growth { min-width: 38px; color: var(--dim); font-size: 10px; text-align: right; }
+.earnings-quality { display: inline-block; border: 1px solid var(--insuf); border-radius: 3px; padding: 2px 4px;
+  color: var(--fail); background: var(--fail-bg); font-size: 10px; font-weight: 800; letter-spacing: .35px; white-space: nowrap; }
+@media (max-width: 1150px) {
+  .grid th:nth-child(9), .grid td:nth-child(9) { display: none; }
+}
+@media (max-width: 860px) {
+  .eps-evidence { min-width: 0; }
+}
+
+/* Readability scale: intentionally larger than the original dense research UI. */
+html { font-size: 18px; }
+body { font-size: 16px; line-height: 1.45; }
+header h1 { font-size: 30px; }
+.sub { font-size: 14px; }
+.search, input, select, button { font-size: 14px; }
+.searchhint, .showing, .storeinfo, .msg, .help, .coverage { font-size: 13px; }
+.chip { font-size: 12px; padding: 5px 13px; }
+.chip.sm { font-size: 11px; padding: 3px 9px; }
+.mincap, .ms-btn { font-size: 13px; padding: 6px 11px; }
+.ms-label { font-size: 11px; }
+.ms-caret { font-size: 10px; }
+.ms-actions button, .ms-list label, .ms-count { font-size: 12px; }
+.ms-list label { padding: 7px 11px; }
+table.grid { font-size: 14px; }
+.grid th { font-size: 11px; padding: 8px 9px; }
+.grid td { padding: 8px 9px; }
+.name, td.sector { font-size: 12px; }
+.idxbadge, .profile-mini, .otc, .netnetmark { font-size: 10px; }
+.align-compact { font-size: 12px; }
+.sub2 { font-size: 9.5px; }
+.star-btn { font-size: 18px; }
+.eps-proof, .eps-growth { font-size: 11px; }
+.eps-proof em { font-size: 9px; }
+.earnings-quality { font-size: 10px; }
+
+.detail { padding: 24px 28px 64px; }
+.detail h2 { font-size: 25px; }
+.detail h3 { font-size: 13px; }
+.detail .sub, .note { font-size: 14px; }
+.profile-pill { font-size: 10px; }
+.snapshot-section h3, .criteria-title h3 { font-size: 15px; }
+.criteria-title p { font-size: 12px; }
+.metric { min-height: 68px; padding: 11px 12px; }
+.metric span { font-size: 12px; }
+.metric em { font-size: 10px; }
+.metric b { font-size: 16px; }
+.criteria-clean { font-size: 13px; }
+.criteria-clean th { font-size: 10px; padding: 8px 9px; }
+.criteria-clean td { padding: 9px; }
+.criteria-clean td.rule, .criteria-clean small { font-size: 11px; }
+.criterion-status { font-size: 10px; }
+.criteria-note { font-size: 12px; }
+
+/* The requested numeric history remains compact but comfortably readable. */
+.annual-history { margin-top: 24px; }
+.annual-history-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.annual-history-table { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+.annual-history-table th { padding: 9px 10px; background: var(--soft); border-bottom: 1px solid var(--line); text-align: left; color: var(--dim); font-size: 10px; letter-spacing: .4px; text-transform: uppercase; }
+.annual-history-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); }
+.annual-history-table tbody tr:last-child td { border-bottom: none; }
+.annual-history-table tr.loss { background: color-mix(in srgb, var(--fail-bg) 32%, transparent); }
+.annual-history-table tr:hover { background: var(--soft); }
+
+@media (max-width: 860px) {
+  html { font-size: 17px; }
+  .app { padding: 16px 14px 48px; }
+  header h1 { font-size: 26px; }
+  .detail { padding: 20px 16px 52px; }
+  .snapshot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .criteria-clean { font-size: 13px; }
+  .criteria-clean tr { padding: 10px 98px 10px 12px; }
+  .criteria-clean td.rule, .criteria-clean small { font-size: 11px; }
+}

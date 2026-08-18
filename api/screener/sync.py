@@ -26,12 +26,12 @@ from pathlib import Path
 
 import httpx
 
-from . import pricestats, store
+from . import ch13, pricestats, profiles, store
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
                                    evaluate)
+from .sources import indexes
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError
-from .sources.indexes import sp500_ciks
 from .sources.prices import YahooPriceProvider
 
 BULK_FACTS_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip"
@@ -63,6 +63,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
         "verdict": r.verdict.value,
         "n_pass": sum(1 for c in r.criteria if c.status.value == "PASS"),
         "ttm_eps": float(snap.ttm_eps) if snap.ttm_eps is not None else None,
+        "ttm_eps_vintage": {d: float(v) for d, v in snap.ttm_eps_vintage.items()},
         "balance_sheet_date": snap.balance_sheet_date.isoformat() if snap.balance_sheet_date else None,
         "annual_eps": {str(y): float(v) for y, v in r.annual_eps_series.items()},
         "annual_net_income": {str(y): float(f.value)
@@ -86,7 +87,26 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
         # kept so criteria 1 and 7 (and market cap) can be recomputed against a live
         # price without refetching anything
         "tbvps": _tbvps(snap),
+        "bvps": _bvps(snap),
         "ncavps": _ncavps(snap),
+        # chapter-13 comparison material; dollar figures repeated here so the UI
+        # can show working capital and capitalization without a second request
+        "annual_revenue": {str(y): float(f.value)
+                           for y, f in sorted(snap.annual_revenue.items())},
+        "ttm_revenue": float(snap.ttm_revenue) if snap.ttm_revenue is not None else None,
+        "annual_operating_income": {str(y): float(f.value)
+                                    for y, f in sorted(snap.annual_operating_income.items())},
+        "dividend_record": snap.dividend_record,
+        "ch13": ch13.eps_stats({y: f.value for y, f in snap.annual_eps.items()}),
+        "current_assets": float(snap.current_assets.value) if snap.current_assets else None,
+        "current_liabilities": (float(snap.current_liabilities.value)
+                                if snap.current_liabilities else None),
+        "long_term_debt": float(snap.long_term_debt.value) if snap.long_term_debt else None,
+        "total_debt": float(snap.total_debt.value) if snap.total_debt else None,
+        "total_assets": float(snap.total_assets.value) if snap.total_assets else None,
+        "total_liabilities": (float(snap.total_liabilities.value)
+                              if snap.total_liabilities else None),
+        "preferred_stock": float(snap.preferred_stock.value) if snap.preferred_stock else None,
         "earnings_asof": max((f.provenance.period_end for f in snap.ttm_eps_inputs
                               if f.provenance.period_end), default=None) and
                          max(f.provenance.period_end for f in snap.ttm_eps_inputs
@@ -126,6 +146,18 @@ def _ncavps(snap) -> float | None:
     optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest) if f)
     return float((snap.current_assets.value - snap.total_liabilities.value - optional)
                  / snap.shares_outstanding.value)
+
+
+def _bvps(snap) -> float | None:
+    """Plain book value per share — intangibles included, unlike criterion 7's
+    tangible variant, because chapter 13's P/B and earnings-on-book use the full
+    equity. Preferred and minority interest are deducted the same way _tbvps does."""
+    need = (snap.total_assets, snap.total_liabilities, snap.shares_outstanding)
+    if any(f is None for f in need) or snap.shares_outstanding.value <= 0:
+        return None
+    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest) if f)
+    book = snap.total_assets.value - snap.total_liabilities.value - optional
+    return float(book / snap.shares_outstanding.value)
 
 
 def _tbvps(snap) -> float | None:
@@ -351,8 +383,16 @@ def apply_price(row: dict, price: float | None) -> dict:
     criteria are settled here — pure arithmetic over ttm_eps and tbvps, no I/O.
     The same rule runs client-side when the UI refreshes a price."""
     crit = {c["n"]: c for c in row["criteria"]}
-    if price:
+    if price is not None and price > 0:
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
+        # Snapshots are intentionally price-free.  Once export has supplied a
+        # live price, do not retain a stale "price quote" token in an otherwise
+        # incomplete tangible-book explanation.
+        note = crit[7].get("note")
+        if isinstance(note, str) and note.startswith("missing: "):
+            missing = [item.strip() for item in note.removeprefix("missing: ").split(",")]
+            missing = [item for item in missing if item != "price quote"]
+            crit[7]["note"] = "missing: " + ", ".join(missing) if missing else None
         pa = row.get("price_asof")
         # a dormant filer keeps its ticker; valuing today's price against its last
         # figures from years ago produces a confident, meaningless number
@@ -372,8 +412,10 @@ def apply_price(row: dict, price: float | None) -> dict:
                 crit[1].update(status="FAIL", value=None,
                                note="TTM EPS non-positive; P/E undefined")
             else:
-                pe = round(price / eps, 2)
-                crit[1].update(status="PASS" if pe < float(PE_MAX) else "FAIL", value=pe, note=None)
+                price_d, eps_d = Decimal(str(price)), Decimal(str(eps))
+                pe = round(price / eps, 2)  # display only
+                crit[1].update(status="PASS" if price_d < PE_MAX * eps_d else "FAIL",
+                               value=pe, note=None)
         dps = row.get("dividend_per_share")
         if dps is not None and crit[5]["status"] == "PASS":
             crit[5]["value"] = round(dps / price * 100, 2)
@@ -382,8 +424,9 @@ def apply_price(row: dict, price: float | None) -> dict:
             if tbvps <= 0:
                 crit[7].update(status="FAIL", value=None, note="non-positive tangible book value")
             else:
-                ptbv = round(price / tbvps, 2)
-                crit[7].update(status="PASS" if ptbv <= float(PRICE_TO_TBV_MAX) else "FAIL",
+                price_d, tbvps_d = Decimal(str(price)), Decimal(str(tbvps))
+                ptbv = round(price / tbvps, 2)  # display only
+                crit[7].update(status="PASS" if price_d < PRICE_TO_TBV_MAX * tbvps_d else "FAIL",
                                value=ptbv, note=None)
     statuses = {c["status"] for c in row["criteria"]}
     row["n_pass"] = sum(1 for c in row["criteria"] if c["status"] == "PASS")
@@ -408,79 +451,38 @@ def _price_stats_row(row: dict, closes) -> dict | None:
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in stats.items()}
 
 
-def _median(vals) -> float | None:
-    vals = sorted(vals)
-    if not vals:
-        return None
-    mid = len(vals) // 2
-    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
-
-
-def _median_pe(rows: list[dict]) -> dict | None:
-    """Median price / TTM EPS across members. Loss-makers have no P/E, so they are
-    left out and the counts disclose how many members actually carried a number."""
-    median = _median(r["price"] / r["ttm_eps"] for r in rows
-                     if r.get("price") and r.get("ttm_eps") and r["ttm_eps"] > 0)
-    if median is None:
-        return None
-    n = sum(1 for r in rows if r.get("price") and r.get("ttm_eps") and r["ttm_eps"] > 0)
-    return {"median_pe": round(median, 1), "n": n, "members": len(rows)}
-
-
-def _december_close(closes, year: int) -> float | None:
-    """Last weekly close in December of `year` — a series that stops earlier has none."""
-    best = None
-    for d, c in closes:
-        if d.year == year and d.month == 12:
-            best = float(c)
-        elif d.year > year:
-            break
-    return best
-
-
-def _index_history(rows: list[dict], closes_by_cik: dict) -> list[dict] | None:
-    """Per calendar year: median price change across members, and median year-end
-    P/E — December's last close over the annual EPS reported for that fiscal year.
-    Today's membership priced backwards, so past years carry survivorship bias."""
-    ends = sorted({d.year for closes in closes_by_cik.values() for d, _ in closes[-1:]})
-    if not ends:
-        return None
-    current = ends[-1]
-    years = range(current - 5, current + 1)
-    ye = {r["cik"]: {y: _december_close(closes_by_cik.get(r["cik"], ()), y) for y in years}
-          for r in rows}
-    out = []
-    for y in years:
-        rets, pes = [], []
-        for r in rows:
-            prev, this = ye[r["cik"]].get(y - 1), ye[r["cik"]].get(y)
-            if y == current:  # year still running: change is measured to the live quote
-                this = r.get("price")
-            if prev and this:
-                rets.append((this / prev - 1) * 100)
-            eps = (r.get("annual_eps") or {}).get(str(y))
-            close = ye[r["cik"]].get(y)
-            if close and eps and eps > 0:
-                pes.append(close / eps)
-        ret, pe = _median(rets), _median(pes)
-        if ret is None and pe is None:
-            continue
-        out.append({"year": y, "ytd": y == current or None,
-                    "ret": None if ret is None else round(ret, 1), "ret_n": len(rets),
-                    "pe": None if pe is None else round(pe, 1), "pe_n": len(pes)})
-    return out or None
-
-
-def _index_stats(rows: list[dict], closes_by_cik: dict) -> dict | None:
-    stats = _median_pe(rows)
-    if stats is None:
-        return None
-    stats["history"] = _index_history(rows, closes_by_cik)
-    return stats
+def _mark_memberships(rows: list[dict], progress) -> None:
+    """Tag each row with the indexes it currently belongs to. A list that cannot
+    be read is skipped WHOLE — a half-parsed index would read as reconstitution —
+    and the skip is said out loud rather than silently shipping blanks."""
+    sp = indexes.sp500()
+    dj = indexes.djia_ciks(sp) if sp else None
+    n100 = indexes.nasdaq100()
+    if not (sp and dj and n100):
+        progress("index lists unavailable: "
+                 + ", ".join(n for n, v in (("S&P 500", sp), ("DJIA", dj),
+                                            ("Nasdaq 100", n100)) if not v))
+    for r in rows:
+        m = []
+        if dj and r["cik"] in dj:
+            m.append("DJIA")
+        if sp and r["cik"] in sp:
+            m.append("S&P 500")
+        if n100 and r.get("ticker") in n100:
+            m.append("Nasdaq 100")
+        if r.get("exchange") == "Nasdaq":
+            m.append("Nasdaq Comp")
+        if m:
+            r["index_memberships"] = m
 
 
 def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
-    """Write the whole universe as one JSON file — the UI fetches it once."""
+    """Write the whole universe as one JSON file — the UI fetches it once.
+    Snapshots below the current engine are recomputed first, so a refresh never
+    ships stale arithmetic — recomputation is automatic, not a separate button."""
+    stale = store.needs_recompute(conn)
+    if stale:
+        derive(conn, progress=progress)
     rows = store.dashboard_rows(conn)
     if with_prices:
         prices = YahooPriceProvider()
@@ -520,15 +522,16 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
         for row in rows:
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
     DASHBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)
-    sp500 = sp500_ciks() if with_prices else None
-    indexes = {
-        "sp500": (_index_stats([r for r in rows if r["cik"] in sp500], closes_by_cik)
-                  if sp500 else None),
-        "nasdaq": _index_stats([r for r in rows if r.get("exchange") == "Nasdaq"], closes_by_cik),
-    }
-    payload = {"generated": store._now(), "engine_version": store.ENGINE_VERSION,
-               "indexes": indexes, "rows": rows}
+    if with_prices:  # membership needs the network; offline exports keep blanks
+        _mark_memberships(rows, progress)
+    for row in rows:
+        row.update(profiles.enrich(row))
+    for row in rows:  # engine-internal series with no reader in the payload
+        row.pop("ttm_eps_vintage", None)
+    payload = {"generated": store._now(), "engine_version": store.ENGINE_VERSION, "rows": rows}
     DASHBOARD_JSON.write_text(json.dumps(payload, separators=(",", ":")))
+    store.set_state(conn, "last_export", store._now())
+    conn.commit()
     progress(f"wrote dashboard.json — {DASHBOARD_JSON.stat().st_size / 1e6:.2f} MB, {len(rows)} companies", len(rows), len(rows))
 
 
