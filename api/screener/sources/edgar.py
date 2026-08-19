@@ -61,6 +61,11 @@ class EdgarClient:
     def company_facts(self, cik: str) -> dict:
         return self._cached(f"companyfacts_{cik}", FACTS_URL.format(cik=cik))
 
+    def submissions(self, cik: str) -> dict:
+        """The filer's filing history header — the only source for how long the
+        company has been an SEC filer at all, which XBRL facts cannot show."""
+        return self._get(f"https://data.sec.gov/submissions/CIK{cik}.json")
+
     def _cached(self, key: str, url: str) -> dict:
         # Filings are immutable once filed; a day-long TTL is the main performance lever.
         path = self.cache_dir / f"{key}.json"

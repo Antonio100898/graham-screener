@@ -118,6 +118,8 @@ class FinancialSnapshot:
     # mezzanine (temporary) equity senior to common — set only when it must be
     # deducted from common book: absent/zero preferred, liabilities not derived
     temporary_equity: Fact | None = None
+    # trailing preferred dividends: EPS nets them, NetIncomeLoss does not
+    ttm_preferred_dividends: Decimal | None = None
 
 
 @dataclass(frozen=True)

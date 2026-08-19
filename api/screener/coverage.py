@@ -43,12 +43,13 @@ PINNED = (
     "MSFT", "PPC", "EPD", "ARCC", "JPM", "DDOG", "GTN", "LEVI", "DUK", "SRI",
     "KO", "MPLX", "SUN", "KRP", "BSM", "SYF", "BXSL", "MAIN", "PNNT", "WFC",
     "HBAN", "TOL", "ULTA", "BRT", "KDP", "HEI", "UDR", "TEVA", "UAL", "AAL",
+    "AFL", "TRV", "O", "PLD", "GS", "CAT", "DE", "NEE", "ET", "ARLP",
 )
 STRATA = ("Technology", "Industrials", "Financials", "Utilities", "Real estate",
           "Consumer staples", "Consumer discretionary", "Energy", "Healthcare & pharma",
           "Communications & media", "Materials & chemicals", "Business services",
           "Wholesale & distribution")
-PER_STRATUM = 4  # 2 largest + 2 smallest with a computable market cap
+PER_STRATUM = 6  # 3 largest + 3 smallest with a computable market cap
 
 FORMS = ("10-K", "10-Q", "10-K/A", "10-Q/A")
 USD_FLOOR = Decimal(1_000_000)
@@ -252,6 +253,24 @@ OUT_OF_SCOPE = (
      "layer (c): commitments — flagged for a human"),
     (r"AccountsReceivableSale|FinancialAssetsSold|AccountsReceivableFromSecuritization",
      "receivable factoring/securitization flows"),
+    (r"SupplementaryInsuranceInformation|LiabilityForFuturePolicyBenefit|PolicyholderFunds|DeferredPolicyAcquisitionCost|PremiumsWritten|Reinsurance|BenefitsLossesAndExpenses|AssetsHeldByInsuranceRegulators|ForeignEarningsRepatriated|AociLiabilityForFuturePolicyBenefit",
+     "insurer statutory schedules: premiums earned and balance-sheet totals are read; policy-benefit rollforwards are actuarial disclosure"),
+    (r"^Investments$|^OtherInvestments$|DecommissioningTrustAssets|SecuritiesSegregated|OtherSecuredFinancings|SecurityBorrowedAfterOffset",
+     "investment/trading portfolios inside Assets; bank funding inside Liabilities"),
+    (r"^LeaseIncome$|BelowMarketLease|DeferredRentReceivables|AboveMarketLease|InPlaceLease(?!s)",
+     "lessor income and lease-intangible amortization schedules: the revenue chain reads the canonical lease-income elements"),
+    (r"^OtherIncome$|OtherOperatingIncomeExpenseNet|NetPeriodicDefinedBenefit",
+     "income-statement residual lines between revenue and the read totals"),
+    (r"NetIncomeLossAttributableTo\w*Noncontrolling",
+     "income scope variants beside the read NetIncomeLoss chain"),
+    (r"IncomeTaxExpenseBenefitIntraperiodTaxAllocation|IncomeTaxEffectsAllocatedDirectlyToEquity|^.*IncomeTaxExpenseBenefitContinuingOperations$",
+     "tax allocation detail: the total expense line is read"),
+    (r"CommonStockValueOutstanding|PreferredStockRedemptionAmount|AcceleratedShareRepurchase",
+     "equity mechanics variants: value/liquidation-preference tags are read"),
+    (r"WorkersCompensationLiability|ConstructionPayable|LongTermPurchaseCommitmentAmount|ReceivableForRecoveryOfImportDuties|CrudeOilAndNaturalGasLiquids|CryptoAsset|ImpairmentOfOngoingProject|TransfersAccountedForAsSecuredBorrowings|LandAvailableForDevelopment",
+     "sector-specific liability/asset composition inside the read totals"),
+    (r"AmountOfRestrictedNetAssets|OtherInterestAndDividendIncome",
+     "bank regulatory-restriction and interest-composition disclosure: totals are read"),
     (r"RealEstate\w|DevelopmentInProcess|AdvanceRent|DirectCostsOfLeasedAndRentedProperty|AccumulatedDistributionsInExcessOfNetIncome|DistributionsOnMandatorilyRedeemable|GainsLossesOnSalesOfInvestmentRealEstate",
      "REIT operating detail: property stocks inside assets, property costs inside expenses, distributions read via the payout chain"),
     (r"ValuationAllowancesAndReserves|SecuritiesReserveDepositRequired|TradingGainsLosses|ProgramRightsObligations|RoyaltyExpense|SellingExpense|AircraftRental|RestructuringSettlementAndImpairmentProvisions|ResearchAndDevelopmentArrangement|RestrictedStockExpense|CapitalizedComputerSoftwareAmortization",
@@ -269,13 +288,20 @@ OUT_OF_SCOPE = (
 # Genuine coverage gaps the harness has already proven, tracked for release 3.
 # Reported separately and non-fatally: a NEW tag landing in the gap list still
 # fails the run, so regressions cannot hide behind these.
-KNOWN_GAPS: dict[str, str] = {}  # all release-3 candidates implemented at engine v39
+KNOWN_GAPS = {
+    "UnsecuredLongTermDebt":
+        "GS carries $348B under it; a debt-family candidate pending its fixture + counterexample (bank cohort, criteria 2-3 N/A)",
+    "SubordinatedDebt":
+        "GS $14.8B; same pending-verification status — the original audit saw it at 104 filers, mostly banks",
+    "FiniteLivedIntangibleAssetAcquiredInPlaceLeases":
+        "REIT in-place-lease intangibles (PLD $588M) — intangible-class candidate pending fixture",
+}
 
 # Identity mismatches already understood and tracked; a NEW ticker appearing
 # here still fails the run.
 KNOWN_IDENTITY = {
-    "GTN": "NI/EPS gap is preferred dividends, not a share error: EPS nets them from income, "
-           "the NetIncomeLoss tag does not; the 100M weighted count is verified correct",
+    "GS": "debt parts understate the rollup: unread UnsecuredLongTermDebt/SubordinatedDebt (see KNOWN_GAPS); "
+          "criterion 3 uses the rollup, so no verdict rests on the parts",
 }
 _OOS_COMPILED = tuple((re.compile(p), reason) for p, reason in OUT_OF_SCOPE)
 
@@ -421,10 +447,15 @@ def verify(limit: int | None = None) -> dict:
         if snap.total_debt and snap.long_term_debt and snap.short_term_debt:
             parts = snap.long_term_debt.value + snap.short_term_debt.value
             if snap.total_debt.value and abs(parts - snap.total_debt.value) > snap.total_debt.value * Decimal("0.25"):
-                identity_failures.append(
-                    f"{row['ticker']}: debt parts {parts:,.0f} vs rollup {snap.total_debt.value:,.0f}")
+                line = f"{row['ticker']}: debt parts {parts:,.0f} vs rollup {snap.total_debt.value:,.0f}"
+                if row["ticker"] in KNOWN_IDENTITY:
+                    known_identity.append(f"{line} — {KNOWN_IDENTITY[row['ticker']]}")
+                else:
+                    identity_failures.append(line)
         if snap.ttm_eps and snap.ttm_net_income and snap.shares_outstanding and snap.ttm_eps != 0:
-            implied = snap.ttm_net_income / snap.ttm_eps
+            # EPS nets preferred dividends from income; the NI tag does not
+            common = snap.ttm_net_income - (snap.ttm_preferred_dividends or Decimal(0))
+            implied = common / snap.ttm_eps
             actual = snap.shares_outstanding.value
             if actual > 0 and not (Decimal("0.5") <= implied / actual <= Decimal("2")):
                 line = f"{row['ticker']}: NI/EPS implies {implied:,.0f} shares vs {actual:,.0f} extracted"

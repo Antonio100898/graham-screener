@@ -1701,3 +1701,15 @@ def test_current_liabilities_derived_from_the_noncurrent_split():
     # Liabilities 400e9 - noncurrent 250e9
     assert float(s.current_liabilities.value) == 150e9
     assert "derived" in s.current_liabilities.provenance.concept
+
+
+def test_redeemable_nci_other_component_counts_without_a_total_et_style():
+    gaap = dict(GAAP)
+    gaap["RedeemableNoncontrollingInterestEquityOtherCarryingAmount"] = \
+        tagdata("USD", [inst("2026-03-31", 256e6, accn="q126")])
+    assert float(build(gaap).noncontrolling_interest.value) == 256e6
+
+    # the total wins when present — components never stack on it
+    gaap["RedeemableNoncontrollingInterestEquityCarryingAmount"] = \
+        tagdata("USD", [inst("2026-03-31", 256e6, accn="q126")])
+    assert float(build(gaap).noncontrolling_interest.value) == 256e6

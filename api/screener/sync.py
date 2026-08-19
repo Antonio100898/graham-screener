@@ -342,11 +342,53 @@ def metadata(conn, progress=_print_progress) -> None:
                 ticker=tickers[0] if tickers else None,
                 name=d.get("name") or None,
             )
+            filings = d.get("filings") or {}
+            first = [f["filingFrom"] for f in (filings.get("files") or []) if f.get("filingFrom")]
+            recent_dates = (filings.get("recent") or {}).get("filingDate") or []
+            if recent_dates:
+                first.append(min(recent_dates))
+            if first:
+                store.set_first_filed(conn, cik, min(first))
             if i % 2000 == 0:
                 conn.commit()
                 progress("reading company metadata", i, len(names))
     conn.commit()
     progress("done", len(names), len(names))
+
+
+def listing_age(conn, progress=_print_progress) -> None:
+    """First-ever SEC filing date, for companies whose EPS record starts after
+    2011. The windowed defensive tests need this corroboration: a record that
+    begins late can mean a young company (LEVI, 2019) or an old company whose
+    tag is young (ARCC's BDC per-share element starts 2020, the company 2004) —
+    XBRL alone cannot tell the two apart."""
+    edgar = EdgarClient()
+    store.migrate(conn)
+    todo = []
+    for row in store.dashboard_rows(conn):
+        if row.get("first_filed"):
+            continue
+        years = [int(y) for y in (row.get("annual_eps") or {})]
+        if years and min(years) > 2011:
+            todo.append(row["cik"])
+    progress(f"{len(todo)} companies need a listing age")
+    for i, cik in enumerate(todo, 1):
+        try:
+            d = edgar.submissions(cik)
+        except (EdgarError, NoXbrlDataError):
+            continue
+        filings = d.get("filings") or {}
+        dates = [f["filingFrom"] for f in (filings.get("files") or []) if f.get("filingFrom")]
+        recent = (filings.get("recent") or {}).get("filingDate") or []
+        if recent:
+            dates.append(min(recent))
+        if dates:
+            store.set_first_filed(conn, cik, min(dates))
+        if i % 100 == 0:
+            conn.commit()
+            progress("listing ages", i, len(todo))
+    conn.commit()
+    progress("done", len(todo), len(todo))
 
 
 def daily(conn, days: int = 7, progress=_print_progress) -> None:
@@ -596,7 +638,7 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
-                                        "derive", "export", "status"])
+                                        "derive", "export", "listing-age", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
@@ -612,6 +654,8 @@ def main(argv=None) -> int:
         daily(conn, args.days)
     elif args.command == "derive":
         derive(conn)
+    elif args.command == "listing-age":
+        listing_age(conn)
     elif args.command == "export":
         export(conn, not args.no_prices)
     else:

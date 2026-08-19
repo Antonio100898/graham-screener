@@ -133,6 +133,7 @@ def young_row():
                          "2022": 1.6, "2023": 1.8, "2024": 1.9, "2025": 2.0}
     row["ch13"] = {}
     row["dividend_record"] = {"first": 2018, "streak_from": 2018, "latest": 2025, "paid_years": 8}
+    row["first_filed"] = "2018-02-01"  # the company itself is young, not just its tags
     return row
 
 
@@ -165,3 +166,19 @@ def test_windowing_never_applies_to_a_gappy_or_pre_xbrl_record():
     tests = enrich(old)["alignment"]["defensive"]["tests"]
     assert tests["stability_10y"] == "INSUFFICIENT_DATA"
     assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+
+
+def test_late_tag_adoption_never_counts_as_a_short_history_arcc_style():
+    """ARCC's EPS record starts in 2020 because the BDC per-share element is
+    young; the company has filed since 2004 — no windowed passes for it."""
+    row = young_row()
+    row["first_filed"] = "2004-10-08"
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["stability_10y"] == "INSUFFICIENT_DATA"
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+    assert tests["growth_10y"] == "INSUFFICIENT_DATA"
+
+    # unknown listing age is treated the same: no corroboration, no window
+    row["first_filed"] = None
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["stability_10y"] == "INSUFFICIENT_DATA"

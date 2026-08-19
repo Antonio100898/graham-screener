@@ -148,6 +148,14 @@ _DIVIDEND_EVIDENCE_EXCLUDE_RE = re.compile(
     r"|undistributed|distributable|affiliates|servicing|productionanddistribution"
     r"|propertyplant|deferredcompensation|fees", re.I
 )
+# Preferred dividends come out of income before anything reaches the common:
+# EPS already nets them, the NetIncomeLoss tag does not, so every NI-vs-EPS
+# arithmetic (implied share counts, identity checks) needs this series.
+PREFERRED_DIVIDEND_TAGS = (
+    "DividendsPreferredStock",
+    "PaymentsOfDividendsPreferredStockAndPreferenceStock",
+    "PreferredStockDividendsIncomeStatementImpact",
+)
 _ANNUAL_DAYS = range(340, 401)  # full-fiscal-year duration incl. 52/53-week years
 _DIVIDEND_RECENCY_DAYS = 400  # broad window for the unknown-evidence scan only
 # "currently pays" window scales with the fact's own tagging cadence: a suspended
@@ -308,7 +316,7 @@ def build_snapshot(
         )
         if redeemable_nci is None:
             # disjoint components, summed only when the total is absent (UDR
-            # tags a component equal to the total)
+            # tags a component equal to the total; ET files only the Other one)
             redeemable_nci = _sum_facts("NoncontrollingInterest (redeemable components)", [
                 _latest_instant(
                     gaap, "NoncontrollingInterest (redeemable preferred)",
@@ -317,6 +325,10 @@ def build_snapshot(
                 _latest_instant(
                     gaap, "NoncontrollingInterest (redeemable common)",
                     ("RedeemableNoncontrollingInterestEquityCommonCarryingAmount",),
+                    not_before=fresh),
+                _latest_instant(
+                    gaap, "NoncontrollingInterest (redeemable other)",
+                    ("RedeemableNoncontrollingInterestEquityOtherCarryingAmount",),
                     not_before=fresh),
             ])
         if redeemable_nci is None and _latest_instant(
@@ -382,8 +394,12 @@ def build_snapshot(
             gaap, "SharesOutstanding (limited partner units)",
             ("LimitedPartnersCapitalAccountUnitsOutstanding",), unit=("shares",), not_before=fresh,
         )
+    annual_preferred_dividends = _annual_union(gaap, PREFERRED_DIVIDEND_TAGS)
+    ttm_preferred_dividends, _ = _ttm_eps(gaap, annual_preferred_dividends,
+                                          unit=("USD",), per_share=False)
     shares = _sane_shares(shares, gaap, dei, fresh,
-                          implied=_implied_shares(gaap, annual_eps, annual_net_income))
+                          implied=_implied_shares(gaap, annual_eps, annual_net_income,
+                                                  annual_preferred_dividends))
 
     balance_sheet_date = next(
         (f.provenance.period_end for f in (current_assets, total_assets) if f is not None), None
@@ -435,6 +451,7 @@ def build_snapshot(
         intangibles=intangibles,
         preferred_stock=preferred,
         temporary_equity=temporary_equity,
+        ttm_preferred_dividends=ttm_preferred_dividends,
         shares_outstanding=shares,
         dividend=dividend,
         dividend_per_share=dividend_per_share,
@@ -1806,18 +1823,22 @@ def _restricted_cash(gaap: dict, fresh: date | None, end: date | None) -> Fact |
     ])
 
 
-def _implied_shares(gaap: dict, annual_eps: dict[int, Fact],
-                    annual_ni: dict[int, Fact]) -> Decimal | None:
+def _implied_shares(gaap: dict, annual_eps: dict[int, Fact], annual_ni: dict[int, Fact],
+                    annual_preferred: dict[int, Fact] | None = None) -> Decimal | None:
     """Share count implied by the filer's own earnings: net income over EPS.
 
     Independent of every share tag, because it is the denominator the company must
-    have divided by to publish the EPS it published.
+    have divided by to publish the EPS it published. EPS nets preferred dividends
+    from income and the NetIncomeLoss tag does not, so they come out first —
+    GTN's implied count was 2.2x off until they did.
     """
     for year in sorted(annual_eps, reverse=True):
         eps, ni = annual_eps.get(year), annual_ni.get(year)
         if eps is None or ni is None or eps.value == 0:
             continue
-        implied = ni.value / eps.value
+        preferred = (annual_preferred or {}).get(year)
+        common = ni.value - (preferred.value if preferred else Decimal(0))
+        implied = common / eps.value
         if implied > 0:
             return implied
     return None

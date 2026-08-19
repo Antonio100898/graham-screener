@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 41  # payload: dividend payment amount beside its provenance row
+ENGINE_VERSION = 43  # redeemable-NCI Other component (ET)
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 
@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS company (
     industry      TEXT,   -- SEC's detailed SIC description
     sector        TEXT,   -- coarse, investor-facing grouping of the SIC code
     exchange      TEXT,
-    filer_size    TEXT
+    filer_size    TEXT,
+    first_filed   TEXT    -- the company's first-ever SEC filing date; gates windowed tests
 );
 CREATE INDEX IF NOT EXISTS company_ticker ON company(ticker);
 CREATE INDEX IF NOT EXISTS company_industry ON company(industry);
@@ -94,7 +95,7 @@ def migrate(conn) -> None:
     """One-off repairs and column additions, run by sync jobs — never by a reader."""
     conn.executescript(SCHEMA)   # creates tables added after the first run
     have = {r["name"] for r in conn.execute("PRAGMA table_info(company)")}
-    for col in ("sic", "industry", "sector", "exchange", "filer_size"):
+    for col in ("sic", "industry", "sector", "exchange", "filer_size", "first_filed"):
         if col not in have:
             conn.execute(f"ALTER TABLE company ADD COLUMN {col} TEXT")
     conn.execute("UPDATE company SET last_filing = NULL WHERE last_filing = ''")
@@ -190,7 +191,8 @@ def set_state(conn, key: str, value: str) -> None:
 
 def dashboard_rows(conn) -> list[dict]:
     rows = conn.execute(
-        """SELECT c.ticker, c.name, c.industry, c.sector, c.exchange, c.filer_size, s.data
+        """SELECT c.ticker, c.name, c.industry, c.sector, c.exchange, c.filer_size,
+                  c.first_filed, s.data
            FROM snapshot s JOIN company c USING (cik)
            WHERE s.status = 'ok' AND s.data IS NOT NULL
              -- an unlisted filer has no ticker, no price, and cannot be bought
@@ -201,9 +203,14 @@ def dashboard_rows(conn) -> list[dict]:
         d = json.loads(r["data"])
         d["ticker"] = r["ticker"] or d.get("ticker")
         d.update(name=r["name"], industry=r["industry"], sector=r["sector"],
-                 exchange=r["exchange"], filer_size=r["filer_size"])
+                 exchange=r["exchange"], filer_size=r["filer_size"],
+                 first_filed=r["first_filed"])
         out.append(d)
     return out
+
+
+def set_first_filed(conn, cik: str, first_filed: str) -> None:
+    conn.execute("UPDATE company SET first_filed = ? WHERE cik = ?", (first_filed, cik))
 
 
 def set_metadata(conn, cik: str, sic, industry, exchange, filer_size, ticker=None, name=None) -> None:

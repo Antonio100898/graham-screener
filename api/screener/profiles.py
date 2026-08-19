@@ -173,11 +173,17 @@ def _defensive(row: dict, profile: str) -> dict:
     # A record that only begins after full XBRL coverage belongs to a company with
     # a genuinely short public history, so its whole record IS the available
     # window. An older company's short series is dataset truncation, never a
-    # licence to judge fewer years than Graham asked for.
+    # licence to judge fewer years than Graham asked for. The company's own
+    # first-ever SEC filing must corroborate the youth: ARCC's EPS record starts
+    # in 2020 because the BDC per-share tag is young, but the company filed
+    # since 2004 — without the corroboration it would earn unearned passes.
+    first_filed = row.get("first_filed")
+    listed_after_xbrl = bool(first_filed) and int(str(first_filed)[:4]) > _XBRL_FULL_COVERAGE
     span = latest - first + 1 if latest is not None else 0
     short_history = (
         latest is not None
         and first > _XBRL_FULL_COVERAGE
+        and listed_after_xbrl
         and all(year in eps for year in range(first, latest + 1))
     )
     windowed: dict[str, str] = {}
