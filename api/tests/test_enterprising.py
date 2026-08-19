@@ -256,3 +256,14 @@ def test_short_but_unbroken_history_stays_insufficient():
     c = crit(r)[4]
     assert c.status == Status.INSUFFICIENT_DATA
     assert "profitable in every year on file" in c.note
+
+
+def test_negative_net_current_assets_fail_c3_even_with_debt_parts_missing():
+    """Debt <= 1.10 x NCA is impossible against negative NCA; the missing debt
+    part must not soften a settled FAIL into insufficient data."""
+    r = evaluate(snap(current_assets=F("AssetsCurrent", 100),
+                      current_liabilities=F("LiabilitiesCurrent", 150),
+                      short_term_debt=None), QUOTE)
+    c = crit(r)[3]
+    assert c.status == Status.FAIL
+    assert "non-positive net current assets" in (c.note or "")

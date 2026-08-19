@@ -133,6 +133,11 @@ def _c3_debt(s: FinancialSnapshot) -> CriterionResult:
                                note="current assets or current liabilities unavailable")
     inputs = (s.current_assets, s.current_liabilities)
     notes = []
+    # Negative net current assets settle the criterion by themselves: no debt
+    # figure, known or missing, can bring debt <= 1.10 x NCA back within reach.
+    if s.current_assets.value - s.current_liabilities.value < 0:
+        return CriterionResult(3, name, Status.FAIL, None, threshold, inputs,
+                               note="non-positive net current assets")
     if s.total_debt is not None:
         debt = s.total_debt.value
         inputs += (s.total_debt,)

@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 35  # hide foreign-form filers; combined + other intangible tag fallbacks
+ENGINE_VERSION = 37  # release 1 correctness: debt latest-period-end selection + stale-rollup drop, suppression registry, parent-scope flag, D&A part-sum, weighted-share walk, unit-based per-share dividends, negative-NCA settles criterion 3
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

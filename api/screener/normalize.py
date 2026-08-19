@@ -184,16 +184,21 @@ def build_snapshot(
         ("DebtLongtermAndShorttermCombinedAmount", "DebtAndCapitalLeaseObligations"),
         not_before=fresh,
     )
-    long_term_debt = _long_term_debt(gaap, fresh)
-    # the plain LongTermDebt tag includes current maturities; keep the short bucket
-    # from counting the current portion a second time
-    ltd_tags = long_term_debt.provenance.tag.split(" + ") if long_term_debt else []
-    short_term_debt = _short_term_debt(
-        gaap, fresh, exclude_ltd_current="us-gaap:LongTermDebt" in ltd_tags
-    )
+    long_term_debt, ltd_suppress = _long_term_debt(gaap, fresh)
+    short_term_debt = _short_term_debt(gaap, fresh, suppress=ltd_suppress)
+    # A combined rollup older than the parts is the stale-tag trap in another
+    # place: SRI's rollup froze at $0.9M while LongTermDebt moved to $180.9M a
+    # quarter later. The fresher basis wins; criterion 3 then uses the parts.
+    parts_end = max((f.provenance.period_end for f in (long_term_debt, short_term_debt)
+                     if f is not None and f.provenance.period_end is not None), default=None)
+    if (total_debt is not None and parts_end is not None
+            and total_debt.provenance.period_end is not None
+            and total_debt.provenance.period_end < parts_end):
+        total_debt = None
     total_liabilities = _latest_instant(gaap, "Liabilities", ("Liabilities",), not_before=fresh)
+    parent_only_derivation = False
     if total_liabilities is None:
-        total_liabilities = _derive_liabilities(gaap, fresh)
+        total_liabilities, parent_only_derivation = _derive_liabilities(gaap, fresh)
     goodwill = _latest_instant(gaap, "Goodwill", ("Goodwill",), not_before=fresh)
     intangibles = _intangibles(gaap, fresh)
     if goodwill is None and intangibles is None:
@@ -210,9 +215,6 @@ def build_snapshot(
     # come out of common TBV — except when liabilities were derived via parent-only
     # StockholdersEquity, which already left NCI inside the liabilities figure.
     nci = None
-    parent_only_derivation = total_liabilities is not None and total_liabilities.provenance.tag.endswith(
-        "- us-gaap:StockholdersEquity"
-    )
     if not parent_only_derivation:
         nci = _sum_facts("NoncontrollingInterest", [
             _latest_instant(gaap, "NoncontrollingInterest", ("MinorityInterest",), not_before=fresh),
@@ -943,13 +945,55 @@ def _latest_instant(
     return None
 
 
-def _long_term_debt(gaap: dict, not_before: date | None) -> Fact | None:
-    primary = _latest_instant(
+def _latest_instant_across(
+    taxo: dict,
+    concept: str,
+    tags: tuple[str, ...],
+    unit: tuple[str, ...] = ("USD",),
+    not_before: date | None = None,
+) -> Fact | None:
+    """Latest period end wins ACROSS the whole chain; chain order only breaks ties.
+
+    Debt chains need this, not first-tag-wins: a filer that stops updating a
+    high-priority tag leaves a stale figure — often a zero — that would outrank a
+    newer fact on a lower-priority tag, and understating debt is the
+    anti-conservative direction for criterion 3."""
+    floor = not_before.isoformat() if not_before else ""
+    best: tuple[dict, str] | None = None
+    for tag in tags:
+        entries = [
+            e
+            for e in _entries(taxo, tag, unit)
+            if "start" not in e
+            and _is_financial_form(e.get("form", ""))
+            and e["end"] >= floor
+        ]
+        if not entries:
+            continue
+        e = max(entries, key=lambda e: (e["end"], e["filed"]))
+        if best is None or e["end"] > best[0]["end"]:
+            best = (e, tag)
+    if best is None:
+        return None
+    return _fact(concept, best[1], best[0])
+
+
+# Short-bucket slots a combined long-bucket tag makes redundant. Every tag that
+# rolls current maturities into the long bucket must name its suppressions here,
+# or the current portion is counted twice across the buckets.
+_LTD_SUPPRESSIONS = {
+    "LongTermDebt": frozenset({"ltd_current"}),  # the plain tag includes current maturities
+}
+
+
+def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, frozenset[str]]:
+    primary = _latest_instant_across(
         gaap, "LongTermDebt",
         ("LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations",
          "LongTermNotesPayable", "LongTermDebt"),
         not_before=not_before,
     )
+    picked = primary.provenance.tag.split(":", 1)[1] if primary else None
     parts = [primary] if primary else []
     if primary is None:
         # "Other…" is a component of the primary tags; additive only when they are absent
@@ -961,29 +1005,29 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> Fact | None:
         ("JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent",),
         not_before=not_before,
     ))
-    if primary is None or "CapitalLeaseObligations" not in primary.provenance.tag:
+    if picked != "LongTermDebtAndCapitalLeaseObligations":
         parts.append(_latest_instant(
             gaap, "LongTermDebt (finance leases)", ("FinanceLeaseLiabilityNoncurrent",),
             not_before=not_before,
         ))
-    return _sum_facts("LongTermDebt", parts)
+    return _sum_facts("LongTermDebt", parts), _LTD_SUPPRESSIONS.get(picked, frozenset())
 
 
 def _short_term_debt(
-    gaap: dict, not_before: date | None, exclude_ltd_current: bool = False
+    gaap: dict, not_before: date | None, suppress: frozenset[str] = frozenset()
 ) -> Fact | None:
-    whole = _latest_instant(gaap, "ShortTermDebt", ("DebtCurrent",), not_before=not_before)
+    whole = _latest_instant_across(gaap, "ShortTermDebt", ("DebtCurrent",), not_before=not_before)
     if whole is not None:
         return whole  # DebtCurrent already rolls up the whole short bucket
     ltd_current = None
-    if not exclude_ltd_current:  # skipped when the long bucket already includes current maturities
-        ltd_current = _latest_instant(
+    if "ltd_current" not in suppress:  # skipped when the long bucket already includes current maturities
+        ltd_current = _latest_instant_across(
             gaap, "ShortTermDebt (current portion of long-term)",
             ("LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
              "UnsecuredDebtCurrent"),
             not_before=not_before,
         )
-    borrowings = _latest_instant(
+    borrowings = _latest_instant_across(
         gaap, "ShortTermDebt (borrowings)", ("ShortTermBorrowings", "CommercialPaper"),
         not_before=not_before,
     )
@@ -1067,18 +1111,21 @@ def _has_material_value(tagdata: dict) -> bool:
     )
 
 
-def _derive_liabilities(gaap: dict, not_before: date | None) -> Fact | None:
+def _derive_liabilities(gaap: dict, not_before: date | None) -> tuple[Fact | None, bool]:
     """Many filers tag no Liabilities total. Derive it from the accounting identity
-    L = LiabilitiesAndStockholdersEquity - total equity, same period end required."""
+    L = LiabilitiesAndStockholdersEquity - total equity, same period end required.
+    The boolean is True when the derivation used PARENT-ONLY equity, leaving
+    noncontrolling interest inside the derived liabilities figure — the caller
+    must then not subtract NCI a second time."""
     lse = _latest_instant(
         gaap, "LiabilitiesAndStockholdersEquity", ("LiabilitiesAndStockholdersEquity",),
         not_before=not_before,
     )
     if lse is None:
-        return None
-    for equity_tag in (
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-        "StockholdersEquity",
+        return None, False
+    for equity_tag, parent_only in (
+        ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", False),
+        ("StockholdersEquity", True),
     ):
         equity = _latest_instant(gaap, "Equity", (equity_tag,), not_before=not_before)
         if equity and equity.provenance.period_end == lse.provenance.period_end:
@@ -1091,8 +1138,8 @@ def _derive_liabilities(gaap: dict, not_before: date | None) -> Fact | None:
                     fiscal_year=None, form=p.form, accession=p.accession,
                     filed=p.filed, period_end=p.period_end,
                 ),
-            )
-    return None
+            ), parent_only
+    return None, False
 
 
 def _intangibles(gaap: dict, not_before: date | None) -> Fact | None:
@@ -1230,9 +1277,13 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     if parts:
         # A filer that drops the combined tag mid-history keeps reporting the pieces;
         # taking the rollup wherever it exists and the sum elsewhere keeps the series
-        # current instead of freezing it at the year the tag changed.
-        summed = {y: Fact(sum(p[y].value for p in parts if y in p), parts[0][y].provenance)
-                  for p in parts for y in p if y in parts[0]}
+        # current instead of freezing it at the year the tag changed. Every year with
+        # ANY part counts, and a summed year's provenance names every summed tag.
+        summed = {}
+        for y in {y for p in parts for y in p}:
+            present = [p[y] for p in parts if y in p]
+            summed[y] = present[0] if len(present) == 1 else _sum_facts(
+                "DepreciationAndAmortization (sum of parts)", present)
         da = {**summed, **da}
     if da:
         flows["depreciation & amortisation"] = da
@@ -1365,25 +1416,27 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
 
 def _weighted_shares(gaap: dict, not_before: date | None) -> Fact | None:
     """Multi-class filers often tag no point-in-time consolidated share count.
-    Weighted-average diluted shares from the income statement is the flagged proxy."""
-    tag = "WeightedAverageNumberOfDilutedSharesOutstanding"
+    Weighted-average shares from the income statement is the flagged proxy —
+    diluted first, so basic-only filers still get a count instead of none."""
     floor = not_before.isoformat() if not_before else ""
-    entries = [
-        e
-        for e in _entries(gaap, tag, ("shares",))
-        if "start" in e and _is_financial_form(e.get("form", "")) and e["end"] >= floor
-    ]
-    if not entries:
-        return None
-    latest_end = max(e["end"] for e in entries)
-    best = None
-    for e in entries:
-        if e["end"] != latest_end:
+    for tag in _WEIGHTED_SHARE_TAGS:
+        entries = [
+            e
+            for e in _entries(gaap, tag, ("shares",))
+            if "start" in e and _is_financial_form(e.get("form", "")) and e["end"] >= floor
+        ]
+        if not entries:
             continue
-        # shortest duration = closest to a point-in-time count; then latest filed
-        if best is None or _days(e) < _days(best) or (_days(e) == _days(best) and e["filed"] > best["filed"]):
-            best = e
-    return _fact("SharesOutstanding (weighted-average diluted proxy)", tag, best)
+        latest_end = max(e["end"] for e in entries)
+        best = None
+        for e in entries:
+            if e["end"] != latest_end:
+                continue
+            # shortest duration = closest to a point-in-time count; then latest filed
+            if best is None or _days(e) < _days(best) or (_days(e) == _days(best) and e["filed"] > best["filed"]):
+                best = e
+        return _fact("SharesOutstanding (weighted-average proxy)", tag, best)
+    return None
 
 
 def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None) -> Decimal | None:
@@ -1393,8 +1446,10 @@ def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None) 
     if dividend is None:
         return None
     tag = dividend.provenance.tag.split(":", 1)[1]
-    per_share = tag.startswith("CommonStockDividendsPerShare")
-    unit = ("USD/shares",) if per_share else ("USD",)
+    # The chain's own unit declaration decides per-share vs dollar aggregate;
+    # a name test would silently mis-scale any newly added per-unit tag.
+    unit = dict(DIVIDEND_TAGS).get(tag, ("USD",))
+    per_share = "USD/shares" in unit
     annual = _annual_series(gaap, tag, unit=unit)
     if not annual:
         return None

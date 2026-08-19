@@ -996,3 +996,93 @@ def test_revenue_fill_refuses_a_disconnected_island():
     s = build(gaap)
     # no adjacent year to prove the scopes match, so the island stays out
     assert sorted(s.annual_revenue) == [2025]
+
+
+def test_stale_zero_on_priority_debt_tag_loses_to_newer_fact():
+    """SRI pattern: the filer stopped updating LongTermDebtNoncurrent at a zero;
+    the newer figure on a lower-priority tag must win, not the stale zero."""
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2025-09-30", 0, accn="q325", filed="2025-11-05")])
+    gaap["LongTermDebt"] = tagdata("USD", [inst("2025-12-31", 180.9e6, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 180.9e6
+    assert "LongTermDebt" in s.long_term_debt.provenance.tag
+
+
+def test_equal_period_ends_keep_chain_priority_for_debt():
+    # counterexample: same period end on both tags -> the chain's ranking decides
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["LongTermDebt"] = tagdata("USD", [inst("2026-03-31", 33e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 30e9
+    assert s.long_term_debt.provenance.tag == "us-gaap:LongTermDebtNoncurrent"
+
+
+def test_parent_only_liabilities_derivation_skips_nci():
+    """Parent-only equity leaves NCI inside derived liabilities; subtracting
+    MinorityInterest again would remove it twice."""
+    gaap = {k: v for k, v in GAAP.items() if k != "Liabilities"}
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 1000e9, accn="q126")])
+    gaap["StockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 590e9, accn="q126")])
+    gaap["MinorityInterest"] = tagdata("USD", [inst("2026-03-31", 10e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 410e9  # NCI stays inside
+    assert s.noncontrolling_interest is None
+
+    # counterpart: equity INCLUDING NCI keeps NCI out of liabilities -> it must be subtracted
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 600e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 400e9
+    assert float(s.noncontrolling_interest.value) == 10e9
+
+
+def test_da_part_sum_keeps_amortization_only_years_and_names_both_tags():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "DepreciationDepletionAndAmortization"}
+    gaap["Depreciation"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 9e9, accn="k25", filed="2026-02-15")])
+    gaap["AmortizationOfIntangibleAssets"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 2e9, accn="k24", filed="2025-02-15"),  # amortization-only year
+        dur("2025-01-01", "2025-12-31", 3e9, accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    oe = s.owner_earnings
+    # 2025 (latest shared year): 100 op + (9+3) D&A - 20 tax - 12 capex
+    assert float(oe.owner_earnings) == 80e9
+    da = dict(oe.components)["+ depreciation & amortisation"]
+    assert float(da) == 12e9
+
+
+def test_basic_only_filer_still_gets_weighted_share_proxy():
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["WeightedAverageNumberOfSharesOutstandingBasic"] = tagdata("shares", [
+        dur("2026-01-01", "2026-03-31", 9.7e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    assert float(s.shares_outstanding.value) == 9.7e9
+    assert "WeightedAverageNumberOfSharesOutstandingBasic" in s.shares_outstanding.provenance.tag
+
+
+def test_per_share_dividend_detection_uses_the_chain_unit_not_the_name():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["CommonStockDividendsPerShareCashPaid"] = tagdata("USD/shares", [
+        dur("2026-01-01", "2026-03-31", 0.5, form="10-Q", accn="q126", filed="2026-05-05"),
+        dur("2025-01-01", "2025-03-31", 0.45, form="10-Q", accn="q125", filed="2025-05-05"),
+        dur("2025-01-01", "2025-12-31", 1.9, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    # per-share fact is used directly, never divided by the share count again
+    assert s.dividend_per_share == Decimal("1.9") + Decimal("0.5") - Decimal("0.45")
+
+
+def test_stale_debt_rollup_loses_to_fresher_parts():
+    """SRI: the combined rollup froze a quarter before the parts moved; the
+    fresher basis must win, so the stale rollup is dropped entirely."""
+    gaap = dict(GAAP)
+    gaap["DebtAndCapitalLeaseObligations"] = tagdata("USD", [inst("2025-09-30", 947e3, accn="q325", filed="2025-11-05")])
+    gaap["LongTermDebt"] = tagdata("USD", [inst("2025-12-31", 180.9e6, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert s.total_debt is None
+    assert float(s.long_term_debt.value) == 180.9e6
+
+    # counterexample: rollup at the same period end as the parts is kept
+    gaap["DebtAndCapitalLeaseObligations"] = tagdata("USD", [inst("2025-12-31", 182e6, form="10-K", accn="k25", filed="2026-02-15")])
+    assert float(build(gaap).total_debt.value) == 182e6

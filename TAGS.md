@@ -129,7 +129,7 @@ P/E get a note, never an adjustment: `InventoryLIFOReserveEffectOnIncomeNet`,
 
 ---
 
-## 2. Audit findings — 2026-08-19 (nothing below is implemented)
+## 2. Audit findings — 2026-08-19 (release 1 of §4.3 implemented at engine v37; §2.2 tag additions still pending)
 
 Full report: the "XBRL Tag Coverage Audit" artifact. Method: tag inventory over
 all 5,903 dashboard companies (4,888 live tags), 8 domain classifiers + 8
@@ -403,7 +403,7 @@ without new evidence overturning the recorded counterexample.
 
 | Release | Content |
 |---|---|
-| 1 | Confirmed correctness fixes only: debt precedence (latest-period-end), current-debt dedupe registry, parent-scope flag, D&A provenance, weighted-share walk, per-share dividend flag. These change existing values — they precede any coverage growth. |
+| 1 | **DONE — engine v37 (2026-08-19).** Debt precedence (latest-period-end wins across the chain), current-debt suppression registry, parent-scope flag on derived liabilities, D&A part-sum provenance + amortization-only years, weighted-share tuple walk, unit-based per-share dividend detection. Two additions found during verification: a combined-debt rollup older than the parts is dropped (SRI's stale $0.9M rollup was beating the fresh $180.9M parts and criterion 3 preferred it), and negative net current assets settle criterion 3 as FAIL even with debt parts missing. Result vs v35: SRI's false PASS is gone; 737 companies moved INSUFFICIENT→FAIL on the negative-NCA rule; 10 stale-data PASSes became honest INSUFFICIENT; 24 basic-only filers (UHAL, TR…) gained share counts. 156 pytest + 22 node fixtures green. |
 | 2 | Standard-tag coverage with adversarial fixtures: debt families, class-level intangibles, shares, temporary equity/NCI, MLP distributions. |
 | 2.5 | **Coverage-verification harness** — 50–100 companies stratified across profiles (operating, utility, bank, insurer, REIT, MLP, BDC, young listing, microcap) plus every §3.4 known-hard case as a permanent fixture. Three layers: (a) *completeness sweep*, automatic — material facts in companyfacts minus facts the snapshot consumed; every leftover tag must classify as covered-by-rollup / registry-out-of-scope / **gap**, and the gap bucket must be empty; (b) *statement reconciliation*, automatic — UI numbers against the filing's own rollups via identities (A = L + E, CA + noncurrent = A, debt buckets vs filing totals, equity − goodwill − intangibles = TBV, EPS × shares ≈ NI) to catch double counts and fragment picks, not just misses; (c) *human-only residue*, flagged never extracted — prose disclosures (commitments, guarantees, covenants, legal ranges, "special" dividend labels): the harness links the section, a human reads it. Runs on every engine bump. Limit until release 5: proves completeness of what Company Facts exposes — dimension-qualified and some issuer-extension facts stay out of reach. |
 | 3 | UI provenance: tag, form, accession, period end, vintage, scope-switch warnings. |
