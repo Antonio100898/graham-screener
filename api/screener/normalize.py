@@ -223,8 +223,14 @@ def build_snapshot(
     annual_net_income = _annual_net_income(gaap)
     ttm_net_income, ttm_ni_inputs = _ttm_eps(gaap, annual_net_income, unit=("USD",),
                                              per_share=False)
-    annual_revenue = _annual_revenue(gaap)
-    ttm_revenue, _ = _ttm_eps(gaap, annual_revenue, unit=("USD",), per_share=False)
+    # A negative "revenue" is a fund's net investment loss wearing a revenue
+    # element (the gold trusts do this); it is not a top line, and the size test
+    # would read it as a company that sold less than nothing.
+    annual_revenue = {y: f for y, f in _annual_revenue(gaap).items() if f.value >= 0}
+    ttm_revenue, ttm_revenue_inputs = _ttm_eps(gaap, annual_revenue, unit=("USD",),
+                                               per_share=False)
+    if ttm_revenue is not None and ttm_revenue < 0:
+        ttm_revenue, ttm_revenue_inputs = None, ()
 
     # LiabilitiesAndStockholdersEquity equals total assets by the accounting identity,
     # so it both stands in for an untagged Assets total and keeps the staleness
@@ -237,7 +243,14 @@ def build_snapshot(
         if total_assets and total_assets.provenance.period_end
         else None
     )
+    # Assets cannot be negative. A filer that tags them so has made a sign error,
+    # and carrying it through would produce a current ratio and a net current
+    # asset value describing no company.
+    if total_assets is not None and total_assets.value < 0:
+        total_assets = None
     current_assets = _latest_instant(gaap, "AssetsCurrent", ("AssetsCurrent",), not_before=fresh)
+    if current_assets is not None and current_assets.value < 0:
+        current_assets = None
     current_liabilities = _latest_instant(gaap, "LiabilitiesCurrent", ("LiabilitiesCurrent",), not_before=fresh)
     if current_liabilities is None:
         # some classified filers tag only the noncurrent split; the identity
@@ -444,6 +457,15 @@ def build_snapshot(
     balance_sheet_date = next(
         (f.provenance.period_end for f in (current_assets, total_assets) if f is not None), None
     )
+    # A trailing figure anchored to a decade-old annual filing is not trailing:
+    # iShares Gold Trust last tagged revenue for 2013 and it was being presented
+    # beside a 2026 balance sheet. Old is not the same as absent, but presenting
+    # it as the current twelve months is the same as being wrong.
+    if balance_sheet_date is not None:
+        floor = balance_sheet_date - timedelta(days=_STALE_DAYS)
+        if _newest_period_end(ttm_revenue_inputs) < floor:
+            ttm_revenue = None
+
     reference = balance_sheet_date or _latest_annual_end(annual_eps)
     pays_dividend, dividend = _dividend(gaap, reference)
     dividend_per_share = _dividend_per_share(gaap, dividend, shares)
@@ -503,6 +525,7 @@ def build_snapshot(
         earnings_quality=_earnings_quality(gaap, ttm_inputs, annual_eps),
         context_notes=_context_notes(gaap, annual_eps, annual_net_income,
                                      _annual_operating_income(gaap)),
+        tax_record=_tax_record(gaap, fresh),
         owner_earnings=owner_earnings,
     )
 
@@ -1964,6 +1987,42 @@ def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
     return out
 
 
+_UNTAXED_SHARE = Decimal("0.01")  # tax this small against a profit is no tax at all
+
+
+def _tax_record(gaap: dict, fresh: date | None) -> dict | None:
+    """Profitable years, and how many of them carried effectively no income tax.
+
+    Penn Central reported profits and paid no income tax for eleven years before
+    it failed; Graham's reading was that the tax authorities did not believe the
+    earnings and neither should the investor. The counting happens here, on the
+    facts. Whether it is a warning or merely a pass-through structure doing what
+    pass-through structures do is decided where the company's profile is known.
+    """
+    tax = _annual_union(gaap, TAX_TAGS)
+    pretax = _annual_union(gaap, PRETAX_TAGS) or _annual_union(gaap, PRETAX_INCOME_TAGS)
+    shared = sorted(set(tax) & set(pretax), reverse=True)[:10]
+    if len(shared) < 5:
+        return None
+    profitable = [y for y in shared if pretax[y].value > 0]
+    untaxed = [y for y in profitable if tax[y].value <= abs(pretax[y].value) * _UNTAXED_SHARE]
+    return {
+        "window_from": min(shared), "window_to": max(shared),
+        "profitable_years": len(profitable), "untaxed_years": len(untaxed),
+        # a partnership or an investment company owes no entity-level tax by
+        # design, and neither does a REIT — but only the first two are legible
+        # from the facts themselves
+        "pass_through": _is_partnership(gaap, fresh) or bool(
+            _annual_union(gaap, ("InvestmentCompanyInvestmentIncomeLossFromOperationsPerShare",
+                                 "InvestmentIncomeOperatingAfterExpenseAndTax"))),
+    }
+
+
+def _newest_period_end(facts) -> date:
+    return max((f.provenance.period_end for f in facts if f.provenance.period_end),
+               default=date.min)
+
+
 def _geographic_pretax(gaap: dict) -> dict[int, Fact]:
     """Consolidated pre-tax income rebuilt from its two geographies, for the year
     both cover. Either half alone describes part of a company; only the pair
@@ -2111,7 +2170,9 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
     values rather than a blend, the ordinary drift between them cannot distort it. With
     fewer than three counts there is nothing to arbitrate, so the choice stands.
     """
-    if chosen is None:
+    # A company cannot have no shares. A zero is a tagging artefact, and it is
+    # the most dangerous one available: every per-share figure divides by this.
+    if chosen is None or chosen.value <= 0:
         return None
     cover = _latest_instant(
         dei, "SharesOutstanding", ("EntityCommonStockSharesOutstanding",),

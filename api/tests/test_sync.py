@@ -199,3 +199,22 @@ def test_row_carries_per_figure_provenance_and_series_mix():
     mix = row["series_mix"]["eps"]
     assert mix["us-gaap:EarningsPerShareBasicAndDiluted"] == [2021]
     assert 2025 in mix["us-gaap:EarningsPerShareDiluted"]
+
+
+def test_peer_efficiency_needs_a_real_peer_group():
+    from screener.sync import _mark_peer_efficiency
+    def company(ticker, industry, income, revenue):
+        return {"ticker": ticker, "industry": industry,
+                "annual_operating_income": {"2025": income}, "annual_revenue": {"2025": revenue}}
+    # a group of six: five healthy, one far behind
+    rows = [company(f"P{i}", "Railroads", 30, 100) for i in range(5)]
+    rows.append(company("LAGGARD", "Railroads", 10, 100))
+    # a company alone in its industry has no median to be measured against
+    rows.append(company("ALONE", "Zeppelins", 1, 100))
+    _mark_peer_efficiency(rows)
+    laggard = next(r for r in rows if r["ticker"] == "LAGGARD")
+    assert laggard["peer_efficiency"]["behind"] is True
+    assert laggard["peer_efficiency"]["industry_median"] == 30.0
+    assert next(r for r in rows if r["ticker"] == "P0")["peer_efficiency"]["behind"] is False
+    assert "peer_efficiency" not in next(r for r in rows if r["ticker"] == "ALONE")
+    assert all("_margin" not in r for r in rows)

@@ -62,10 +62,20 @@ def _source(fact) -> dict | None:
                 "end": p.period_end.isoformat() if p.period_end else None,
                 "filed": p.filed.isoformat() if p.filed else None}
 
+    def leaves(p) -> list:
+        # a component can itself be a sum; the reader wants the filings, not the
+        # intermediate constructions
+        if not p.components:
+            return []
+        out = []
+        for child in p.components:
+            out.extend(leaves(child) or [child])
+        return out
+
     p = fact.provenance
     src = one(p)
-    if p.components:
-        src["components"] = [one(c) for c in p.components]
+    if (parts := leaves(p)):
+        src["components"] = [one(c) for c in parts]
     return src
 
 
@@ -105,6 +115,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
         "assumptions": list(r.assumptions),
         "earnings_quality": list(snap.earnings_quality),
         "context_notes": list(snap.context_notes),
+        "tax_record": snap.tax_record,
         # reported beside the verdict, never inside it — see models.EpsGrowth
         "eps_growth": {
             "base_fiscal_year": r.eps_growth.base_fiscal_year,
@@ -563,6 +574,60 @@ def _price_stats_row(row: dict, closes) -> dict | None:
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in stats.items()}
 
 
+_PEER_MINIMUM = 5           # fewer than this and the median describes nothing
+_EFFICIENCY_GAP = 0.66      # a margin this far under the peer median is worth stating
+
+
+def _mark_peer_efficiency(rows: list[dict]) -> None:
+    """Operating margin against the median of the company's own industry.
+
+    Graham's sixth Penn Central signal was that its operating ratio had long run
+    far worse than a comparable railroad's — the kind of gap that says the
+    business is weaker than its peers whatever the reported earnings say. It is
+    the one measure here that no single filing can produce, because it needs
+    every other filer in the industry, so it is computed at export.
+    """
+    margins: dict[str, list[float]] = {}
+    for row in rows:
+        margin = _operating_margin(row)
+        if margin is None:
+            continue
+        row["_margin"] = margin
+        industry = row.get("industry")
+        if industry:
+            margins.setdefault(industry, []).append(margin)
+    for row in rows:
+        margin = row.pop("_margin", None)
+        industry = row.get("industry")
+        peers = margins.get(industry or "", ())
+        if margin is None or len(peers) < _PEER_MINIMUM:
+            continue
+        ordered = sorted(peers)
+        mid = len(ordered) // 2
+        median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        row["peer_efficiency"] = {
+            "margin": round(margin * 100, 1),
+            "industry_median": round(median * 100, 1),
+            "peers": len(ordered),
+            # only a shortfall is worth a reader's attention, and only against a
+            # peer group that is itself profitable
+            "behind": bool(median > 0 and margin < median * _EFFICIENCY_GAP),
+        }
+
+
+def _operating_margin(row: dict) -> float | None:
+    """Latest fiscal year where the company reported both operating income and
+    revenue. Banks and insurers report no operating subtotal and get none."""
+    income = row.get("annual_operating_income") or {}
+    revenue = row.get("annual_revenue") or {}
+    shared = sorted(set(income) & set(revenue), reverse=True)
+    for year in shared[:1]:
+        sales = revenue[year]
+        if sales and sales > 0:
+            return income[year] / sales
+    return None
+
+
 def _mark_memberships(rows: list[dict], progress) -> None:
     """Tag each row with the indexes it currently belongs to. A list that cannot
     be read is skipped WHOLE — a half-parsed index would read as reconstitution —
@@ -636,6 +701,7 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
     DASHBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)
     if with_prices:  # membership needs the network; offline exports keep blanks
         _mark_memberships(rows, progress)
+    _mark_peer_efficiency(rows)
     for row in rows:
         row.update(profiles.enrich(row))
     for row in rows:  # engine-internal series with no reader in the payload

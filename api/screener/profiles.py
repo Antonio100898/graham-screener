@@ -167,6 +167,48 @@ def _enterprising(row: dict, profile: str) -> dict:
     return result
 
 
+def peer_efficiency_note(row: dict) -> str | None:
+    """Penn Central's operating ratio ran at 47.5% against a comparable
+    railroad's 35.2%, and Graham's point was that the gap had been visible for
+    years. A margin far under the industry's median says the same thing."""
+    peer = row.get("peer_efficiency") or {}
+    if not peer.get("behind"):
+        return None
+    return (f"Operating margin of {peer['margin']}% against a median of "
+            f"{peer['industry_median']}% across {peer['peers']} companies in the same industry. "
+            "Graham's sixth Penn Central signal was exactly this: an operating gap against "
+            "comparable businesses that had been visible for years before the failure.")
+
+
+_REIT_INDUSTRIES = ("real estate investment trust",)
+
+
+def tax_note(row: dict) -> str | None:
+    """Graham's Penn Central reading: a taxable company that reports profits for
+    years while paying no income tax is telling two different stories, and the
+    tax authorities' version is the one to believe.
+
+    A partnership, an investment company or a REIT owes no entity-level tax by
+    design, so for them the same facts are a structure, not a warning — and each
+    is worth stating plainly, because a reader comparing their earnings with an
+    ordinary corporation's should know the earnings were never taxed."""
+    record = row.get("tax_record") or {}
+    profitable = record.get("profitable_years") or 0
+    untaxed = record.get("untaxed_years") or 0
+    if profitable < 5 or untaxed < 3:
+        return None
+    window = f"FY{record['window_from']}–FY{record['window_to']}"
+    industry = (row.get("industry") or "").lower()
+    pass_through = record.get("pass_through") or any(k in industry for k in _REIT_INDUSTRIES)
+    if pass_through:
+        return (f"{untaxed} of {profitable} profitable years in {window} carried no income tax — "
+                "expected for a pass-through structure, which owes no tax at the entity level. "
+                "Its earnings are not comparable with a taxed corporation's without adjustment.")
+    return (f"{untaxed} of {profitable} profitable years in {window} carried effectively no income "
+            "tax. Penn Central reported profits and paid no tax for eleven years before it failed: "
+            "earnings the tax authorities do not recognise deserve the same scepticism here.")
+
+
 def _no_dividend_years_inside_the_window(row: dict, record: dict) -> bool:
     """Years inside the 20-year window where the company was demonstrably filing
     (its own annual earnings cover the year) and demonstrably paid nothing.
@@ -338,9 +380,16 @@ def _defensive(row: dict, profile: str) -> dict:
 def enrich(row: dict) -> dict:
     """Add compact, JSON-safe applicability and alignment fields to one dashboard row."""
     profile = profile_for(row.get("sector"))
+    # the tax reading needs the company's industry, which the facts do not carry
+    notes = list(row.get("context_notes") or ())
+    if (note := tax_note(row)) is not None:
+        notes.append(note)
+    if (note := peer_efficiency_note(row)) is not None:
+        notes.append(note)
     return {
         "graham_profile": profile,
         "graham_profile_meta": PROFILE_META[profile],
+        "context_notes": notes,
         "alignment": {
             "enterprising": _enterprising(row, profile),
             "defensive": _defensive(row, profile),

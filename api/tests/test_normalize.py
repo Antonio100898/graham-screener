@@ -1859,3 +1859,38 @@ def test_a_summed_figure_keeps_every_component_filing():
     # the summary line's own date belongs to the newest part, which is exactly
     # why the parts must state their own
     assert {str(p.period_end) for p in parts} == {"2025-12-31", "2026-03-31"}
+
+
+def test_a_zero_share_count_is_not_a_share_count():
+    """Every per-share figure divides by this number; a tagged zero is an
+    artefact, and treating it as real would make each of them meaningless."""
+    gaap = dict(GAAP)
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [inst("2026-03-31", 0, accn="q126")])
+    assert build(gaap).shares_outstanding is None
+
+
+def test_a_negative_revenue_is_not_a_top_line():
+    """The gold trusts tag a net investment loss as Revenues; the size test
+    would otherwise read a company that sold less than nothing."""
+    gaap = dict(GAAP)
+    gaap["Revenues"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", -606e6, accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert 2025 not in s.annual_revenue
+    assert s.ttm_revenue is None
+
+
+def test_a_trailing_figure_anchored_a_decade_back_is_not_trailing():
+    gaap = dict(GAAP)
+    gaap["Revenues"] = tagdata("USD", [
+        dur("2013-01-01", "2013-12-31", 500e6, accn="k13", filed="2014-02-15")])
+    s = build(gaap)  # GAAP's balance sheet is 2026
+    assert s.annual_revenue[2013] is not None   # the year itself is real history
+    assert s.ttm_revenue is None                # but it is not the trailing twelve months
+
+
+def test_negative_assets_are_a_sign_error_not_a_balance_sheet():
+    gaap = dict(GAAP)
+    gaap["AssetsCurrent"] = tagdata("USD", [inst("2026-03-31", -26, accn="q126")])
+    s = build(gaap)
+    assert s.current_assets is None

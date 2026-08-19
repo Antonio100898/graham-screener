@@ -211,3 +211,45 @@ def test_early_xbrl_tagging_gap_never_disproves_the_record():
     row["dividend_record"] = {"first": 2013, "streak_from": 2013, "latest": 2026, "paid_years": 14}
     tests = enrich(row)["alignment"]["defensive"]["tests"]
     assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+
+
+def taxed_row(untaxed=4, profitable=9, **over):
+    row = screen_row()
+    row["tax_record"] = {"window_from": 2016, "window_to": 2025, "profitable_years": profitable,
+                         "untaxed_years": untaxed, "pass_through": False}
+    row.update(over)
+    return row
+
+
+def test_profits_without_tax_carry_the_penn_central_warning():
+    note = enrich(taxed_row())["context_notes"][-1]
+    assert "Penn Central" in note and "4 of 9" in note
+
+
+def test_a_pass_through_structure_is_explained_not_accused():
+    row = taxed_row()
+    row["tax_record"]["pass_through"] = True
+    note = enrich(row)["context_notes"][-1]
+    assert "pass-through" in note and "Penn Central" not in note
+
+    # a REIT is a pass-through the facts alone cannot show; its industry does
+    reit = taxed_row(industry="Real Estate Investment Trusts")
+    assert "pass-through" in enrich(reit)["context_notes"][-1]
+
+
+def test_an_ordinary_tax_record_says_nothing():
+    assert enrich(taxed_row(untaxed=1))["context_notes"] == []
+    assert enrich(screen_row())["context_notes"] == []
+
+
+def test_a_margin_far_under_the_industry_median_is_stated():
+    row = screen_row()
+    row["peer_efficiency"] = {"margin": 4.2, "industry_median": 12.5, "peers": 18, "behind": True}
+    note = enrich(row)["context_notes"][-1]
+    assert "4.2%" in note and "12.5%" in note and "18 companies" in note
+
+
+def test_a_margin_in_line_with_peers_says_nothing():
+    row = screen_row()
+    row["peer_efficiency"] = {"margin": 11.0, "industry_median": 12.5, "peers": 18, "behind": False}
+    assert enrich(row)["context_notes"] == []

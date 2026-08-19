@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 47  # consolidated pre-tax income only; component-level provenance
+ENGINE_VERSION = 49  # data integrity: no zero share counts, no negative revenue or assets, no decade-old trailing figures
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

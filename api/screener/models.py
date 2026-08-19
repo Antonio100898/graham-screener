@@ -127,6 +127,9 @@ class FinancialSnapshot:
     # cash conversion, dilution and interest coverage — context a passing
     # multiple cannot answer; never a criterion, never an adjustment
     context_notes: tuple[str, ...] = ()
+    # profitable years against years that carried effectively no income tax
+    # {"window_from", "window_to", "profitable_years", "untaxed_years", "pass_through"}
+    tax_record: dict | None = None
 
 
 @dataclass(frozen=True)

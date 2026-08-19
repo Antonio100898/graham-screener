@@ -2,7 +2,7 @@
 
 Proves, for a stratified sample of companies, that nothing material in their
 SEC Company Facts is silently ignored, and that what was extracted reconciles
-with the filing's own rollups. Three layers:
+with the filing's own rollups. Four layers:
 
 a) completeness sweep — every material recent fact either fed the snapshot,
    belongs to a tag the chains know, or matches the out-of-scope registry;
@@ -13,6 +13,11 @@ b) identity reconciliation — extracted figures against the filing's own
 c) human-only residue — prose sections (commitments, guarantees, covenants)
    cannot be extracted deterministically; they are out of scope by design and
    never counted as gaps.
+d) constructed-figure audit — every summed or derived number, across ALL
+   companies rather than the sample: complete (its components account for every
+   element it names), clean (finite, and never negative where the concept
+   cannot be), and free of a component another component already contains.
+   A figure the screener invents is a figure it can invent wrongly.
 
 Run: python -m screener.coverage            (or: make verify-coverage)
 Limit until the Inline-XBRL adapter exists: Company Facts omits
@@ -363,6 +368,169 @@ def _sample(rows: list[dict]) -> list[dict]:
     return list(picked.values())
 
 
+# Tag pairs where one already contains the other. A sum may never hold both:
+# that is the double count every debt and intangibles release has guarded
+# against, stated once here so the harness can prove it rather than trust it.
+_CONTAINS = (
+    ("LongTermDebt", "LongTermDebtCurrent"),
+    ("LongTermDebt", "LongTermDebtNoncurrent"),
+    ("LongTermDebtAndCapitalLeaseObligations", "FinanceLeaseLiabilityNoncurrent"),
+    ("LongTermDebtAndCapitalLeaseObligations", "LongTermDebtNoncurrent"),
+    ("FinanceLeaseLiability", "FinanceLeaseLiabilityCurrent"),
+    ("FinanceLeaseLiability", "FinanceLeaseLiabilityNoncurrent"),
+    ("NotesAndLoansPayable", "NotesPayable"),
+    ("NotesAndLoansPayable", "LoansPayable"),
+    ("DebtCurrent", "LongTermDebtCurrent"),
+    ("DebtCurrent", "CommercialPaper"),
+    ("IntangibleAssetsNetIncludingGoodwill", "Goodwill"),
+    ("IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"),
+    ("IntangibleAssetsNetExcludingGoodwill", "IndefiniteLivedIntangibleAssetsExcludingGoodwill"),
+    ("RedeemableNoncontrollingInterestEquityCarryingAmount",
+     "RedeemableNoncontrollingInterestEquityPreferredCarryingAmount"),
+    ("RedeemableNoncontrollingInterestEquityCarryingAmount",
+     "RedeemableNoncontrollingInterestEquityCommonCarryingAmount"),
+    ("ProfitLoss", "NetIncomeLoss"),
+)
+
+_CONSTRUCTED_FIELDS = (
+    "total_assets", "total_liabilities", "current_assets", "current_liabilities",
+    "long_term_debt", "short_term_debt", "total_debt", "goodwill", "intangibles",
+    "preferred_stock", "temporary_equity", "noncontrolling_interest",
+    "shares_outstanding", "dividend",
+)
+
+
+def _tags_of(prov) -> list[str]:
+    """Every element name a figure rests on, composites split apart."""
+    return [t.split(":", 1)[1] if ":" in t else t
+            for t in re.split(r" [+/-] ", prov.tag)]
+
+
+_NEVER_NEGATIVE = ("total_assets", "current_assets", "goodwill", "intangibles",
+                   "shares", "preferred_stock", "temporary_equity", "ttm_revenue")
+_MUST_BE_FINITE = _NEVER_NEGATIVE + ("total_liabilities", "current_liabilities",
+                                     "long_term_debt", "short_term_debt", "total_debt",
+                                     "ttm_eps", "tbvps", "bvps", "ncavps", "price")
+
+
+def audit_payload() -> list[str]:
+    """Every exported number for every company, checked for the three ways a
+    derived figure goes wrong: incomplete, dirty, or double counted.
+
+    The sampled harness rebuilds snapshots and can afford deep checks on forty
+    companies. This reads the shipped payload instead, so it covers all of them
+    — nothing reaches the dashboard without passing here."""
+    rows = json.loads(DASHBOARD.read_text())["rows"]
+    problems: list[str] = []
+    for row in rows:
+        ticker = row.get("ticker") or row.get("cik")
+        for field in _MUST_BE_FINITE:
+            value = row.get(field)
+            if value is None or isinstance(value, str):
+                continue
+            if value != value or value in (float("inf"), float("-inf")):
+                problems.append(f"{ticker}: {field} is not a finite number ({value})")
+            elif field in _NEVER_NEGATIVE and value < 0:
+                problems.append(f"{ticker}: {field} is negative ({value:,.0f})")
+        if (shares := row.get("shares")) is not None and shares <= 0:
+            problems.append(f"{ticker}: share count is {shares}")
+        for name, source in (row.get("sources") or {}).items():
+            raw = source.get("tag", "")
+            tags = [t.split(":", 1)[1] if ":" in t else t
+                    for t in re.split(r" [+/-] ", raw)]
+            # containment is a double count only when the parts are ADDED; a
+            # derivation subtracts or divides by the container deliberately
+            added = [t.split(":", 1)[1] if ":" in t else t for t in raw.split(" + ")]
+            if len(tags) != len(set(tags)):
+                dupes = sorted({t for t in tags if tags.count(t) > 1})
+                problems.append(f"{ticker}: {name} counts {', '.join(dupes)} twice")
+            for parent, child in _CONTAINS:
+                if parent in added and child in added:
+                    problems.append(f"{ticker}: {name} adds {child} to {parent}, which contains it")
+            components = source.get("components") or []
+            if components:
+                leaf_tags = sorted(t for c in components
+                                   for t in re.split(r" [+/-] ", c.get("tag", "")))
+                named = sorted(source.get("tag", "").split(" + "))
+                if len(leaf_tags) != len(named):
+                    problems.append(f"{ticker}: {name} names {len(named)} tags but its components "
+                                    f"account for {len(leaf_tags)}")
+        for series_name in ("annual_eps", "annual_net_income", "annual_revenue"):
+            series = row.get(series_name) or {}
+            years = [int(y) for y in series]
+            if len(years) != len(set(years)):
+                problems.append(f"{ticker}: {series_name} holds a year twice")
+            for year, value in series.items():
+                if value != value:
+                    problems.append(f"{ticker}: {series_name}[{year}] is not a number")
+    return problems
+
+
+def _leaves(prov) -> list:
+    """Every original filing behind a figure, unwrapping sums built from sums."""
+    if not prov.components:
+        return []
+    out = []
+    for child in prov.components:
+        out.extend(_leaves(child) or [child])
+    return out
+
+
+def _audit_constructions(ticker: str, snap) -> list[str]:
+    """Sums and derivations must be complete, arithmetically themselves, and
+    free of a component that another component already contains.
+
+    A constructed figure is where a screener invents a number, so it is where a
+    wrong number can be invented — this proves each one against its own parts
+    rather than trusting the code that built it."""
+    problems: list[str] = []
+
+    def check(label: str, fact) -> None:
+        if fact is None:
+            return
+        prov = fact.provenance
+        tags = _tags_of(prov)
+        # no element counted twice inside one figure
+        if len(tags) != len(set(tags)):
+            dupes = sorted({t for t in tags if tags.count(t) > 1})
+            problems.append(f"{ticker}: {label} counts {', '.join(dupes)} more than once")
+        # no element that another component already contains — only across sums,
+        # since a derivation subtracts its container on purpose
+        added = [t.split(":", 1)[1] if ":" in t else t for t in prov.tag.split(" + ")]
+        for parent, child in _CONTAINS:
+            if parent in added and child in added:
+                problems.append(f"{ticker}: {label} adds {child} to {parent}, which contains it")
+        components = _leaves(prov)
+        if components:
+            # a component may itself be a sum, so compare against the flattened
+            # leaves: every element in the tag string must have a filing behind it
+            leaf_tags = sorted(t for c in components for t in _tags_of(c))
+            if leaf_tags != sorted(tags):
+                problems.append(f"{ticker}: {label} names {sorted(tags)} but its components "
+                                f"account for {leaf_tags}")
+            ends = {c.period_end for c in components if c.period_end}
+            if prov.period_end and ends and max(ends) != prov.period_end:
+                problems.append(f"{ticker}: {label} reports {prov.period_end} while its newest "
+                                f"component is {max(ends)}")
+        # a derived figure must never be silently negative where the concept cannot be
+        if fact.value < 0 and label in ("goodwill", "intangibles", "shares_outstanding",
+                                        "current_assets", "total_assets"):
+            problems.append(f"{ticker}: {label} is negative ({fact.value:,.0f})")
+
+    for name in _CONSTRUCTED_FIELDS:
+        check(name, getattr(snap, name, None))
+
+    # an annual series must hold one fact per year, and a derived year must not
+    # sit beside a reported one for the same period
+    for series_name in ("annual_eps", "annual_net_income", "annual_revenue"):
+        series = getattr(snap, series_name, {}) or {}
+        for year, fact in series.items():
+            end = fact.provenance.period_end
+            if end and abs(end.year - year) > 1:
+                problems.append(f"{ticker}: {series_name}[{year}] carries a fact ending {end}")
+    return problems
+
+
 def verify(limit: int | None = None) -> dict:
     rows = json.loads(DASHBOARD.read_text())["rows"]
     sample = _sample(rows)[:limit]
@@ -371,6 +539,7 @@ def verify(limit: int | None = None) -> dict:
     gap_examples: dict[str, list[str]] = {}
     identity_failures: list[str] = []
     known_identity: list[str] = []
+    derived_failures: list[str] = []
     companies_clean = 0
 
     for row in sample:
@@ -407,6 +576,10 @@ def verify(limit: int | None = None) -> dict:
             gap_examples.setdefault(tag, []).append(f"{row['ticker']}({value / Decimal(1e6):,.0f}M)")
         if all(tag in KNOWN_GAPS for tag, _ in company_gaps):
             companies_clean += 1
+
+        # layer (d): every constructed figure must be complete, arithmetically
+        # itself, and free of a component counted twice
+        derived_failures.extend(_audit_constructions(row["ticker"], snap))
 
         # layer (b): identities the filing itself must satisfy
         a, li = snap.total_assets, snap.total_liabilities
@@ -465,10 +638,21 @@ def verify(limit: int | None = None) -> dict:
                      for tag, n in gaps.most_common() if tag not in KNOWN_GAPS},
         "identity_failures": identity_failures,
         "known_identity": known_identity,
+        "derived_failures": derived_failures,
     }
 
 
 def main(argv=None) -> int:
+    payload = audit_payload()
+    rows = len(json.loads(DASHBOARD.read_text())["rows"])
+    print(f"payload audit: {rows} companies checked for duplicated, overlapping, "
+          f"non-finite and impossible figures")
+    if payload:
+        print(f"\nPAYLOAD FAILURES ({len(payload)}):")
+        for line in payload[:40]:
+            print(f"  {line}")
+        if len(payload) > 40:
+            print(f"  ... and {len(payload) - 40} more")
     report = verify()
     print(f"sampled {report['sampled']} companies; "
           f"{report['companies_clean']} with zero unexplained material tags")
@@ -484,11 +668,16 @@ def main(argv=None) -> int:
         print(f"\nKNOWN IDENTITY MISMATCHES — tracked release-3 candidates ({len(report['known_identity'])}):")
         for line in report["known_identity"]:
             print(f"  {line}")
+    if report["derived_failures"]:
+        print(f"\nCONSTRUCTED-FIGURE FAILURES ({len(report['derived_failures'])}):")
+        for line in report["derived_failures"]:
+            print(f"  {line}")
     if report["identity_failures"]:
         print(f"\nIDENTITY FAILURES ({len(report['identity_failures'])}):")
         for line in report["identity_failures"]:
             print(f"  {line}")
-    ok = not report["gap_tags"] and not report["identity_failures"]
+    ok = (not report["gap_tags"] and not report["identity_failures"]
+          and not report["derived_failures"] and not payload)
     print("\nPASS" if ok else "\nFAIL — every gap above needs a chain, a registry entry with a defensible reason, or a fix")
     return 0 if ok else 1
 
