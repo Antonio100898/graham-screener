@@ -221,7 +221,8 @@ def build_snapshot(
     annual_eps = _annual_eps(gaap)
     ttm_eps, ttm_inputs = _ttm_eps(gaap, annual_eps)
     annual_net_income = _annual_net_income(gaap)
-    ttm_net_income, _ = _ttm_eps(gaap, annual_net_income, unit=("USD",), per_share=False)
+    ttm_net_income, ttm_ni_inputs = _ttm_eps(gaap, annual_net_income, unit=("USD",),
+                                             per_share=False)
     annual_revenue = _annual_revenue(gaap)
     ttm_revenue, _ = _ttm_eps(gaap, annual_revenue, unit=("USD",), per_share=False)
 
@@ -397,9 +398,48 @@ def build_snapshot(
     annual_preferred_dividends = _annual_union(gaap, PREFERRED_DIVIDEND_TAGS)
     ttm_preferred_dividends, _ = _ttm_eps(gaap, annual_preferred_dividends,
                                           unit=("USD",), per_share=False)
+    # implied shares read only TAGGED eps — derived years below are computed FROM
+    # the share count and would otherwise vote for themselves
     shares = _sane_shares(shares, gaap, dei, fresh,
                           implied=_implied_shares(gaap, annual_eps, annual_net_income,
                                                   annual_preferred_dividends))
+
+    # Filers that tag earnings per share only on a share-class axis publish no
+    # per-share element the Company Facts API can return (KKR since 2017, PAA
+    # since 2016), and a co-op may simply stop tagging one. Their own income and
+    # share count still divide, so the series continues as disclosed arithmetic
+    # rather than stopping years before the balance sheet.
+    derived_eps = _derived_annual_eps(gaap, dei, annual_eps, annual_net_income,
+                                      annual_preferred_dividends,
+                                      has_nci=_has_minority_interest(gaap, fresh, nci))
+    if derived_eps:
+        annual_eps = {**annual_eps, **derived_eps}
+        # A filer that stopped tagging per-share figures still has a per-share
+        # TTM in its own income statement. The tagged trailing figure is not
+        # merely absent for these filers — it is years stale (KKR's last tagged
+        # EPS period ended 2018), and a stale figure priced against today's quote
+        # is worse than none, so newer income overrides it.
+        def _newest_end(facts) -> date:
+            return max((f.provenance.period_end for f in facts if f.provenance.period_end),
+                       default=date.min)
+
+        income_is_newer = _newest_end(ttm_ni_inputs) > _newest_end(ttm_inputs)
+        if ((ttm_eps is None or income_is_newer)
+                and ttm_net_income is not None and shares and shares.value > 0):
+            ttm_eps = ((ttm_net_income - (ttm_preferred_dividends or Decimal(0)))
+                       / shares.value)
+            # the trailing figure still carries a date: the newest income period
+            # behind it, which is what decides whether a price may be compared
+            newest = max(ttm_ni_inputs, key=lambda f: f.provenance.period_end or date.min,
+                         default=None)
+            if newest is not None:
+                p = newest.provenance
+                ttm_inputs = (Fact(value=ttm_eps, provenance=Provenance(
+                    concept="TTM EPS (derived: earnings available to common / share count)",
+                    tag=f"{p.tag} / {shares.provenance.tag}",
+                    fiscal_year=None, form=p.form, accession=p.accession,
+                    filed=p.filed, period_end=p.period_end, period_start=p.period_start,
+                )),)
 
     balance_sheet_date = next(
         (f.provenance.period_end for f in (current_assets, total_assets) if f is not None), None
@@ -1825,6 +1865,89 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     return OwnerEarnings(fiscal_year=fy, owner_earnings=owner, invested_capital=invested,
                          roic=roic, roic_maintenance=roic_maint, components=components,
                          caveats=tuple(caveats))
+
+
+_DERIVED_EPS_SHARE_LAG = 460  # a cover count this close to the year end counts that year
+
+
+def _has_minority_interest(gaap: dict, fresh: date | None, nci: Fact | None) -> bool:
+    """Whether minority holders own part of this balance sheet. The NCI tag is
+    not the only evidence: Ares tags no MinorityInterest at all, yet its equity
+    including noncontrolling interests is more than twice its parent equity."""
+    if nci is not None and nci.value != 0:
+        return True
+    both = _latest_instant(
+        gaap, "Equity (incl. NCI)",
+        ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",),
+        not_before=fresh,
+    )
+    parent = _latest_instant(gaap, "Equity (parent)", ("StockholdersEquity",), not_before=fresh)
+    if both is None or parent is None or both.value == 0:
+        return False
+    return abs(both.value - parent.value) / abs(both.value) > Decimal("0.02")
+
+
+def _annual_share_counts(gaap: dict, dei: dict) -> dict[int, Fact]:
+    """One share count per fiscal year: the weighted average the filer used for
+    its own per-share figures, else the count on that year's report cover."""
+    counts = _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
+    covers: dict[int, Fact] = {}
+    for tag, taxo, ns in (("EntityCommonStockSharesOutstanding", dei, "dei"),
+                          ("CommonStockSharesOutstanding", gaap, "us-gaap")):
+        for e in _entries(taxo, tag, ("shares",)):
+            if "start" in e or not _is_financial_form(e.get("form", "")):
+                continue
+            if not isinstance(e.get("val"), (int, float)) or e["val"] <= 0:
+                continue
+            end = date.fromisoformat(e["end"])
+            # a cover is dated after the year it reports on; attribute it to that year
+            year = _fy_label(end)
+            kept = covers.get(year)
+            if kept is None or e["filed"] > kept.provenance.filed.isoformat():
+                covers[year] = _fact("SharesOutstanding (report cover)", tag, e, ns=ns)
+    return {**covers, **counts}  # a weighted average always outranks a cover count
+
+
+def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
+                        annual_ni: dict[int, Fact], annual_preferred: dict[int, Fact],
+                        has_nci: bool = False) -> dict[int, Fact]:
+    """Per-share earnings for years the filer reported income but tagged no
+    per-share element: (net income - preferred dividends) / that year's share
+    count. Both figures are the company's own and belong to the same year; the
+    provenance names both tags so no reader mistakes it for a reported EPS.
+
+    ProfitLoss includes noncontrolling interests, which are not the common
+    shareholder's earnings — dividing it by the common share count inflates EPS
+    and makes the price look cheap. It serves only where the balance sheet shows
+    no minority interest to inflate it (ARES would have read 2.60 against a
+    genuine 3.00-odd; a co-op with no NCI is unaffected)."""
+    counts = _annual_share_counts(gaap, dei)
+    out: dict[int, Fact] = {}
+    for year, income in annual_ni.items():
+        if year in annual_eps:
+            continue
+        if has_nci and income.provenance.tag.endswith(":ProfitLoss"):
+            continue
+        count = counts.get(year)
+        if count is None or count.value <= 0:
+            continue
+        end = income.provenance.period_end
+        share_end = count.provenance.period_end
+        if end and share_end and (share_end - end).days > _DERIVED_EPS_SHARE_LAG:
+            continue  # a count struck long after the year describes a different company
+        preferred = annual_preferred.get(year)
+        common = income.value - (preferred.value if preferred else Decimal(0))
+        p, q = income.provenance, count.provenance
+        out[year] = Fact(
+            value=common / count.value,
+            provenance=Provenance(
+                concept="EarningsPerShare (derived: earnings available to common / share count)",
+                tag=f"{p.tag} / {q.tag}",
+                fiscal_year=year, form=p.form, accession=p.accession,
+                filed=p.filed, period_end=p.period_end, period_start=p.period_start,
+            ),
+        )
+    return out
 
 
 def _context_notes(gaap: dict, annual_eps: dict[int, Fact],

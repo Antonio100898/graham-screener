@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 44  # dividend record can disprove 20 years; secured/unsecured debt axis; context notes
+ENGINE_VERSION = 46  # derived EPS and TTM where the per-share element is dimension-only or stale
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

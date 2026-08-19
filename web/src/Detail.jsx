@@ -90,6 +90,7 @@ export default function Detail({ row, onClose }) {
           rows={defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook })}
         />
 
+        <OwnerEarnings oe={row.owner_earnings} />
         <Notes title="What the multiples do not say"
                subtitle="Cash conversion, dilution and interest cover — context, never part of a grade"
                notes={row.context_notes} />
@@ -161,6 +162,40 @@ function enterprisingValue(criterion) {
   if (criterion.n === 1 || criterion.n === 2 || criterion.n === 3 || criterion.n === 7) return multiple(criterion.value);
   if (criterion.n === 5) return criterion.value == null ? "—" : `${number(criterion.value)}% yield`;
   return criterion.value == null ? "—" : number(criterion.value);
+}
+
+/** Owner earnings over invested capital — the Davis Funds measure Zweig sets
+ * against earnings per share. Not a Graham criterion: it ranks what already
+ * passed, so it sits beside the verdict rather than inside it. */
+function OwnerEarnings({ oe }) {
+  if (!oe) return null;
+  const rate = (value) => (value == null ? "—" : `${number(value)}%`);
+  return (
+    <section className="criteria-section">
+      <div className="criteria-title">
+        <div><h3>Return on invested capital</h3>
+          <p>FY{oe.fiscal_year} owner earnings ÷ invested capital — 10% attractive, 6% acceptable behind a strong brand</p></div>
+        <b className={oe.roic >= 10 ? "ok" : ""}>{rate(oe.roic)}</b>
+      </div>
+      <table className="criteria-clean">
+        <thead><tr><th>Component</th><th className="num">FY{oe.fiscal_year}</th></tr></thead>
+        <tbody>
+          {oe.components.map(([label, value]) => (
+            <tr key={label}><td><b>{label}</b></td><td className="num">{money(value)}</td></tr>
+          ))}
+          <tr><td><b>Owner earnings</b></td><td className="num">{money(oe.owner_earnings)}</td></tr>
+          <tr><td><b>Invested capital</b><small>assets less cash, short-term investments and non-interest-bearing current liabilities</small></td>
+              <td className="num">{money(oe.invested_capital)}</td></tr>
+          <tr><td><b>Return on invested capital</b></td><td className="num">{rate(oe.roic)}</td></tr>
+          <tr><td><b>…with maintenance capex assumed equal to depreciation</b></td>
+              <td className="num">{rate(oe.roic_maintenance)}</td></tr>
+        </tbody>
+      </table>
+      {oe.caveats?.length > 0 && (
+        <ul className="disclosure-notes">{oe.caveats.map((c, i) => <li key={i}>{c}</li>)}</ul>
+      )}
+    </section>
+  );
 }
 
 /** Disclosure paragraphs: read alongside the grades, never folded into them. */

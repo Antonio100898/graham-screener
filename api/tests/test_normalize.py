@@ -1763,3 +1763,65 @@ def test_context_notes_flag_thin_interest_cover():
         dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
     note = next(n for n in build(gaap).context_notes if "covers interest" in n)
     assert "2.0x" in note
+
+
+# --- Release 4b: derived EPS for filers whose per-share element is dimension-only ---
+
+def test_eps_derived_when_no_per_share_element_exists_kkr_style():
+    """KKR tags EPS only on a share-class axis, which Company Facts omits; its
+    own income and share count still divide."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 2400e6, accn="k25", filed="2026-02-15")])
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2025-12-31", 900e6, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 900e6, accn="q126")])
+    s = build(gaap)
+    assert round(float(s.annual_eps[2025].value), 4) == round(2400 / 900, 4)
+    assert "derived" in s.annual_eps[2025].provenance.concept
+    assert s.annual_eps[2025].provenance.tag == "us-gaap:NetIncomeLoss / us-gaap:CommonStockSharesOutstanding"
+
+
+def test_derived_eps_nets_preferred_dividends_first():
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 1000e6, accn="k25", filed="2026-02-15")])
+    gaap["DividendsPreferredStock"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2025-12-31", 100e6, form="10-K", accn="k25", filed="2026-02-15")])
+    assert float(build(gaap).annual_eps[2025].value) == 9.0  # 900M to common, not 1,000M
+
+
+def test_profit_loss_never_derives_eps_for_a_filer_with_minority_interest_ares_style():
+    """ProfitLoss includes noncontrolling interests. Ares tags no MinorityInterest
+    at all, so the equity pair is the evidence: EPS would read 2.60 against a
+    genuine 3.00-odd — the false-bargain direction."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["ProfitLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 465e6, accn="k25", filed="2026-02-15")])
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2025-12-31", 180e6, form="10-K", accn="k25", filed="2026-02-15")])
+    gaap["StockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 4025e6, accn="q126")])
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 8602e6, accn="q126")])
+    assert 2025 not in build(gaap).annual_eps
+
+    # a filer whose equity shows no minority holders keeps the derivation (co-op)
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 4025e6, accn="q126")])
+    assert 2025 in build(gaap).annual_eps
+
+
+def test_a_share_count_struck_long_after_the_year_never_derives_it():
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2021-01-01", "2021-12-31", 1000e6, accn="k21", filed="2022-02-15")])
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2026-03-31", 100e6, accn="q126")])  # five years later
+    assert 2021 not in build(gaap).annual_eps
+
+
+def test_a_reported_eps_is_never_replaced_by_a_derived_one():
+    s = build()  # GAAP has EarningsPerShareDiluted for every year
+    assert all("derived" not in f.provenance.concept for f in s.annual_eps.values())

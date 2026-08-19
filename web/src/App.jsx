@@ -223,6 +223,8 @@ export default function App() {
       if (key === "n_pass") return -r.n_pass;
       if (key === "pe") return byN(r, 1).value ?? null;
       if (key === "pe3") return r.pe3 ?? null;
+      // the interesting end is the highest return, so it leads on the first click
+      if (key === "roic") return r.roic == null ? null : -r.roic;
       // the interesting end is the most beaten-down, so sort those to the top
       if (key === "offhigh")
         return r.price_stats?.pct_below_52w_high == null
@@ -450,6 +452,9 @@ export default function App() {
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
+            <Th id="roic" sort={sort} onSort={sortBy} className="num">
+              ROIC<em className="sub2">owner earnings</em>
+            </Th>
           </tr>
         </thead>
         <tbody>
@@ -503,6 +508,10 @@ export default function App() {
               <td className="num" data-label="P/E 3y"
                   title="current price over the average of the three latest annual EPS — one lucky or disastrous year moves it a third as much as it moves the TTM P/E">
                 {fmt(r.pe3)}
+              </td>
+              <td className={`num${r.roic != null && r.roic >= 10 ? " ok" : ""}`} data-label="ROIC"
+                  title="owner earnings (operating profit + depreciation and amortisation − tax − capital expenditure) over invested capital — 10% is attractive, 6% acceptable behind a strong brand">
+                {r.roic == null ? "—" : `${r.roic.toFixed(1)}%`}
               </td>
             </tr>
           ))}
