@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -20,6 +21,10 @@ from .sources.prices import YahooPriceProvider
 app = FastAPI(title="Graham Enterprising Screener", version="1.0")
 # no-op unless SCREENER_TOKEN is set, which is how a tunnelled instance is run
 app.middleware("http")(auth.require_token)
+# The dashboard payload is one 35MB JSON document of mostly repeated keys; it
+# compresses to about an eighth of that, and the UI downloads all of it on every
+# first visit.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 _edgar = EdgarClient()
 _prices = YahooPriceProvider()
 
