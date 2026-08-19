@@ -269,29 +269,13 @@ OUT_OF_SCOPE = (
 # Genuine coverage gaps the harness has already proven, tracked for release 3.
 # Reported separately and non-fatally: a NEW tag landing in the gap list still
 # fails the run, so regressions cannot hide behind these.
-KNOWN_GAPS = {
-    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities":
-        "combined debt rollup unread (JPM $460B, KO $45B) — TotalDebt-chain candidate",
-    "LiabilitiesNoncurrent":
-        "could derive LiabilitiesCurrent = Liabilities - LiabilitiesNoncurrent where no current rollup exists (TEVA, UAL, AAL)",
-    "SeniorNotes":
-        "combined senior-notes total unread (SYF $7.7B, TOL, TEVA) — notes-family candidate behind the rollup-absent guard",
-    "OtherLoansPayable":
-        "combined loans line unread (DUK $935M, TOL) — loans-family candidate",
-    "WarehouseAgreementBorrowings":
-        "mortgage-warehouse borrowings unread — short-bucket candidate",
-    "LongTermNotesAndLoans":
-        "combined notes+loans rollup unread (TEVA $16.8B) — notes-family candidate",
-    "JuniorSubordinatedNotes":
-        "junior subordinated notes unread (BRT) — subordinated-slot candidate",
-}
+KNOWN_GAPS: dict[str, str] = {}  # all release-3 candidates implemented at engine v39
 
 # Identity mismatches already understood and tracked; a NEW ticker appearing
 # here still fails the run.
 KNOWN_IDENTITY = {
-    "GTN": "dual-class filer: undimensioned share tags carry one class; NI/EPS implies the full count",
-    "SUN": "LP unit instant appears to be a class fragment; NI/EPS disagrees — recheck the unit-count gate",
-    "HEI": "dual-class filer (HEI/HEI.A): CommonStockSharesOutstanding holds one class (~55M of ~141M) — per-share values overstated",
+    "GTN": "NI/EPS gap is preferred dividends, not a share error: EPS nets them from income, "
+           "the NetIncomeLoss tag does not; the 100M weighted count is verified correct",
 }
 _OOS_COMPILED = tuple((re.compile(p), reason) for p, reason in OUT_OF_SCOPE)
 

@@ -230,9 +230,18 @@ def build_snapshot(
     )
     current_assets = _latest_instant(gaap, "AssetsCurrent", ("AssetsCurrent",), not_before=fresh)
     current_liabilities = _latest_instant(gaap, "LiabilitiesCurrent", ("LiabilitiesCurrent",), not_before=fresh)
-    total_debt = _latest_instant(
+    if current_liabilities is None:
+        # some classified filers tag only the noncurrent split; the identity
+        # fills the current side. NEVER mirrored on the asset side —
+        # AssetsNoncurrent is an ASC 280 disclosure, not a balance-sheet rollup.
+        current_liabilities = _derived_instant(
+            gaap, "LiabilitiesCurrent (derived: Liabilities - LiabilitiesNoncurrent)",
+            "Liabilities", "LiabilitiesNoncurrent", fresh,
+        )
+    total_debt = _latest_instant_across(
         gaap, "TotalDebt",
-        ("DebtLongtermAndShorttermCombinedAmount", "DebtAndCapitalLeaseObligations"),
+        ("DebtLongtermAndShorttermCombinedAmount", "DebtAndCapitalLeaseObligations",
+         "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities"),
         not_before=fresh,
     )
     long_term_debt, ltd_suppress = _long_term_debt(gaap, fresh)
@@ -1155,6 +1164,8 @@ _COMBINED_SUPPRESSIONS = {
     "LineOfCredit": frozenset({"loc_current"}),
     "SecuredDebt": frozenset({"secured_current"}),
     "FinanceLeaseLiability": frozenset({"finance_lease_current"}),
+    "SeniorNotes": frozenset({"senior_current"}),
+    "OtherLoansPayable": frozenset({"loans_current"}),
 }
 
 
@@ -1173,9 +1184,11 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
         parts.append(_latest_instant(
             gaap, "LongTermDebt (other)", ("OtherLongTermDebtNoncurrent",), not_before=not_before
         ))
-        # notes/loans family: the parent rollup wins over the pair
+        # notes/loans family: the parent rollups win over the pair (TEVA files
+        # only the long-term combined variant, $16.8B)
         notes_group = _latest_instant_across(
-            gaap, "LongTermDebt (notes and loans)", ("NotesAndLoansPayable",), not_before=not_before
+            gaap, "LongTermDebt (notes and loans)",
+            ("NotesAndLoansPayable", "LongTermNotesAndLoans"), not_before=not_before
         )
         if notes_group is None:
             notes_group = _sum_facts("LongTermDebt (notes and loans)", [
@@ -1195,10 +1208,12 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
                 not_before=not_before,
             ))
             instruments.append(_latest_instant_across(
-                gaap, "LongTermDebt (loans)", ("LongTermLoansPayable",), not_before=not_before
+                gaap, "LongTermDebt (loans)", ("LongTermLoansPayable", "OtherLoansPayable"),
+                not_before=not_before
             ))
             instruments.append(_latest_instant_across(
-                gaap, "LongTermDebt (senior notes)", ("SeniorLongTermNotes",), not_before=not_before
+                gaap, "LongTermDebt (senior notes)", ("SeniorLongTermNotes", "SeniorNotes"),
+                not_before=not_before
             ))
         instruments.append(_latest_instant_across(
             gaap, "LongTermDebt (credit line)", ("LongTermLineOfCredit", "LineOfCredit"),
@@ -1218,9 +1233,10 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
         else:
             parts.extend(instruments)
             secured = None
-    parts.append(_latest_instant(
+    parts.append(_latest_instant_across(
         gaap, "LongTermDebt (subordinated debentures)",
-        ("JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent",),
+        ("JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent",
+         "JuniorSubordinatedNotes"),
         not_before=not_before,
     ))
     if picked != "LongTermDebtAndCapitalLeaseObligations":
@@ -1255,12 +1271,15 @@ def _short_term_debt(
     )
     bank_loans_won = _tag_of(borrowings) == "ShortTermBankLoansAndNotesPayable"
     if borrowings is None:
-        # KO: commercial paper and other short-term borrowings are disjoint lines
+        # KO: commercial paper and other short-term borrowings are disjoint lines;
+        # mortgage-warehouse lines are their own facility
         borrowings = _sum_facts("ShortTermDebt (borrowings)", [
             _latest_instant_across(gaap, "ShortTermDebt (commercial paper)", ("CommercialPaper",),
                                    not_before=not_before),
             _latest_instant_across(gaap, "ShortTermDebt (other borrowings)",
                                    ("OtherShortTermBorrowings",), not_before=not_before),
+            _latest_instant_across(gaap, "ShortTermDebt (warehouse borrowings)",
+                                   ("WarehouseAgreementBorrowings",), not_before=not_before),
         ])
 
     ltd_current = None
@@ -1310,9 +1329,10 @@ def _short_term_debt(
                 family.append(_latest_instant_across(
                     gaap, "ShortTermDebt (other notes, current)", ("OtherNotesPayableCurrent",),
                     not_before=not_before))
-                family.append(_latest_instant_across(
-                    gaap, "ShortTermDebt (senior notes, current)", ("SeniorNotesCurrent",),
-                    not_before=not_before))
+                if "senior_current" not in suppress:  # combined SeniorNotes already holds it
+                    family.append(_latest_instant_across(
+                        gaap, "ShortTermDebt (senior notes, current)", ("SeniorNotesCurrent",),
+                        not_before=not_before))
         if "convertible_current" not in suppress:
             family.append(_latest_instant_across(
                 gaap, "ShortTermDebt (convertible, current)",
@@ -1832,12 +1852,28 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
     others = [f for f in (cover, weighted)
               if f is not None and f.value > 0 and f is not chosen]
     candidates = [chosen] + others
+
+    def ratio(a: Decimal, b: Decimal) -> Decimal:
+        return max(a, b) / min(a, b)
+
     if len(candidates) >= 3:
-        outlier = all(max(chosen.value, f.value) / min(chosen.value, f.value) > 10
-                      for f in others)
-        if outlier:
+        if all(ratio(chosen.value, f.value) > 10 for f in others):
+            return sorted(candidates, key=lambda f: f.value)[1]
+        # Dual-class fragment: an undimensioned instant can carry ONE class of a
+        # multi-class filer — a 2-3x error, far under the magnitude test. When
+        # the two independent witnesses agree with each other and both disagree
+        # with the chosen count, the chosen count is the fragment.
+        if (ratio(others[0].value, others[1].value) < Decimal("1.35")
+                and all(ratio(chosen.value, f.value) > Decimal("1.5") for f in others)):
             return sorted(candidates, key=lambda f: f.value)[1]
         return chosen
+    if len(candidates) == 2 and implied is not None and implied > 0:
+        # earnings arithmetic is the third witness: HEI's stale 55M class
+        # instant loses to the 141M weighted count that NI/EPS corroborates
+        other = others[0]
+        if (ratio(chosen.value, other.value) > Decimal("1.5")
+                and ratio(other.value, implied) < Decimal("1.35")):
+            return other
     # With one source there is nothing to outvote, and that is exactly where a filer
     # tagging shares in thousands slips through: Hub Group reported 60,333 against a
     # true 60.3 million, which passed criterion 7 at a price-to-book of 0.00. Earnings
@@ -1845,6 +1881,14 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
     # count rather than publishing a thousandfold-wrong book value.
     if implied is not None and implied > 0 and chosen.value > 0:
         if max(chosen.value, implied) / min(chosen.value, implied) > 10:
+            return None
+        # The last-resort tags are fragments exactly when nothing corroborates
+        # them (SUN's LP-unit instant is 51.5M of ~136M real units); with no
+        # witness and a 2x earnings disagreement, missing beats wrong.
+        if not others and chosen.provenance.tag in (
+            "us-gaap:LimitedPartnersCapitalAccountUnitsOutstanding",
+            "us-gaap:SharesOutstanding",
+        ) and max(chosen.value, implied) / min(chosen.value, implied) > 2:
             return None
     return chosen
 

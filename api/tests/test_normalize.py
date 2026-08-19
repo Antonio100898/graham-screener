@@ -1606,3 +1606,98 @@ def test_segment_capex_fills_only_missing_years_schl_style():
     s = build(gaap)
     # latest shared year 2025 uses the segment figure: 100 + 12 - 20 - 12
     assert float(s.owner_earnings.owner_earnings) == 80e9
+
+
+# --- Release 3: harness candidates ---
+
+def test_dual_class_instant_fragment_loses_to_corroborated_weighted_hei_style():
+    """HEI: a stale one-class instant (55M) against the 141M weighted count that
+    NI/EPS corroborates — earnings arithmetic is the third witness."""
+    gaap = dict(GAAP)
+    # implied = NI / EPS ~= 141M via the annual series
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 846e6, accn="k25", filed="2026-02-15")])
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-12-31", 6.0, accn="k25", filed="2026-02-15")])
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2025-07-31", 55.1e6, accn="q325", filed="2025-08-25")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2026-01-01", "2026-03-31", 141e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert float(s.shares_outstanding.value) == 141e6
+
+
+def test_lone_lp_unit_instant_retired_when_earnings_disagree_sun_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 1537e6, accn="k25", filed="2026-02-15")])
+    gaap["PartnersCapital"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    gaap["LimitedPartnersCapitalAccountUnitsOutstanding"] = tagdata("shares", [
+        inst("2026-03-31", 51.5e6, accn="q126")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    # implied ~256M vs 51.5M with no witness: missing beats wrong
+    assert s.shares_outstanding is None
+
+
+def test_uncorroborated_weighted_count_survives_a_2x_earnings_gap_gtn_style():
+    # preferred dividends legitimately push NI/EPS off the true count;
+    # the weighted tag is not a fragile source and must stand
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", -26e6, accn="k25", filed="2026-02-15")])
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-12-31", -0.58, accn="k25", filed="2026-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2026-01-01", "2026-03-31", 100e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert float(s.shares_outstanding.value) == 100e6
+
+
+def test_combined_debt_rollup_including_current_maturities_jpm_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities"] = \
+        tagdata("USD", [inst("2026-03-31", 460.5e9, accn="q126")])
+    assert float(build(gaap).total_debt.value) == 460.5e9
+
+
+def test_long_term_notes_and_loans_rollup_teva_style():
+    gaap = dict(GAAP)
+    gaap["LongTermNotesAndLoans"] = tagdata("USD", [inst("2026-03-31", 16.8e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 16.8e9
+    # long-term-only variant: the current side stays open
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 2e9, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 2e9
+
+
+def test_combined_senior_notes_suppress_only_their_current_twin_syf_style():
+    gaap = dict(GAAP)
+    gaap["SeniorNotes"] = tagdata("USD", [inst("2026-03-31", 7.7e9, accn="q126")])
+    gaap["SeniorNotesCurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    gaap["OtherNotesPayableCurrent"] = tagdata("USD", [inst("2026-03-31", 200e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 7.7e9
+    # senior-current inside the combined tag; other notes still count
+    assert float(s.short_term_debt.value) == 200e6
+
+
+def test_other_loans_payable_and_junior_subordinated_notes_and_warehouse():
+    gaap = dict(GAAP)
+    gaap["OtherLoansPayable"] = tagdata("USD", [inst("2026-03-31", 935e6, accn="q126")])
+    gaap["JuniorSubordinatedNotes"] = tagdata("USD", [inst("2026-03-31", 37e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 935e6 + 37e6
+
+    gaap2 = dict(GAAP)
+    gaap2["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    gaap2["WarehouseAgreementBorrowings"] = tagdata("USD", [inst("2026-03-31", 300e6, accn="q126")])
+    assert float(build(gaap2).short_term_debt.value) == 300e6
+
+
+def test_current_liabilities_derived_from_the_noncurrent_split():
+    gaap = {k: v for k, v in GAAP.items() if k != "LiabilitiesCurrent"}
+    gaap["LiabilitiesNoncurrent"] = tagdata("USD", [inst("2026-03-31", 250e9, accn="q126")])
+    s = build(gaap)
+    # Liabilities 400e9 - noncurrent 250e9
+    assert float(s.current_liabilities.value) == 150e9
+    assert "derived" in s.current_liabilities.provenance.concept

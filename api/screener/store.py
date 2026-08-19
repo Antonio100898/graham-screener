@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 38  # release 2 coverage: debt families, intangible classes/derivations, LP distributions, mezzanine equity, NCI chain, partnership shares, financial-sector income, restricted cash, gain-signed quality notes
+ENGINE_VERSION = 39  # release 3: dual-class share outvote, fragile-source veto, combined debt rollups, current-liabilities derivation
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 
