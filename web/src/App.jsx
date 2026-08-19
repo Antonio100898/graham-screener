@@ -452,9 +452,7 @@ export default function App() {
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
-            <Th id="roic" sort={sort} onSort={sortBy} className="num">
-              ROIC<em className="sub2">owner earnings</em>
-            </Th>
+            <Th id="roic" sort={sort} onSort={sortBy} className="num">ROIC</Th>
           </tr>
         </thead>
         <tbody>
