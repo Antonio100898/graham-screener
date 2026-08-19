@@ -17,6 +17,9 @@ from .ch13 import _avg3
 # anything about a company's record.
 _XBRL_FULL_COVERAGE = 2011
 _MIN_WINDOW_YEARS = 5
+# By this year every dividend payer tagged its payments, so a filing year with
+# earnings and no dividend fact is a year the company did not pay.
+_DIVIDEND_TAGGING_RELIABLE = 2013
 
 PROFILE_OPERATING = "OPERATING"
 PROFILE_UTILITY = "UTILITY"
@@ -164,6 +167,24 @@ def _enterprising(row: dict, profile: str) -> dict:
     return result
 
 
+def _no_dividend_years_inside_the_window(row: dict, record: dict) -> bool:
+    """Years inside the 20-year window where the company was demonstrably filing
+    (its own annual earnings cover the year) and demonstrably paid nothing.
+
+    Two or more such years disprove the uninterrupted record. Both halves of the
+    evidence are required — an absent earnings year is silence, not a non-payment
+    — and the years must be recent enough that a payer would certainly have
+    tagged the dividend, or an early-XBRL tagging gap would read as a deficit.
+    """
+    latest_paid, first_paid = record.get("latest"), record.get("first")
+    if latest_paid is None or first_paid is None:
+        return False
+    window_start = latest_paid - 19
+    silent = [year for year in _eps_series(row)
+              if window_start <= year < first_paid and year >= _DIVIDEND_TAGGING_RELIABLE]
+    return len(silent) >= 2
+
+
 def _defensive(row: dict, profile: str) -> dict:
     """Summarize defensive evidence without claiming a 20-year history that XBRL cannot prove."""
     eps = _eps_series(row)
@@ -272,6 +293,11 @@ def _defensive(row: dict, profile: str) -> dict:
             f"paid every year of the company's {span}-year public record; "
             "20 years is longer than the company has traded"
         )
+    elif _no_dividend_years_inside_the_window(row, record):
+        # The record does not merely fail to prove 20 years — it disproves them:
+        # the company was filing (its own earnings series covers those years)
+        # and paid nothing, so no uninterrupted 20-year record can exist.
+        dividend = "FAIL"
     else:
         # A short XBRL record cannot prove a 20-year uninterrupted record and
         # must not be turned into a fail merely because the dataset is young.

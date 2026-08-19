@@ -90,6 +90,12 @@ export default function Detail({ row, onClose }) {
           rows={defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook })}
         />
 
+        <Notes title="What the multiples do not say"
+               subtitle="Cash conversion, dilution and interest cover — context, never part of a grade"
+               notes={row.context_notes} />
+        <Notes title="What the trailing earnings are made of"
+               subtitle="Non-recurring lines large enough to decide criterion 1 on their own"
+               notes={row.earnings_quality} />
         <AnnualFinancialHistory annualEps={row.annual_eps} annualNetIncome={row.annual_net_income} />
         <SeriesMix mix={row.series_mix} />
         <Provenance row={row} />
@@ -155,6 +161,19 @@ function enterprisingValue(criterion) {
   if (criterion.n === 1 || criterion.n === 2 || criterion.n === 3 || criterion.n === 7) return multiple(criterion.value);
   if (criterion.n === 5) return criterion.value == null ? "—" : `${number(criterion.value)}% yield`;
   return criterion.value == null ? "—" : number(criterion.value);
+}
+
+/** Disclosure paragraphs: read alongside the grades, never folded into them. */
+function Notes({ title, subtitle, notes }) {
+  if (!notes || notes.length === 0) return null;
+  return (
+    <section className="criteria-section notes-section">
+      <div className="criteria-title"><div><h3>{title}</h3><p>{subtitle}</p></div></div>
+      <ul className="disclosure-notes">
+        {notes.map((note, i) => <li key={i}>{note}</li>)}
+      </ul>
+    </section>
+  );
 }
 
 const SOURCE_LABELS = {

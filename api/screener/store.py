@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 43  # redeemable-NCI Other component (ET)
+ENGINE_VERSION = 44  # dividend record can disprove 20 years; secured/unsecured debt axis; context notes
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

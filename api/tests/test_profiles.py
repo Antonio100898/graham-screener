@@ -182,3 +182,32 @@ def test_late_tag_adoption_never_counts_as_a_short_history_arcc_style():
     row["first_filed"] = None
     tests = enrich(row)["alignment"]["defensive"]["tests"]
     assert tests["stability_10y"] == "INSUFFICIENT_DATA"
+
+
+def test_filing_years_without_a_dividend_disprove_the_twenty_year_record():
+    """BCC: paid every year since 2017, but its own earnings series covers
+    2013-2016 with no dividend — 20 uninterrupted years is impossible, not
+    merely unproven."""
+    row = screen_row()
+    row["annual_eps"] = {str(y): 1.0 for y in range(2011, 2026)}
+    row["dividend_record"] = {"first": 2017, "streak_from": 2017, "latest": 2026, "paid_years": 10}
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["dividend_20y"] == "FAIL"
+
+
+def test_a_young_company_is_not_failed_for_years_it_did_not_exist():
+    # listed 2018, paying since 2018: no filing year inside the window is silent
+    row = screen_row()
+    row["annual_eps"] = {str(y): 1.0 for y in range(2018, 2026)}
+    row["dividend_record"] = {"first": 2018, "streak_from": 2018, "latest": 2026, "paid_years": 9}
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+
+
+def test_early_xbrl_tagging_gap_never_disproves_the_record():
+    # only pre-2013 years are silent: dividend tagging was not yet universal
+    row = screen_row()
+    row["annual_eps"] = {str(y): 1.0 for y in range(2011, 2026)}
+    row["dividend_record"] = {"first": 2013, "streak_from": 2013, "latest": 2026, "paid_years": 14}
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"

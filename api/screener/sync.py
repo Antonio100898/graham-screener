@@ -93,6 +93,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
         "ttm_net_income": float(snap.ttm_net_income) if snap.ttm_net_income is not None else None,
         "assumptions": list(r.assumptions),
         "earnings_quality": list(snap.earnings_quality),
+        "context_notes": list(snap.context_notes),
         # reported beside the verdict, never inside it — see models.EpsGrowth
         "eps_growth": {
             "base_fiscal_year": r.eps_growth.base_fiscal_year,

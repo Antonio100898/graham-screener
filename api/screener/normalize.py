@@ -461,6 +461,8 @@ def build_snapshot(
         assumed_zero=frozenset(assumed),
         noncontrolling_interest=nci,
         earnings_quality=_earnings_quality(gaap, ttm_inputs, annual_eps),
+        context_notes=_context_notes(gaap, annual_eps, annual_net_income,
+                                     _annual_operating_income(gaap)),
         owner_earnings=owner_earnings,
     )
 
@@ -1228,6 +1230,13 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
                 gaap, "LongTermDebt (loans)", ("LongTermLoansPayable", "OtherLoansPayable"),
                 not_before=not_before
             ))
+            # banks file this beside no instrument rollup at all; it sits INSIDE
+            # unsecured borrowings, so it competes with the secured/unsecured
+            # axis below rather than adding to it
+            instruments.append(_latest_instant_across(
+                gaap, "LongTermDebt (subordinated)", ("SubordinatedDebt",),
+                not_before=not_before
+            ))
             instruments.append(_latest_instant_across(
                 gaap, "LongTermDebt (senior notes)", ("SeniorLongTermNotes", "SeniorNotes"),
                 not_before=not_before
@@ -1237,19 +1246,26 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
             not_before=not_before,
         ))
         instruments = [f for f in instruments if f is not None]
-        # Secured debt is an AXIS over the same instruments, not another
-        # instrument: take whichever representation shows more, never both.
-        # A skip-if-present guard misfires on fresh zeros (BRT) and fragments
-        # (AVA would report 3M instead of 2,759M).
-        secured = _latest_instant_across(
-            gaap, "LongTermDebt (secured)", ("SecuredLongTermDebt", "SecuredDebt"),
-            not_before=not_before,
-        )
-        if secured is not None and secured.value > sum((f.value for f in instruments), Decimal(0)):
-            parts.append(secured)
+        # Secured/unsecured is an AXIS over the same instruments, not another
+        # instrument: the two sides are disjoint by definition, so their sum is
+        # a second representation of the whole (GS reports $348B unsecured +
+        # $11.6B secured and no instrument rollup at all). Take whichever
+        # representation shows more, never both. A skip-if-present guard
+        # misfires on fresh zeros (BRT) and fragments (AVA: 900x).
+        axis = _sum_facts("LongTermDebt (secured + unsecured)", [
+            _latest_instant_across(
+                gaap, "LongTermDebt (secured)", ("SecuredLongTermDebt", "SecuredDebt"),
+                not_before=not_before,
+            ),
+            _latest_instant_across(
+                gaap, "LongTermDebt (unsecured)", ("UnsecuredLongTermDebt",),
+                not_before=not_before,
+            ),
+        ])
+        if axis is not None and axis.value > sum((f.value for f in instruments), Decimal(0)):
+            parts.append(axis)
         else:
             parts.extend(instruments)
-            secured = None
     parts.append(_latest_instant_across(
         gaap, "LongTermDebt (subordinated debentures)",
         ("JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent",
@@ -1642,6 +1658,18 @@ CASH_TAGS = (
     "CashAndCashEquivalentsAtCarryingValue",
     "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
 )
+# Context only — never an adjustment, never a criterion. Reported earnings that
+# do not arrive as cash, a share count quietly growing, and interest that eats
+# operating profit are the three things a Graham reader wants flagged beside a
+# passing multiple.
+OPERATING_CASH_FLOW_TAGS = (
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+)
+INTEREST_EXPENSE_TAGS = (
+    "InterestExpense", "InterestExpenseDebt", "InterestAndDebtExpense",
+    "InterestExpenseNonoperating", "InterestIncomeExpenseNet",
+)
 # The two post-ASU-2016-01 AFS successors and held-to-maturity go END of chain:
 # PFE tags OtherShortTermInvestments as the total and the AFS tag as its
 # footnote fragment. The dead pre-ASU AvailableForSaleSecuritiesCurrent is gone
@@ -1797,6 +1825,75 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     return OwnerEarnings(fiscal_year=fy, owner_earnings=owner, invested_capital=invested,
                          roic=roic, roic_maintenance=roic_maint, components=components,
                          caveats=tuple(caveats))
+
+
+def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
+                   annual_ni: dict[int, Fact], annual_op: dict[int, Fact]) -> tuple[str, ...]:
+    """Three standing questions a passing multiple cannot answer by itself.
+
+    Disclosure only: nothing here enters a criterion, a grade or an adjustment —
+    a company can be cheap on every Graham test and still be worth a second look
+    because its earnings never became cash, its share count keeps climbing, or
+    its interest bill is most of its operating profit.
+    """
+    notes: list[str] = []
+    ocf = _annual_union(gaap, OPERATING_CASH_FLOW_TAGS)
+    shared = sorted(set(ocf) & set(annual_ni), reverse=True)[:3]
+    if shared:
+        cash = sum(ocf[y].value for y in shared)
+        income = sum(annual_ni[y].value for y in shared)
+        if income > 0:
+            ratio = cash / income
+            if ratio < Decimal("0.8"):
+                notes.append(
+                    f"Over FY{min(shared)}–FY{max(shared)} the business turned "
+                    f"{ratio * 100:.0f}% of reported net income into operating cash "
+                    f"({cash / _MILLION:,.0f}M against {income / _MILLION:,.0f}M). "
+                    "Earnings that do not arrive as cash still count in every "
+                    "multiple on this page."
+                )
+            elif ratio > Decimal("1.5"):
+                notes.append(
+                    f"Operating cash flow over FY{min(shared)}–FY{max(shared)} is "
+                    f"{ratio * 100:.0f}% of reported net income — depreciation-heavy "
+                    "or working-capital-driven, so the earnings multiple understates "
+                    "what the business collects."
+                )
+
+    weighted = _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
+    years = sorted(weighted)
+    if len(years) >= 5:
+        latest, base = years[-1], years[-5]
+        old, new = weighted[base].value, weighted[latest].value
+        if old > 0:
+            change = (new / old - 1) * 100
+            if change > 10:
+                notes.append(
+                    f"The share count grew {change:.0f}% between FY{base} and FY{latest} "
+                    f"({old / _MILLION:,.1f}M to {new / _MILLION:,.1f}M shares). Per-share "
+                    "figures are divided by a denominator that keeps rising."
+                )
+            elif change < -10:
+                notes.append(
+                    f"The share count fell {abs(change):.0f}% between FY{base} and FY{latest} "
+                    f"({old / _MILLION:,.1f}M to {new / _MILLION:,.1f}M shares) — buybacks "
+                    "are lifting per-share figures independently of the business."
+                )
+
+    interest = _annual_union(gaap, INTEREST_EXPENSE_TAGS)
+    shared_op = sorted(set(interest) & set(annual_op), reverse=True)[:1]
+    for year in shared_op:
+        cost, profit = abs(interest[year].value), annual_op[year].value
+        if cost > 0 and profit > 0:
+            cover = profit / cost
+            if cover < 3:
+                notes.append(
+                    f"FY{year} operating profit covers interest {cover:.1f}x "
+                    f"({profit / _MILLION:,.0f}M against {cost / _MILLION:,.0f}M of interest). "
+                    "Graham's debt test measures the balance sheet; this is what the "
+                    "income statement pays for it."
+                )
+    return tuple(notes)
 
 
 def _restricted_cash(gaap: dict, fresh: date | None, end: date | None) -> Fact | None:

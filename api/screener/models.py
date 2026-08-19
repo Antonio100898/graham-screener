@@ -120,6 +120,9 @@ class FinancialSnapshot:
     temporary_equity: Fact | None = None
     # trailing preferred dividends: EPS nets them, NetIncomeLoss does not
     ttm_preferred_dividends: Decimal | None = None
+    # cash conversion, dilution and interest coverage — context a passing
+    # multiple cannot answer; never a criterion, never an adjustment
+    context_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

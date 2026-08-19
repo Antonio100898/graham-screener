@@ -1713,3 +1713,53 @@ def test_redeemable_nci_other_component_counts_without_a_total_et_style():
     gaap["RedeemableNoncontrollingInterestEquityCarryingAmount"] = \
         tagdata("USD", [inst("2026-03-31", 256e6, accn="q126")])
     assert float(build(gaap).noncontrolling_interest.value) == 256e6
+
+
+# --- Release 4: context notes and the secured/unsecured axis ---
+
+def test_secured_plus_unsecured_axis_beats_a_lone_instrument_gs_style():
+    """GS reports $348B unsecured and $11.6B secured with no instrument rollup;
+    subordinated debt sits inside unsecured and must not be added on top."""
+    gaap = dict(GAAP)
+    gaap["UnsecuredLongTermDebt"] = tagdata("USD", [inst("2026-03-31", 347.96e9, accn="q126")])
+    gaap["SecuredLongTermDebt"] = tagdata("USD", [inst("2026-03-31", 11.56e9, accn="q126")])
+    gaap["SubordinatedDebt"] = tagdata("USD", [inst("2026-03-31", 14.81e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 347.96e9 + 11.56e9
+
+    # a filer with subordinated debt and no axis tags still gets its figure
+    gaap2 = {k: v for k, v in gaap.items()
+             if k not in ("UnsecuredLongTermDebt", "SecuredLongTermDebt")}
+    assert float(build(gaap2).long_term_debt.value) == 14.81e9
+
+
+def test_context_notes_flag_weak_cash_conversion():
+    gaap = dict(GAAP)
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur(f"{y}-01-01", f"{y}-12-31", 1000e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+        for y in (2023, 2024, 2025)])
+    gaap["NetCashProvidedByUsedInOperatingActivities"] = tagdata("USD", [
+        dur(f"{y}-01-01", f"{y}-12-31", 400e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+        for y in (2023, 2024, 2025)])
+    note = next(n for n in build(gaap).context_notes if "operating cash" in n)
+    assert "40%" in note
+
+
+def test_context_notes_flag_a_rising_share_count():
+    gaap = dict(GAAP)
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur(f"{y}-01-01", f"{y}-12-31", shares, accn=f"k{y}", filed=f"{y+1}-02-15")
+        for y, shares in ((2021, 100e6), (2022, 105e6), (2023, 110e6),
+                          (2024, 118e6), (2025, 130e6))])
+    note = next(n for n in build(gaap).context_notes if "share count grew" in n)
+    assert "30%" in note
+
+
+def test_context_notes_flag_thin_interest_cover():
+    gaap = dict(GAAP)
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 200e6, accn="k25", filed="2026-02-15")])
+    gaap["InterestExpense"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
+    note = next(n for n in build(gaap).context_notes if "covers interest" in n)
+    assert "2.0x" in note

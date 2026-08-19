@@ -60,7 +60,7 @@ RECENT_DAYS = 400
 # stuff": a family may only live here with a reason a reviewer can reject.
 OUT_OF_SCOPE = (
     (r"^NetCashProvidedByUsedIn|^CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncrease|^CashPeriodIncrease|^EffectOfExchangeRateOn",
-     "cash-flow-statement totals: no criterion consumes OCF; owner earnings is built from parts"),
+     "cash-flow-statement totals: no CRITERION consumes OCF (owner earnings is built from parts with provenance); operating cash flow is read for the cash-conversion context note"),
     (r"OperatingLease|LesseeOperating|RightOfUse|LesseeDisclosure|SubleaseIncome|LeaseCost|LesseeFinanceLease|FinanceLeaseRightOfUse|FinanceLeaseInterest|FinanceLeasePrincipal|OperatingAndFinanceLease",
      "ASC 842 leases: rentals are not borrowed money under criterion 3; current portion already in LiabilitiesCurrent"),
     (r"DeferredTax|DeferredIncomeTax|IncomeTaxReconciliation|EffectiveIncomeTaxRate|UnrecognizedTaxBenefit|TaxCreditCarryforward|OperatingLossCarryforward|IncomeTaxesPaid|TaxesPayable|AccruedIncomeTaxes|IncomeTaxExaminationPenalties|TaxationExpense|TaxCutsAndJobs",
@@ -271,6 +271,8 @@ OUT_OF_SCOPE = (
      "sector-specific liability/asset composition inside the read totals"),
     (r"AmountOfRestrictedNetAssets|OtherInterestAndDividendIncome",
      "bank regulatory-restriction and interest-composition disclosure: totals are read"),
+    (r"FiniteLivedIntangibleAsset(Acquired)?InPlaceLeases|FiniteLivedIntangibleAssetsAcquired",
+     "intangible-class components INSIDE FiniteLivedIntangibleAssetsNet, which is read (PLD: 588M of a 1,496M total)"),
     (r"RealEstate\w|DevelopmentInProcess|AdvanceRent|DirectCostsOfLeasedAndRentedProperty|AccumulatedDistributionsInExcessOfNetIncome|DistributionsOnMandatorilyRedeemable|GainsLossesOnSalesOfInvestmentRealEstate",
      "REIT operating detail: property stocks inside assets, property costs inside expenses, distributions read via the payout chain"),
     (r"ValuationAllowancesAndReserves|SecuritiesReserveDepositRequired|TradingGainsLosses|ProgramRightsObligations|RoyaltyExpense|SellingExpense|AircraftRental|RestructuringSettlementAndImpairmentProvisions|ResearchAndDevelopmentArrangement|RestrictedStockExpense|CapitalizedComputerSoftwareAmortization",
@@ -288,21 +290,11 @@ OUT_OF_SCOPE = (
 # Genuine coverage gaps the harness has already proven, tracked for release 3.
 # Reported separately and non-fatally: a NEW tag landing in the gap list still
 # fails the run, so regressions cannot hide behind these.
-KNOWN_GAPS = {
-    "UnsecuredLongTermDebt":
-        "GS carries $348B under it; a debt-family candidate pending its fixture + counterexample (bank cohort, criteria 2-3 N/A)",
-    "SubordinatedDebt":
-        "GS $14.8B; same pending-verification status — the original audit saw it at 104 filers, mostly banks",
-    "FiniteLivedIntangibleAssetAcquiredInPlaceLeases":
-        "REIT in-place-lease intangibles (PLD $588M) — intangible-class candidate pending fixture",
-}
+KNOWN_GAPS: dict[str, str] = {}  # every tracked candidate resolved at engine v44
 
 # Identity mismatches already understood and tracked; a NEW ticker appearing
 # here still fails the run.
-KNOWN_IDENTITY = {
-    "GS": "debt parts understate the rollup: unread UnsecuredLongTermDebt/SubordinatedDebt (see KNOWN_GAPS); "
-          "criterion 3 uses the rollup, so no verdict rests on the parts",
-}
+KNOWN_IDENTITY: dict[str, str] = {}
 _OOS_COMPILED = tuple((re.compile(p), reason) for p, reason in OUT_OF_SCOPE)
 
 

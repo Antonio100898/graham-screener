@@ -477,3 +477,7 @@ table.grid { font-size: 14px; }
 .provenance-section a { color: var(--accent, #3b6ea5); text-decoration: none; white-space: nowrap; }
 .provenance-section a:hover { text-decoration: underline; }
 .series-mix { margin-top: 0.75rem; }
+
+/* Disclosure notes: context and earnings composition (release 4) */
+.disclosure-notes { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.disclosure-notes li { font-size: 11px; line-height: 1.55; color: var(--dim); }
