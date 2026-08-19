@@ -107,3 +107,61 @@ def test_export_valuation_uses_raw_threshold_not_rounded_display_ratio():
     # Graham's text says less than 120%; equality is not a pass.
     out = apply_price(price_row(ttm=10.0, tbvps=100.0), price=120.0)
     assert criterion(out, 7)["status"] == "FAIL"
+
+
+def test_verified_non_payer_fails_defensive_dividend_record():
+    # criterion 5 FAIL = verifiably pays nothing now; a 20-year uninterrupted
+    # record is then impossible, whatever the historical paid years show
+    row = screen_row()
+    next(c for c in row["criteria"] if c["n"] == 5)["status"] = "FAIL"
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["dividend_20y"] == "FAIL"
+
+
+def test_unknown_dividend_status_stays_incomplete_not_fail():
+    row = screen_row()
+    next(c for c in row["criteria"] if c["n"] == 5)["status"] = "INSUFFICIENT_DATA"
+    row["dividend_record"] = None
+    tests = enrich(row)["alignment"]["defensive"]["tests"]
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+
+
+def young_row():
+    # listed 2018: the whole public record is 8 years, complete
+    row = screen_row()
+    row["annual_eps"] = {"2018": 1.0, "2019": 1.1, "2020": 1.2, "2021": 1.4,
+                         "2022": 1.6, "2023": 1.8, "2024": 1.9, "2025": 2.0}
+    row["ch13"] = {}
+    row["dividend_record"] = {"first": 2018, "streak_from": 2018, "latest": 2025, "paid_years": 8}
+    return row
+
+
+def test_short_history_company_is_judged_over_its_whole_record():
+    result = enrich(young_row())["alignment"]["defensive"]
+    tests, windowed = result["tests"], result["windowed"]
+    assert tests["stability_10y"] == "PASS"           # 8 of 8 years, no deficit
+    assert tests["dividend_20y"] == "PASS"            # paid every year since listing
+    # base avg3(2018-20)=1.1, recent avg3(2023-25)=1.9 -> +72.7% over 5-year
+    # spacing, against the scaled (4/3)^0.5-1 = 15.5% threshold
+    assert tests["growth_10y"] == "PASS"
+    assert "8-year" in windowed["stability_10y"]
+    assert "8-year" in windowed["dividend_20y"]
+    assert "5-year spacing" in windowed["growth_10y"]
+
+
+def test_windowing_never_applies_to_a_gappy_or_pre_xbrl_record():
+    # same span but one missing year: dataset truncation, not a short history
+    gappy = young_row()
+    del gappy["annual_eps"]["2020"]
+    tests = enrich(gappy)["alignment"]["defensive"]["tests"]
+    assert tests["stability_10y"] == "INSUFFICIENT_DATA"
+    assert tests["growth_10y"] == "INSUFFICIENT_DATA"
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"
+
+    # record starting in the XBRL phase-in years could belong to an older company
+    old = young_row()
+    old["annual_eps"] = {str(y): 1.0 for y in range(2010, 2017)}
+    old["dividend_record"] = {"first": 2010, "streak_from": 2010, "latest": 2016, "paid_years": 7}
+    tests = enrich(old)["alignment"]["defensive"]["tests"]
+    assert tests["stability_10y"] == "INSUFFICIENT_DATA"
+    assert tests["dividend_20y"] == "INSUFFICIENT_DATA"

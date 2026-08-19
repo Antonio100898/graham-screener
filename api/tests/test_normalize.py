@@ -58,6 +58,40 @@ def build(gaap=GAAP):
     return build_snapshot("TEST", "0000000001", facts_doc(gaap))
 
 
+def test_filer_currently_on_foreign_forms_is_rejected():
+    """Even with US-GAAP facts: foreign balance sheets trail the domestic cadence."""
+    foreign_gaap = {
+        tag: tagdata(unit, [
+            {**entry, "form": "20-F" if entry["form"].startswith("10-K") else "6-K"}
+            for entry in entries
+        ])
+        for tag, data in GAAP.items()
+        for unit, entries in data["units"].items()
+    }
+    with pytest.raises(UnsupportedFilerError, match="foreign"):
+        build(foreign_gaap)
+
+
+def test_filer_that_moved_to_domestic_forms_keeps_foreign_history():
+    """Old 20-F facts stay readable once the newest financial filing is domestic."""
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        {**EPS[0], "form": "20-F"},  # FY2021 filed 2022 on the pre-transition form
+        *EPS[1:],
+    ])
+    s = build(gaap)
+    assert s.annual_eps[2021].provenance.form == "20-F"
+    assert float(s.annual_eps[2021].value) == 3.0
+
+
+def test_foreign_ifrs_facts_remain_explicitly_unsupported():
+    facts = {"facts": {"ifrs-full": {
+        "Revenue": tagdata("USD", [dur("2025-01-01", "2025-12-31", 1.0, form="20-F")])
+    }}}
+    with pytest.raises(UnsupportedFilerError, match="IFRS taxonomy"):
+        build_snapshot("IFRS", "0000000002", facts)
+
+
 def test_annual_eps_from_10k_only_latest_filed_wins():
     s = build()
     assert {y: float(f.value) for y, f in s.annual_eps.items()} == {
@@ -152,6 +186,36 @@ def test_intangibles_summed_from_finite_and_indefinite():
     assert float(s.intangibles.value) == 30e9
     assert "FiniteLived" in s.intangibles.provenance.tag
     assert "IndefiniteLived" in s.intangibles.provenance.tag
+
+
+def test_other_intangible_assets_net_is_last_resort():
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["OtherIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 12e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.intangibles.value) == 12e9
+    assert "OtherIntangibleAssetsNet" in s.intangibles.provenance.tag
+    # the specific tags win over the ambiguous residual line
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 20e9, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 20e9
+
+
+def test_combined_goodwill_intangibles_line_fills_both_slots():
+    gaap = {k: v for k, v in GAAP.items()
+            if k not in ("Goodwill", "IntangibleAssetsNetExcludingGoodwill")}
+    gaap["IntangibleAssetsNetIncludingGoodwill"] = tagdata("USD", [inst("2026-03-31", 80e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.intangibles.value) == 80e9
+    assert float(s.goodwill.value) == 0  # contained in the combined line, not missing
+    assert "IntangibleAssetsNetIncludingGoodwill" in s.goodwill.provenance.tag
+
+
+def test_combined_line_never_used_when_goodwill_tagged_separately():
+    # goodwill + combined would double-count the goodwill inside the combined line
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["IntangibleAssetsNetIncludingGoodwill"] = tagdata("USD", [inst("2026-03-31", 80e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.goodwill.value) == 50e9
+    assert s.intangibles is None
 
 
 def test_sum_includes_components_with_different_period_ends():
@@ -363,10 +427,12 @@ def test_bank_without_classified_balance_sheet():
     assert s.total_assets is not None
 
 
-def test_foreign_filer_rejected():
-    gaap = {"Assets": tagdata("USD", [inst("2025-12-31", 1e9, form="20-F")])}
-    with pytest.raises(UnsupportedFilerError):
-        build(gaap)
+def test_foreign_ifrs_filer_rejected():
+    facts = {"facts": {"ifrs-full": {
+        "Assets": tagdata("USD", [inst("2025-12-31", 1e9, form="20-F")])
+    }}}
+    with pytest.raises(UnsupportedFilerError, match="IFRS taxonomy"):
+        build_snapshot("IFRS", "0000000003", facts)
 
 
 def test_frame_field_labels_comparative_only_years():

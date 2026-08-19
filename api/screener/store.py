@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 33  # displayed two-decimal defensive valuation boundary
+ENGINE_VERSION = 35  # hide foreign-form filers; combined + other intangible tag fallbacks
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

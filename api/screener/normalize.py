@@ -14,7 +14,30 @@ from .models import Fact, FinancialSnapshot, OwnerEarnings, Provenance
 
 
 class UnsupportedFilerError(Exception):
-    """Foreign filers (20-F/40-F) are rejected explicitly, not partially evaluated."""
+    """A filing basis not covered by the normalizer; never partially evaluate it."""
+
+
+# Foreign issuers file annual 20-F/40-F reports and interim 6-K reports, mostly
+# under IFRS, and their US-GAAP facts (when any) trail the domestic cadence —
+# balance sheets arrive stale or not at all.  A filer whose newest financial
+# filing is a foreign form is rejected outright; the form tuples still include
+# the foreign forms so that a filer that later moved to 10-K/10-Q keeps its
+# pre-transition history readable.
+ANNUAL_FORMS = ("10-K", "20-F", "40-F")
+INTERIM_FORMS = ("10-Q", "6-K")
+FINANCIAL_FORMS = ANNUAL_FORMS + INTERIM_FORMS
+
+
+def _is_annual_form(form: str) -> bool:
+    return form.startswith(ANNUAL_FORMS)
+
+
+def _is_interim_form(form: str) -> bool:
+    return form.startswith(INTERIM_FORMS)
+
+
+def _is_financial_form(form: str) -> bool:
+    return form.startswith(FINANCIAL_FORMS)
 
 
 EPS_CONTINUING_TAG = "IncomeLossFromContinuingOperationsPerDilutedShare"
@@ -173,6 +196,8 @@ def build_snapshot(
         total_liabilities = _derive_liabilities(gaap, fresh)
     goodwill = _latest_instant(gaap, "Goodwill", ("Goodwill",), not_before=fresh)
     intangibles = _intangibles(gaap, fresh)
+    if goodwill is None and intangibles is None:
+        goodwill, intangibles = _combined_goodwill_and_intangibles(gaap, fresh)
     # liquidation preference first: it is the economically correct common-TBV deduction
     # and better maintained than the par-value tag (JPM par tag is stale since 2009)
     preferred = _latest_instant(
@@ -272,15 +297,25 @@ def build_snapshot(
 
 
 def _reject_foreign(facts: dict) -> None:
-    forms = {
-        e.get("form", "")
-        for taxo in facts.values()
-        for tagdata in taxo.values()
-        for entries in tagdata.get("units", {}).values()
-        for e in entries
-    }
-    if any(f.startswith(("20-F", "40-F")) for f in forms) and not any(f.startswith("10-K") for f in forms):
-        raise UnsupportedFilerError("foreign filer (20-F/40-F); only US domestic 10-K/10-Q filers are supported")
+    latest = {"foreign": "", "domestic": ""}
+    for taxo in facts.values():
+        for tagdata in taxo.values():
+            for entries in tagdata.get("units", {}).values():
+                for e in entries:
+                    form = e.get("form", "")
+                    if form.startswith(("20-F", "40-F", "6-K")):
+                        side = "foreign"
+                    elif form.startswith(("10-K", "10-Q")):
+                        side = "domestic"
+                    else:
+                        continue
+                    if e.get("filed", "") > latest[side]:
+                        latest[side] = e["filed"]
+    if latest["foreign"] > latest["domestic"]:
+        raise UnsupportedFilerError(
+            "filer currently reports on foreign forms (20-F/40-F/6-K); foreign "
+            "reporting cadence and IFRS taxonomy are not supported"
+        )
 
 
 def _entries(taxo: dict, tag: str, unit_pref: tuple[str, ...]) -> list[dict]:
@@ -426,12 +461,12 @@ def _split_events(periods: dict[tuple[str, str], list[tuple[str, Decimal]]]
 
 
 def _annual_series(gaap: dict, tag: str, unit: tuple[str, ...] = ("USD/shares",)) -> dict[int, Fact]:
-    """Full-fiscal-year facts from 10-K filings only. Never a sum of quarters (§5.2)."""
+    """Full-fiscal-year facts from annual filings only. Never a sum of quarters (§5.2)."""
     by_end: dict[str, dict] = {}
     frames: dict[str, int] = {}
     annual_entries = []
     for e in _entries(gaap, tag, unit):
-        if "start" not in e or not e.get("form", "").startswith("10-K"):
+        if "start" not in e or not _is_annual_form(e.get("form", "")):
             continue
         if _days(e) not in _ANNUAL_DAYS:
             continue
@@ -656,15 +691,15 @@ def _latest_annual_end(annual_eps: dict[int, Fact]) -> date | None:
 def _ttm_eps(gaap: dict, annual_eps: dict[int, Fact],
              unit: tuple[str, ...] = ("USD/shares",),
              per_share: bool = True) -> tuple[Decimal | None, tuple[Fact, ...]]:
-    """Current EPS for criterion 1: latest annual, rolled forward with 10-Q
-    year-to-date figures when a quarter newer than the 10-K exists
+    """Current EPS for criterion 1: latest annual, rolled forward with interim
+    year-to-date figures when a newer filing exists
     (TTM = FY + YTD_current - YTD_prior_year)."""
     if not annual_eps:
         return None, ()
     latest = annual_eps[max(annual_eps)]
     tag = latest.provenance.tag.split(":", 1)[1]
     all_durations = [e for e in _entries(gaap, tag, unit) if "start" in e]
-    quarters = [e for e in all_durations if e.get("form", "").startswith("10-Q")]
+    quarters = [e for e in all_durations if _is_interim_form(e.get("form", ""))]
     if not quarters:
         return latest.value, (latest,)
     latest_end = max(date.fromisoformat(e["end"]) for e in quarters)
@@ -769,7 +804,7 @@ def _duration_fact(gaap: dict, tag: str, start: str, end: str, unit=("USD",)) ->
     """Value for an exact reporting period, latest-filed wins."""
     matches = [e for e in _entries(gaap, tag, unit)
                if e.get("start") == start and e.get("end") == end
-               and e.get("form", "").startswith(("10-K", "10-Q"))]
+               and _is_financial_form(e.get("form", ""))]
     if not matches:
         return None
     return _dec(max(matches, key=lambda e: e["filed"])["val"])
@@ -782,7 +817,7 @@ def _year_earlier_fact(gaap: dict, tag: str, start: date, end: date) -> Decimal 
     length = (end - start).days
     best = None
     for e in _entries(gaap, tag, ("USD",)):
-        if "start" not in e or not e.get("form", "").startswith(("10-K", "10-Q")):
+        if "start" not in e or not _is_financial_form(e.get("form", "")):
             continue
         es, ee = date.fromisoformat(e["start"]), date.fromisoformat(e["end"])
         if abs((ee - want_end).days) <= 10 and abs((es - want_start).days) <= 10 \
@@ -899,7 +934,7 @@ def _latest_instant(
             e
             for e in _entries(taxo, tag, unit)
             if "start" not in e
-            and e.get("form", "").startswith(("10-K", "10-Q"))
+            and _is_financial_form(e.get("form", ""))
             and e["end"] >= floor
         ]
         if entries:
@@ -1028,7 +1063,7 @@ def _has_material_value(tagdata: dict) -> bool:
         isinstance(e.get("val"), (int, float)) and abs(e["val"]) >= _EVIDENCE_FLOOR
         for unit in tagdata.get("units", {}).values()
         for e in unit
-        if e.get("form", "").startswith(("10-K", "10-Q"))
+        if _is_financial_form(e.get("form", ""))
     )
 
 
@@ -1061,7 +1096,10 @@ def _derive_liabilities(gaap: dict, not_before: date | None) -> Fact | None:
 
 
 def _intangibles(gaap: dict, not_before: date | None) -> Fact | None:
-    """Total ex-goodwill tag when present; otherwise finite + indefinite-lived parts."""
+    """Total ex-goodwill tag when present; otherwise finite + indefinite-lived parts;
+    otherwise the OtherIntangibleAssetsNet line some filers use as their only total.
+    Last because when the specific tags exist it may be a residual category, and
+    adding it to them would risk double counting."""
     total = _latest_instant(
         gaap, "Intangibles", ("IntangibleAssetsNetExcludingGoodwill",), not_before=not_before
     )
@@ -1074,7 +1112,35 @@ def _intangibles(gaap: dict, not_before: date | None) -> Fact | None:
         gaap, "Intangibles (indefinite-lived)", ("IndefiniteLivedIntangibleAssetsExcludingGoodwill",),
         not_before=not_before,
     )
-    return _sum_facts("Intangibles", [finite, indefinite])
+    summed = _sum_facts("Intangibles", [finite, indefinite])
+    if summed is not None:
+        return summed
+    return _latest_instant(
+        gaap, "Intangibles (other, net)", ("OtherIntangibleAssetsNet",), not_before=not_before
+    )
+
+
+def _combined_goodwill_and_intangibles(gaap: dict, not_before: date | None) -> tuple[Fact | None, Fact | None]:
+    """Some filers tag one combined goodwill+intangibles balance line and nothing
+    else. Subtracting that line once equals subtracting both parts, so it fills
+    the intangibles slot; goodwill becomes an explicit zero whose provenance
+    names the combined line that already contains it."""
+    combined = _latest_instant(
+        gaap, "Intangibles (incl. goodwill)", ("IntangibleAssetsNetIncludingGoodwill",),
+        not_before=not_before,
+    )
+    if combined is None:
+        return None, None
+    p = combined.provenance
+    goodwill = Fact(
+        value=Decimal(0),
+        provenance=Provenance(
+            concept="Goodwill (contained in the combined intangibles line)",
+            tag=p.tag, fiscal_year=p.fiscal_year, form=p.form,
+            accession=p.accession, filed=p.filed, period_end=p.period_end,
+        ),
+    )
+    return goodwill, combined
 
 
 OPERATING_INCOME_TAGS = ("OperatingIncomeLoss",)
@@ -1305,7 +1371,7 @@ def _weighted_shares(gaap: dict, not_before: date | None) -> Fact | None:
     entries = [
         e
         for e in _entries(gaap, tag, ("shares",))
-        if "start" in e and e.get("form", "").startswith(("10-K", "10-Q")) and e["end"] >= floor
+        if "start" in e and _is_financial_form(e.get("form", "")) and e["end"] >= floor
     ]
     if not entries:
         return None
@@ -1350,7 +1416,7 @@ def _dividend_record(gaap: dict) -> dict | None:
     paid: set[int] = set()
     for tag, unit in DIVIDEND_TAGS:
         for e in _entries(gaap, tag, unit):
-            if "start" in e and e.get("form", "").startswith(("10-K", "10-Q")) \
+            if "start" in e and _is_financial_form(e.get("form", "")) \
                     and _dec(e["val"]) > 0:
                 paid.add(int(e["end"][:4]))
     if not paid:
@@ -1388,7 +1454,7 @@ def _dividend(gaap: dict, reference: date | None) -> tuple[bool | None, Fact | N
             continue
         for unit in tagdata.get("units", {}).values():
             for e in unit:
-                if (e.get("form", "").startswith(("10-K", "10-Q"))
+                if (_is_financial_form(e.get("form", ""))
                         and e.get("end", "") >= floor
                         and isinstance(e.get("val"), (int, float)) and e["val"] > 0):
                     return None, None
