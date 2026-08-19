@@ -2268,28 +2268,65 @@ def _weighted_shares(gaap: dict, not_before: date | None) -> Fact | None:
     return None
 
 
+def _is_a_rate_not_a_total(gaap: dict, tag: str, unit: tuple[str, ...],
+                           annual: dict[int, Fact]) -> bool:
+    """Whether a per-share dividend element states the quarterly rate rather than
+    the year's total.
+
+    Visa tags 0.59 for a ninety-day quarter and 0.59 again for the whole fiscal
+    year: the element carries the rate per payment, repeated against every
+    context. Treating that as a year's dividends understates the yield fourfold,
+    and the filer's own facts are what give it away — a total cannot equal one
+    of its own quarters."""
+    for year, fact in annual.items():
+        end = fact.provenance.period_end
+        if end is None:
+            continue
+        for e in _entries(gaap, tag, unit):
+            if "start" not in e or not _is_financial_form(e.get("form", "")):
+                continue
+            if e["end"] != end.isoformat() or not 80 <= _days(e) <= 100:
+                continue
+            if _dec(e["val"]) == fact.value:
+                return True
+    return False
+
+
 def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None) -> Decimal | None:
     """A dividend fact covers whatever span the filer tagged — a quarter for one
     company, half a year for another — so the raw figure is not comparable. Roll it
     to twelve months the same way earnings are, then express it per share."""
     if dividend is None:
         return None
-    tag = dividend.provenance.tag.split(":", 1)[1]
-    # The chain's own unit declaration decides per-share vs dollar aggregate;
-    # a name test would silently mis-scale any newly added per-unit tag.
-    unit = dict(DIVIDEND_TAGS).get(tag, ("USD",))
-    per_share = "USD/shares" in unit
-    annual = _annual_series(gaap, tag, unit=unit)
-    if not annual:
-        return None
-    ttm, _ = _ttm_eps(gaap, annual, unit=unit, per_share=False)
-    if ttm is None:
-        return None
-    if per_share:
-        return ttm
-    if shares is None or shares.value <= 0:
-        return None
-    return ttm / shares.value
+    # The element that proves a company still pays is not always the one it uses
+    # for its annual totals: Coca-Cola's freshest dividend fact is quarterly
+    # under DividendsCommonStockCash, and it tags no annual series there at all,
+    # so reading the yield from that one tag alone left 167 payers — Coke, ADP,
+    # Visa, Exxon — showing that they pay without saying how much. Every chained
+    # element is tried, per-share ones first: those need no share count, so they
+    # cannot inherit an error from it.
+    chosen = dividend.provenance.tag.split(":", 1)[1]
+    ordered = sorted(
+        DIVIDEND_TAGS,
+        key=lambda pair: (pair[0] != chosen, "USD/shares" not in pair[1]),
+    )
+    for tag, unit in ordered:
+        # The chain's own unit declaration decides per-share vs dollar aggregate;
+        # a name test would silently mis-scale any newly added per-unit tag.
+        per_share = "USD/shares" in unit
+        annual = _annual_series(gaap, tag, unit=unit)
+        if not annual:
+            continue
+        if per_share and _is_a_rate_not_a_total(gaap, tag, unit, annual):
+            continue
+        ttm, _ = _ttm_eps(gaap, annual, unit=unit, per_share=False)
+        if ttm is None or ttm <= 0:
+            continue
+        if per_share:
+            return ttm
+        if shares is not None and shares.value > 0:
+            return ttm / shares.value
+    return None
 
 
 def _dividend_record(gaap: dict) -> dict | None:

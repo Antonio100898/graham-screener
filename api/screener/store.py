@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 49  # data integrity: no zero share counts, no negative revenue or assets, no decade-old trailing figures
+ENGINE_VERSION = 51  # dividend yield reads the annual series from any chained tag, and refuses a per-share rate
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

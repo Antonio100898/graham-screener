@@ -66,6 +66,9 @@ export default function Detail({ row, onClose }) {
             <Metric label="Long-term debt" value={money(ltd)} />
             <Metric label="Tangible book / share" value={moneyPrice(row.tbvps)} />
             <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} emphasis={row.ncavps != null && row.price != null && row.price <= row.ncavps} />
+            <Metric label="Price / NCAV" sub="Graham buys under 0.67×"
+                    value={multiple(priceToNcav(row))}
+                    emphasis={priceToNcav(row) != null && priceToNcav(row) <= 2 / 3} />
           </div>
         </section>
 
@@ -103,6 +106,15 @@ export default function Detail({ row, onClose }) {
       </aside>
     </>
   );
+}
+
+/** Graham's hardest bargain: the price against net current assets alone, with
+ * every liability already subtracted and the fixed assets thrown in free. Only
+ * meaningful while net current assets are positive — a negative denominator
+ * turns "cheap" upside down. */
+function priceToNcav(row) {
+  if (row.price == null || row.ncavps == null || row.ncavps <= 0) return null;
+  return row.price / row.ncavps;
 }
 
 function Metric({ label, sub, value, emphasis = false }) {

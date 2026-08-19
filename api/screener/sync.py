@@ -222,7 +222,11 @@ def _ncavps(snap) -> float | None:
     need = (snap.current_assets, snap.total_liabilities, snap.shares_outstanding)
     if any(f is None for f in need) or snap.shares_outstanding.value <= 0:
         return None
-    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest) if f)
+    # mezzanine equity is senior to the common the same way preferred is, and
+    # tangible book already deducts it; leaving it in here would credit the
+    # common with assets it stands behind
+    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
+                                     snap.temporary_equity) if f)
     return float((snap.current_assets.value - snap.total_liabilities.value - optional)
                  / snap.shares_outstanding.value)
 

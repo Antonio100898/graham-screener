@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import Detail from "./Detail.jsx";
 import LoadBar from "./LoadBar.jsx";
 import MultiSelect from "./MultiSelect.jsx";
-import EarningsEvidence, { earningsQuality, epsEvidence } from "./EarningsEvidence.jsx";
+import EarningsEvidence, { epsEvidence } from "./EarningsEvidence.jsx";
 import { send } from "./api.js";
 import { below, spell } from "./format.js";
 import { loadView, saveView, takeOverScrollRestoration } from "./view.js";
@@ -151,18 +151,19 @@ export default function App() {
   const rows = useMemo(() => {
     if (!data) return [];
     return data.rows.map((r) => {
-      const quality = earningsQuality(r.annual_eps, r.annual_net_income);
       return {
         ...r,
         mcap: r.price && r.shares ? r.price * r.shares : null,
         eps10: epsEvidence(r.annual_eps),
-        quality,
         // any criterion we could not decide either way leaves the verdict incomplete
         unjudged: r.criteria.some((c) => c.status !== "PASS" && c.status !== "FAIL"),
         // criteria 2 and 3 cannot be asked of a filer with no classified balance
         // sheet — unlike a missing figure, no later filing will ever supply it
         inapplicable: r.criteria.some((c) => c.status === "NOT_APPLICABLE"),
         netNet: r.ncavps != null && r.price != null && r.ncavps > 0 && r.price <= r.ncavps,
+        // only while net current assets are positive: a negative denominator
+        // would turn the cheapest-looking ratio into the most expensive company
+        pncav: r.ncavps != null && r.price != null && r.ncavps > 0 ? r.price / r.ncavps : null,
         idx: r.index_memberships ?? [],
         pe3: pe3(r),
         roic: r.owner_earnings?.roic ?? null,
@@ -225,6 +226,8 @@ export default function App() {
       if (key === "pe3") return r.pe3 ?? null;
       // the interesting end is the highest return, so it leads on the first click
       if (key === "roic") return r.roic == null ? null : -r.roic;
+      // here the interesting end is the cheapest, which is the lowest ratio
+      if (key === "pncav") return r.pncav ?? null;
       // the interesting end is the most beaten-down, so sort those to the top
       if (key === "offhigh")
         return r.price_stats?.pct_below_52w_high == null
@@ -442,7 +445,6 @@ export default function App() {
             <Th id="fit" sort={sort} onSort={sortBy}>Graham fit<em className="sub2">E · D</em></Th>
             <Th id="index" sort={sort} onSort={sortBy}>Index</Th>
             <Th id="eps10" sort={sort} onSort={sortBy}>10Y EPS evidence<em className="sub2">positive years · growth</em></Th>
-            <th>Earnings quality<em className="sub2">exception only</em></th>
             <Th id="mcap" sort={sort} onSort={sortBy} className="num">Mkt cap</Th>
             <Th id="price" sort={sort} onSort={sortBy} className="num">Price</Th>
             <Th id="offhigh" sort={sort} onSort={sortBy} className="num">
@@ -453,6 +455,7 @@ export default function App() {
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
             <Th id="roic" sort={sort} onSort={sortBy} className="num">ROIC</Th>
+            <Th id="pncav" sort={sort} onSort={sortBy} className="num">P/NCAV</Th>
           </tr>
         </thead>
         <tbody>
@@ -487,9 +490,6 @@ export default function App() {
                   : <span className="dim">—</span>}
               </td>
               <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
-              <td data-label="Earnings quality">
-                {r.quality ? <span className="earnings-quality" title={r.quality.title}>YES</span> : <span className="dim">—</span>}
-              </td>
               <td className="num" data-label="Mkt cap">{fmtCap(r.mcap)}</td>
               <td className="num" data-label="Price">{fmtPrice(r.price)}</td>
               <td className="num offhigh" data-label="Off high" title={drawdownTitle(r)}>
@@ -510,6 +510,10 @@ export default function App() {
               <td className={`num${r.roic != null && r.roic >= 10 ? " ok" : ""}`} data-label="ROIC"
                   title="owner earnings (operating profit + depreciation and amortisation − tax − capital expenditure) over invested capital — 10% is attractive, 6% acceptable behind a strong brand">
                 {r.roic == null ? "—" : `${r.roic.toFixed(1)}%`}
+              </td>
+              <td className={`num${r.pncav != null && r.pncav <= 2 / 3 ? " ok" : ""}`} data-label="P/NCAV"
+                  title="price over net current asset value per share — current assets less every liability, fixed assets counted as nothing. Graham's hardest bargain is a price under two-thirds of it; blank where net current assets are not positive">
+                {r.pncav == null ? "—" : `${r.pncav.toFixed(2)}×`}
               </td>
             </tr>
           ))}

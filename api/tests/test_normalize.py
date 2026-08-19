@@ -1894,3 +1894,37 @@ def test_negative_assets_are_a_sign_error_not_a_balance_sheet():
     gaap["AssetsCurrent"] = tagdata("USD", [inst("2026-03-31", -26, accn="q126")])
     s = build(gaap)
     assert s.current_assets is None
+
+
+def test_yield_reads_the_annual_series_even_from_another_chained_tag_ko_style():
+    """Coca-Cola's freshest dividend fact is quarterly under one element while
+    its annual series lives under another; reading only the winning tag left
+    167 payers stating that they pay without saying how much."""
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["DividendsCommonStockCash"] = tagdata("USD", [          # freshest, quarterly only
+        dur("2026-01-01", "2026-04-03", 2.28e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["CommonStockDividendsPerShareCashPaid"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-12-31", 2.06, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert s.pays_dividend is True
+    assert s.dividend.provenance.tag.endswith("DividendsCommonStockCash")  # recency unchanged
+    assert s.dividend_per_share == Decimal("2.06")                          # yield from the series
+
+
+def test_a_per_share_rate_repeated_across_contexts_is_not_a_years_dividends():
+    """Visa tags 0.59 for a quarter and 0.59 again for the fiscal year: the
+    element carries the rate per payment. Taking it as the annual total would
+    understate the yield fourfold, so the figure is withheld instead."""
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2024-10-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
+        dur("2025-07-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
+    ])
+    assert build(gaap).dividend_per_share is None
+
+    # a genuine annual total, larger than any one quarter, is used
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2024-10-01", "2025-09-30", 2.36, form="10-K", accn="k25", filed="2025-11-15"),
+        dur("2025-07-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
+    ])
+    assert build(gaap).dividend_per_share == Decimal("2.36")
