@@ -144,6 +144,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
                                     if snap.noncontrolling_interest else None),
         "temporary_equity": (float(snap.temporary_equity.value)
                              if snap.temporary_equity else None),
+        # the payment fact behind criterion 5 — covers whatever span the filer
+        # tagged (its period end sits in sources.dividend)
+        "dividend": float(snap.dividend.value) if snap.dividend else None,
         # per-figure provenance: which tag, in which filing, dated when — the
         # reader can open the exact document behind every number
         "sources": {name: src for name, src in (

@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 40  # release 3b: per-figure provenance and series scope-switch disclosure in the payload
+ENGINE_VERSION = 41  # payload: dividend payment amount beside its provenance row
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

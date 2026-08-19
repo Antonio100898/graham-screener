@@ -164,7 +164,7 @@ const SOURCE_LABELS = {
   total_debt: "Total debt (rollup)", goodwill: "Goodwill", intangibles: "Intangibles",
   preferred_stock: "Preferred stock", temporary_equity: "Temporary equity",
   noncontrolling_interest: "Noncontrolling interest", shares: "Shares outstanding",
-  dividend: "Dividend",
+  dividend: "Dividend paid (tagged period)",
 };
 
 function edgarUrl(cik, accn) {
@@ -187,7 +187,8 @@ function Provenance({ row }) {
             {Object.entries(SOURCE_LABELS).filter(([key]) => sources[key]).map(([key, label]) => {
               const s = sources[key];
               const url = edgarUrl(row.cik, s.accn);
-              const value = key === "shares" ? number(row[key]) : money(row[key]);
+              const raw = key === "dividend" && row[key] == null ? undefined : row[key];
+              const value = key === "shares" ? number(raw) : money(raw);
               return (
                 <tr key={key}>
                   <td><b>{label}</b></td>
