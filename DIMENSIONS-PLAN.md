@@ -84,10 +84,19 @@ per-share figure reads as a bargain. The rules, in order:
    concept and period — KKR's lone `ClassOfStock=CommonStock` — that *is* the
    company's figure. This case alone covers most of the 474.
 4. **Multiple members require proof.** A ticker is one share class, and HEI and
-   HEI.A are different securities at different prices. Use a dimensioned
-   per-share fact only when the ticker maps to a class on evidence (SEC's
-   `company_tickers_exchange.json` plus the class facts on the cover). With no
-   proof, leave it missing — the invariant that has held all along.
+   HEI.A are different securities at different prices. Visa is the case that
+   matters: it reports Class A at $3.03, Class B1 at $4.71 and Class B2 at
+   $4.61 for the same quarter, and the ticker V is Class A alone.
+
+   **Verified constraint:** the mapping cannot be read from the datasets.
+   `num.txt` holds numeric facts only, so the cover-page `TradingSymbol` — the
+   one fact that ties a ticker to a share class — is not there, and Company
+   Facts omits text facts as well. The candidate rule is therefore the largest
+   class by weighted-average share count, adopted only when it exceeds the next
+   class by a wide margin (Visa: 1,933M Class A against 120M Class B2, a
+   sixteen-fold gap) and left missing when the classes are close. That rule
+   must be validated against a set of known dual-class tickers before it ships,
+   because a wrong class is a wrong price-to-earnings on a real company.
 5. **Additive concepts may be summed only with a reconciliation.** Share counts
    across classes may be added when the members are provably disjoint *and* the
    sum agrees with an independent total (the dei cover count) within tolerance.
