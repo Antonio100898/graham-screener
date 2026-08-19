@@ -91,6 +91,8 @@ export default function Detail({ row, onClose }) {
         />
 
         <AnnualFinancialHistory annualEps={row.annual_eps} annualNetIncome={row.annual_net_income} />
+        <SeriesMix mix={row.series_mix} />
+        <Provenance row={row} />
       </aside>
     </>
   );
@@ -153,6 +155,73 @@ function enterprisingValue(criterion) {
   if (criterion.n === 1 || criterion.n === 2 || criterion.n === 3 || criterion.n === 7) return multiple(criterion.value);
   if (criterion.n === 5) return criterion.value == null ? "—" : `${number(criterion.value)}% yield`;
   return criterion.value == null ? "—" : number(criterion.value);
+}
+
+const SOURCE_LABELS = {
+  total_assets: "Total assets", total_liabilities: "Total liabilities",
+  current_assets: "Current assets", current_liabilities: "Current liabilities",
+  long_term_debt: "Long-term debt", short_term_debt: "Short-term debt",
+  total_debt: "Total debt (rollup)", goodwill: "Goodwill", intangibles: "Intangibles",
+  preferred_stock: "Preferred stock", temporary_equity: "Temporary equity",
+  noncontrolling_interest: "Noncontrolling interest", shares: "Shares outstanding",
+  dividend: "Dividend",
+};
+
+function edgarUrl(cik, accn) {
+  if (!cik || !accn) return null;
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replaceAll("-", "")}/`;
+}
+
+/** Every figure names its tag, filing and date — the audit trail behind the screen. */
+function Provenance({ row }) {
+  const sources = row.sources;
+  if (!sources || Object.keys(sources).length === 0) return null;
+  return (
+    <section className="criteria-section provenance-section">
+      <div className="criteria-title"><div><h3>Data provenance</h3>
+        <p>Which XBRL tag, in which SEC filing, dated when. Filing links open EDGAR.</p></div></div>
+      <div className="provenance-scroll">
+        <table className="criteria-clean">
+          <thead><tr><th>Figure</th><th>Value</th><th>Tag</th><th>Filing</th></tr></thead>
+          <tbody>
+            {Object.entries(SOURCE_LABELS).filter(([key]) => sources[key]).map(([key, label]) => {
+              const s = sources[key];
+              const url = edgarUrl(row.cik, s.accn);
+              const value = key === "shares" ? number(row[key]) : money(row[key]);
+              return (
+                <tr key={key}>
+                  <td><b>{label}</b></td>
+                  <td className="num">{value}</td>
+                  <td className="rule"><code>{s.tag}</code></td>
+                  <td>{url
+                    ? <a href={url} target="_blank" rel="noreferrer">{s.form} · {s.end ?? "—"}</a>
+                    : `${s.form} · ${s.end ?? "—"}`}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+/** A series stitched from more than one tag can change scope mid-history. */
+function SeriesMix({ mix }) {
+  if (!mix) return null;
+  const NAMES = { eps: "EPS", net_income: "Net income", revenue: "Revenue" };
+  return (
+    <div className="series-mix">
+      {Object.entries(mix).map(([series, tags]) => (
+        <p key={series} className="criteria-note">
+          <b>{NAMES[series] ?? series} series is stitched from {Object.keys(tags).length} tags:</b>{" "}
+          {Object.entries(tags).map(([tag, years]) =>
+            `${tag.replace("us-gaap:", "")} (${years[0]}–${years[years.length - 1]})`).join(" · ")}
+          {" — "}scope can differ between tags; judge year-over-year steps that cross a boundary accordingly.
+        </p>
+      ))}
+    </div>
+  );
 }
 
 function Status({ value }) {

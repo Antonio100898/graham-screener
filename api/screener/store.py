@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 39  # release 3: dual-class share outvote, fragile-source veto, combined debt rollups, current-liabilities derivation
+ENGINE_VERSION = 40  # release 3b: per-figure provenance and series scope-switch disclosure in the payload
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

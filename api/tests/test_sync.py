@@ -175,3 +175,27 @@ def test_index_membership_parsers():
               + "".join(f'<tr><td>{tick(i)}</td><td><a href="/wiki/X">X</a></td></tr>'
                         for i in range(102)) + "</table>")
     assert len(nasdaq100(n_html)) == 101  # first row is the header
+
+
+def test_row_carries_per_figure_provenance_and_series_mix():
+    """Release 3b: every extracted figure names its tag and filing; a series
+    stitched from two tags discloses which years came from which."""
+    from tests.test_normalize import GAAP, facts_doc, tagdata, dur
+    from screener.sync import _derive
+
+    gaap = dict(GAAP)
+    # EPS 2021 under a different element -> a scope switch worth disclosing
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        e for e in GAAP["EarningsPerShareDiluted"]["units"]["USD/shares"]
+        if not e["start"].startswith("2021")])
+    gaap["EarningsPerShareBasicAndDiluted"] = tagdata("USD/shares", [
+        dur("2021-01-01", "2021-12-31", 3.0, accn="k21", filed="2022-02-15")])
+    status, row = _derive("0000000001", "TEST", facts_doc(gaap))
+    assert status == "ok"
+    src = row["sources"]["total_assets"]
+    assert src["tag"] == "us-gaap:Assets"
+    assert src["form"] and src["accn"] and src["end"]
+    assert row["sources"]["goodwill"]["tag"] == "us-gaap:Goodwill"
+    mix = row["series_mix"]["eps"]
+    assert mix["us-gaap:EarningsPerShareBasicAndDiluted"] == [2021]
+    assert 2025 in mix["us-gaap:EarningsPerShareDiluted"]

@@ -48,6 +48,28 @@ def _facts_path(edgar: EdgarClient, cik: str) -> Path:
     return edgar.cache_dir / f"companyfacts_{cik}.json"
 
 
+def _source(fact) -> dict | None:
+    """Compact provenance for the payload: enough to open the exact filing."""
+    if fact is None:
+        return None
+    p = fact.provenance
+    return {"tag": p.tag, "form": p.form, "accn": p.accession,
+            "end": p.period_end.isoformat() if p.period_end else None,
+            "filed": p.filed.isoformat() if p.filed else None}
+
+
+def _series_mix(series: dict) -> dict | None:
+    """Which tag served which years — only when the series switched tags, so the
+    reader sees a scope change (ProfitLoss beside NetIncomeLoss) instead of a
+    silently uniform-looking history."""
+    tags: dict[str, list[int]] = {}
+    for year, fact in series.items():
+        tags.setdefault(fact.provenance.tag, []).append(year)
+    if len(tags) <= 1:
+        return None
+    return {tag: sorted(years) for tag, years in tags.items()}
+
+
 def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict | None]:
     """Snapshot + screen result, flattened for the dashboard."""
     try:
@@ -115,6 +137,37 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
         "dividend_per_share": float(snap.dividend_per_share)
                               if snap.dividend_per_share is not None else None,
         "owner_earnings": _owner_earnings_row(snap),
+        "short_term_debt": float(snap.short_term_debt.value) if snap.short_term_debt else None,
+        "goodwill": float(snap.goodwill.value) if snap.goodwill else None,
+        "intangibles": float(snap.intangibles.value) if snap.intangibles else None,
+        "noncontrolling_interest": (float(snap.noncontrolling_interest.value)
+                                    if snap.noncontrolling_interest else None),
+        "temporary_equity": (float(snap.temporary_equity.value)
+                             if snap.temporary_equity else None),
+        # per-figure provenance: which tag, in which filing, dated when — the
+        # reader can open the exact document behind every number
+        "sources": {name: src for name, src in (
+            ("total_assets", _source(snap.total_assets)),
+            ("total_liabilities", _source(snap.total_liabilities)),
+            ("current_assets", _source(snap.current_assets)),
+            ("current_liabilities", _source(snap.current_liabilities)),
+            ("long_term_debt", _source(snap.long_term_debt)),
+            ("short_term_debt", _source(snap.short_term_debt)),
+            ("total_debt", _source(snap.total_debt)),
+            ("goodwill", _source(snap.goodwill)),
+            ("intangibles", _source(snap.intangibles)),
+            ("preferred_stock", _source(snap.preferred_stock)),
+            ("temporary_equity", _source(snap.temporary_equity)),
+            ("noncontrolling_interest", _source(snap.noncontrolling_interest)),
+            ("shares", _source(snap.shares_outstanding)),
+            ("dividend", _source(snap.dividend)),
+        ) if src is not None},
+        # scope-switch disclosure: annual series stitched from more than one tag
+        "series_mix": {name: mix for name, mix in (
+            ("eps", _series_mix(snap.annual_eps)),
+            ("net_income", _series_mix(snap.annual_net_income)),
+            ("revenue", _series_mix(snap.annual_revenue)),
+        ) if mix is not None} or None,
     }
 
 
