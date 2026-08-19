@@ -115,6 +115,9 @@ class FinancialSnapshot:
     # {"first", "latest", "streak_from", "paid_years"} — calendar years with a
     # positive common dividend; None when the record holds none
     dividend_record: dict | None = None
+    # mezzanine (temporary) equity senior to common — set only when it must be
+    # deducted from common book: absent/zero preferred, liabilities not derived
+    temporary_equity: Fact | None = None
 
 
 @dataclass(frozen=True)

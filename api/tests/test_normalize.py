@@ -1086,3 +1086,523 @@ def test_stale_debt_rollup_loses_to_fresher_parts():
     # counterexample: rollup at the same period end as the parts is kept
     gaap["DebtAndCapitalLeaseObligations"] = tagdata("USD", [inst("2025-12-31", 182e6, form="10-K", accn="k25", filed="2026-02-15")])
     assert float(build(gaap).total_debt.value) == 182e6
+
+
+# --- Release 2, batch A: debt tag families (each fixture names its real-world case) ---
+
+def test_convertible_notes_are_the_whole_debt_ddog_style():
+    """DDOG/SNOW: converts under ConvertibleDebtNoncurrent are the only debt."""
+    gaap = dict(GAAP)
+    gaap["ConvertibleDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 985.5e6, accn="q126")])
+    gaap["ConvertibleNotesPayableCurrent"] = tagdata("USD", [inst("2026-03-31", 0, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 985.5e6
+    # current convertible slot is a valid zero -> short bucket computable
+    assert float(s.short_term_debt.value) == 0
+
+
+def test_convertible_family_not_added_beside_a_primary_rollup():
+    # NOW/AFRM: the rollup already contains the converts
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["ConvertibleDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 10e9, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 30e9
+
+
+def test_notes_plus_loans_summed_realty_income_style():
+    gaap = dict(GAAP)
+    gaap["NotesPayable"] = tagdata("USD", [inst("2026-03-31", 25091.6e6, accn="q126")])
+    gaap["LoansPayable"] = tagdata("USD", [inst("2026-03-31", 2760.4e6, accn="q126")])
+    # convertible would hide inside the notes total: never a separate slot here
+    gaap["ConvertibleNotesPayable"] = tagdata("USD", [inst("2026-03-31", 5e9, accn="q126")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 25091.6e6 + 2760.4e6
+    # notes totals include the current portion: the ltd_current slot is suppressed
+    assert s.short_term_debt is None
+
+
+def test_notes_and_loans_parent_rollup_wins_over_the_pair():
+    gaap = dict(GAAP)
+    gaap["NotesAndLoansPayable"] = tagdata("USD", [inst("2026-03-31", 27e9, accn="q126")])
+    gaap["NotesPayable"] = tagdata("USD", [inst("2026-03-31", 25e9, accn="q126")])
+    gaap["LoansPayable"] = tagdata("USD", [inst("2026-03-31", 2e9, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 27e9
+
+
+def test_credit_line_is_additive_beside_other_instruments_sri_style():
+    gaap = dict(GAAP)
+    gaap["LongTermLineOfCredit"] = tagdata("USD", [inst("2026-03-31", 151.1e6, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 151.1e6
+
+
+def test_secured_debt_takes_the_larger_representation_never_both():
+    # AVA: instruments show a 3M fragment while SecuredLongTermDebt holds 2,759M
+    gaap = dict(GAAP)
+    gaap["LongTermLoansPayable"] = tagdata("USD", [inst("2026-03-31", 3e6, accn="q126")])
+    gaap["SecuredLongTermDebt"] = tagdata("USD", [inst("2026-03-31", 2759e6, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 2759e6
+
+    # BRT: a fresh zero revolver must not block the secured figure
+    gaap = dict(GAAP)
+    gaap["LongTermLineOfCredit"] = tagdata("USD", [inst("2026-03-31", 0, accn="q126")])
+    gaap["SecuredDebt"] = tagdata("USD", [inst("2026-03-31", 469e6, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 469e6
+
+    # the reverse: instruments larger -> secured dropped, never summed
+    gaap = dict(GAAP)
+    gaap["NotesPayable"] = tagdata("USD", [inst("2026-03-31", 10e9, accn="q126")])
+    gaap["SecuredDebt"] = tagdata("USD", [inst("2026-03-31", 4e9, accn="q126")])
+    assert float(build(gaap).long_term_debt.value) == 10e9
+
+
+def test_combined_finance_lease_tag_suppresses_its_current_twin_boeing_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["FinanceLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 111e6, accn="q126")])
+    gaap["FinanceLeaseLiabilityCurrent"] = tagdata("USD", [inst("2026-03-31", 40e6, accn="q126")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 5e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 30e9 + 111e6
+    assert float(s.short_term_debt.value) == 5e9  # lease current NOT double counted
+
+
+def test_noncurrent_lease_tag_still_lets_the_current_lease_count():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["FinanceLeaseLiabilityNoncurrent"] = tagdata("USD", [inst("2026-03-31", 71e6, accn="q126")])
+    gaap["FinanceLeaseLiabilityCurrent"] = tagdata("USD", [inst("2026-03-31", 40e6, accn="q126")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 5e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 30e9 + 71e6
+    assert float(s.short_term_debt.value) == 5e9 + 40e6
+
+
+def test_notes_payable_current_equal_to_commercial_paper_counts_once_ed_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["NotesPayableCurrent"] = tagdata("USD", [inst("2026-03-31", 869e6, accn="q126")])
+    gaap["CommercialPaper"] = tagdata("USD", [inst("2026-03-31", 869e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 869e6
+
+    # different figures = genuinely different lines: both count
+    gaap["NotesPayableCurrent"] = tagdata("USD", [inst("2026-03-31", 500e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 500e6 + 869e6
+
+
+def test_bank_loans_and_notes_tag_terminates_the_borrowings_slot_key_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["ShortTermBankLoansAndNotesPayable"] = tagdata("USD", [inst("2026-03-31", 3680e6, accn="q126")])
+    gaap["OtherShortTermBorrowings"] = tagdata("USD", [inst("2026-03-31", 3680e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 3680e6
+
+
+def test_commercial_paper_and_other_borrowings_are_disjoint_ko_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
+    gaap["CommercialPaper"] = tagdata("USD", [inst("2026-03-31", 250e6, accn="q126")])
+    gaap["OtherShortTermBorrowings"] = tagdata("USD", [inst("2026-03-31", 56e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 306e6
+
+
+def test_current_family_never_added_beside_a_current_rollup_smp_style():
+    # SMP: LinesOfCreditCurrent + OtherLongTermDebtCurrent == LongTermDebtCurrent exactly
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 54.6e6, accn="q126")])
+    gaap["LinesOfCreditCurrent"] = tagdata("USD", [inst("2026-03-31", 34.6e6, accn="q126")])
+    gaap["OtherLongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 20e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 54.6e6
+
+
+def test_revolver_only_filer_gets_a_short_bucket_cal_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    gaap["LinesOfCreditCurrent"] = tagdata("USD", [inst("2026-03-31", 347.5e6, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 347.5e6
+
+
+def test_senior_notes_current_only_without_parent_and_rollup_teva_style():
+    # TEVA: SeniorNotesCurrent == the entire LongTermDebtCurrent rollup
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 15e9, accn="q126")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [inst("2026-03-31", 2.1e9, accn="q126")])
+    gaap["SeniorNotesCurrent"] = tagdata("USD", [inst("2026-03-31", 2.1e9, accn="q126")])
+    assert float(build(gaap).short_term_debt.value) == 2.1e9
+
+    del gaap["LongTermDebtCurrent"]
+    assert float(build(gaap).short_term_debt.value) == 2.1e9
+
+
+# --- Release 2, batch B: intangibles & goodwill ---
+
+def test_other_intangibles_beat_a_smaller_parts_sum_hban_style():
+    # HBAN: Other 1,727M contains the finite 969M plus 758M of MSRs
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 969e6, accn="q126")])
+    gaap["OtherIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 1727e6, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 1727e6
+    # SPGI: when the Other line is the smaller residual, the parts sum wins — never both
+    gaap["OtherIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 100e6, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 969e6
+
+
+def test_indefinite_class_tags_fill_the_empty_slot_ko_style():
+    # KO: trademarks live only in IndefiniteLivedTrademarks
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["IndefiniteLivedTrademarks"] = tagdata("USD", [inst("2026-03-31", 12463e6, accn="q126")])
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [inst("2026-03-31", 100e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.intangibles.value) == 12463e6 + 100e6
+    # the rollup wins over class tags when both exist
+    gaap["IndefiniteLivedIntangibleAssetsExcludingGoodwill"] = tagdata("USD", [inst("2026-03-31", 12463e6, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 12463e6 + 100e6
+
+
+def test_combined_minus_goodwill_derivation_needs_a_common_period_end():
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    # goodwill is annual-only; the combined line is quarterly — common end is FY
+    gaap["Goodwill"] = tagdata("USD", [inst("2025-12-31", 50e9, form="10-K", accn="k25", filed="2026-02-15")])
+    gaap["IntangibleAssetsNetIncludingGoodwill"] = tagdata("USD", [
+        inst("2025-12-31", 80e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 82e9, accn="q126"),
+    ])
+    s = build(gaap)
+    assert float(s.intangibles.value) == 30e9
+    assert "IntangibleAssetsNetIncludingGoodwill - us-gaap:Goodwill" in s.intangibles.provenance.tag
+
+    # CALM guard: combined below goodwill is a mistag, never a negative value
+    gaap["IntangibleAssetsNetIncludingGoodwill"] = tagdata("USD", [
+        inst("2025-12-31", 40e9, form="10-K", accn="k25", filed="2026-02-15")])
+    assert build(gaap).intangibles is None
+
+
+def test_gross_minus_accumulated_requires_matching_period_end_bby_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["FiniteLivedIntangibleAssetsGross"] = tagdata("USD", [
+        inst("2025-12-31", 96e8, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 97e8, accn="q126"),
+    ])
+    gaap["FiniteLivedIntangibleAssetsAccumulatedAmortization"] = tagdata("USD", [
+        inst("2025-12-31", 95e8, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    # matched at 2025-12-31: 9.6B - 9.5B, never the fresh gross alone
+    assert float(s.intangibles.value) == 1e8
+
+
+def test_goodwill_derived_from_gross_when_never_impaired_aaon_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "Goodwill"}
+    gaap["GoodwillGross"] = tagdata("USD", [inst("2026-03-31", 573e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.goodwill.value) == 573e6
+    assert "never tagged" in s.goodwill.provenance.concept
+
+
+def test_servicing_assets_sum_both_measurement_books_wfc_style():
+    gaap = {k: v for k, v in GAAP.items()
+            if k not in ("IntangibleAssetsNetExcludingGoodwill",)}
+    gaap["ServicingAssetAtFairValueAmount"] = tagdata("USD", [inst("2026-03-31", 1.3e9, accn="q126")])
+    gaap["ServicingAssetAtAmortizedValue"] = tagdata("USD", [inst("2026-03-31", 0.4e9, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 1.7e9
+
+
+def test_capitalized_software_is_the_disclosed_last_resort_mcd_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "IntangibleAssetsNetExcludingGoodwill"}
+    gaap["CapitalizedComputerSoftwareNet"] = tagdata("USD", [inst("2026-03-31", 800e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.intangibles.value) == 800e6
+    assert "standing in" in s.intangibles.provenance.concept
+
+
+# --- Release 2, batch C: distributions & dividend evidence ---
+
+def test_lp_distributions_count_as_the_common_payout_epd_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["DistributionMadeToLimitedPartnerCashDistributionsPaid"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 1.2e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    assert s.pays_dividend is True
+    assert "common" in s.dividend.provenance.concept
+
+
+def test_per_unit_lp_distribution_feeds_dps_without_a_share_count_uan_style():
+    gaap = {k: v for k, v in GAAP.items()
+            if k not in ("PaymentsOfDividendsCommonStock", "CommonStockSharesOutstanding")}
+    gaap["DistributionMadeToLimitedPartnerDistributionsPaidPerUnit"] = tagdata("USD/shares", [
+        dur("2026-01-01", "2026-03-31", 2.26, form="10-Q", accn="q126", filed="2026-05-05"),
+        dur("2025-01-01", "2025-03-31", 1.80, form="10-Q", accn="q125", filed="2025-05-05"),
+        dur("2025-01-01", "2025-12-31", 4.37, form="10-K", accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert s.pays_dividend is True
+    # per-unit fact used directly: 4.37 + 2.26 - 1.80 — never divided by shares
+    assert s.dividend_per_share == Decimal("4.37") + Decimal("2.26") - Decimal("1.80")
+
+
+def test_investment_company_per_share_beats_the_fragmented_amount_tag_main_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["InvestmentCompanyDistributionToShareholdersPerShare"] = tagdata("USD/shares", [
+        dur("2026-01-01", "2026-03-31", 0.77, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["InvestmentCompanyDividendDistribution"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 30.4e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    assert "PerShare" in s.dividend.provenance.tag
+
+
+def test_partners_capital_distributions_carry_the_aggregate_label_mplx_style():
+    # the equity-statement total includes GP/IDR holders: disclosed, not "common"
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["PartnersCapitalAccountDistributions"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 1.02e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    assert s.pays_dividend is True
+    assert "aggregate" in s.dividend.provenance.concept
+
+
+def test_distribution_named_tag_is_evidence_for_unknown_not_fail():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["DistributionsMade"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 5e8, form="10-Q", accn="q126", filed="2026-05-05")])
+    assert build(gaap).pays_dividend is None  # unknown, never a false FAIL
+
+
+def test_share_and_ratio_units_are_never_payout_evidence():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["CommonStockDividendsShares"] = tagdata("shares", [
+        dur("2026-01-01", "2026-03-31", 1e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    assert build(gaap).pays_dividend is False  # no dollar payout anywhere -> not paying
+
+
+# --- Release 2, batch D: partnership equity, NCI chain, temporary equity ---
+
+def test_partners_capital_derives_liabilities_for_mlps_paa_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "Liabilities"}
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 29218e6, accn="q126")])
+    gaap["PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 14291e6, accn="q126")])
+    gaap["PartnersCapitalAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 3212e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 29218e6 - 14291e6
+    # PCI kept NCI out of liabilities -> the partners-capital NCI is subtracted
+    assert float(s.noncontrolling_interest.value) == 3212e6
+
+
+def test_parent_only_partners_capital_skips_nci_dkl_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "Liabilities"}
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 1000e6, accn="q126")])
+    gaap["PartnersCapital"] = tagdata("USD", [inst("2026-03-31", -69.3e6, accn="q126")])  # deficit is fine
+    gaap["PartnersCapitalAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 50e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 1000e6 + 69.3e6
+    assert s.noncontrolling_interest is None  # NCI already inside derived liabilities
+
+
+def test_nonredeemable_nci_is_an_alternative_never_added_ms_style():
+    gaap = dict(GAAP)
+    gaap["MinorityInterest"] = tagdata("USD", [inst("2026-03-31", 1111e6, accn="q126")])
+    gaap["NonredeemableNoncontrollingInterest"] = tagdata("USD", [inst("2026-03-31", 1111e6, accn="q126")])
+    assert float(build(gaap).noncontrolling_interest.value) == 1111e6
+
+
+def test_redeemable_nci_components_only_when_the_total_is_absent_udr_style():
+    gaap = dict(GAAP)
+    gaap["RedeemableNoncontrollingInterestEquityCarryingAmount"] = \
+        tagdata("USD", [inst("2026-03-31", 155.6e6, accn="q126")])
+    gaap["RedeemableNoncontrollingInterestEquityPreferredCarryingAmount"] = \
+        tagdata("USD", [inst("2026-03-31", 155.6e6, accn="q126")])
+    assert float(build(gaap).noncontrolling_interest.value) == 155.6e6
+
+    del gaap["RedeemableNoncontrollingInterestEquityCarryingAmount"]
+    gaap["RedeemableNoncontrollingInterestEquityCommonCarryingAmount"] = \
+        tagdata("USD", [inst("2026-03-31", 44.4e6, accn="q126")])
+    assert float(build(gaap).noncontrolling_interest.value) == 200e6
+
+
+def test_redeemable_fair_value_blocked_by_the_incl_nci_temporary_tag_heico_style():
+    gaap = dict(GAAP)
+    gaap["RedeemableNoncontrollingInterestEquityFairValue"] = \
+        tagdata("USD", [inst("2026-03-31", 103.1e6, accn="q126")])
+    gaap["TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests"] = \
+        tagdata("USD", [inst("2026-03-31", 536.7e6, accn="q126")])
+    s = build(gaap)
+    # same holders once: the incl-NCI line fills the temporary-equity slot instead
+    assert s.noncontrolling_interest is None
+    assert float(s.temporary_equity.value) == 536.7e6
+
+    # OMC-style clean case: fair value stands when nothing else names the holders
+    del gaap["TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests"]
+    s = build(gaap)
+    assert float(s.noncontrolling_interest.value) == 103.1e6
+    assert s.temporary_equity is None
+
+
+def test_temporary_equity_deducted_when_preferred_is_a_zero_placeholder_kdp_style():
+    gaap = dict(GAAP)
+    gaap["PreferredStockValue"] = tagdata("USD", [inst("2026-03-31", 0, accn="q126")])
+    gaap["TemporaryEquityCarryingAmountAttributableToParent"] = \
+        tagdata("USD", [inst("2026-03-31", 4418e6, accn="q126")])
+    s = build(gaap)
+    assert float(s.temporary_equity.value) == 4418e6
+
+    # nonzero preferred keeps the slot: never both
+    gaap["PreferredStockValue"] = tagdata("USD", [inst("2026-03-31", 600e6, accn="q126")])
+    assert build(gaap).temporary_equity is None
+
+
+def test_temporary_equity_skipped_when_liabilities_were_derived():
+    # a derived L = LSE - equity figure already contains the mezzanine (CMCSA/ACN)
+    gaap = {k: v for k, v in GAAP.items() if k != "Liabilities"}
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 1000e9, accn="q126")])
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = \
+        tagdata("USD", [inst("2026-03-31", 600e9, accn="q126")])
+    gaap["TemporaryEquityCarryingAmountAttributableToParent"] = \
+        tagdata("USD", [inst("2026-03-31", 5e9, accn="q126")])
+    assert build(gaap).temporary_equity is None
+
+
+def test_liquidation_preference_is_the_last_resort_eikon_style():
+    gaap = dict(GAAP)
+    gaap["PreferredStockValue"] = tagdata("USD", [inst("2026-03-31", 0, accn="q126")])
+    gaap["TemporaryEquityLiquidationPreference"] = \
+        tagdata("USD", [inst("2026-03-31", 1159.8e6, accn="q126")])
+    assert float(build(gaap).temporary_equity.value) == 1159.8e6
+
+
+# --- Release 2, batch E: share-count fallbacks ---
+
+def test_lp_weighted_units_serve_as_the_share_proxy_et_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["WeightedAverageLimitedPartnershipUnitsOutstandingDiluted"] = tagdata("shares", [
+        dur("2026-01-01", "2026-03-31", 3.43e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    assert float(s.shares_outstanding.value) == 3.43e9
+
+
+def test_generic_shares_outstanding_ranks_after_the_dei_cover_slb_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["SharesOutstanding"] = tagdata("shares", [inst("2026-03-31", 1e6, accn="q126")])  # class fragment
+    dei = {"EntityCommonStockSharesOutstanding": tagdata("shares", [
+        inst("2026-04-28", 1.4e9, form="10-Q", accn="q126", filed="2026-05-05")])}
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap, dei))
+    assert float(s.shares_outstanding.value) == 1.4e9
+
+    # with no cover and no specific tag, the generic instant finally stands
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert float(s.shares_outstanding.value) == 1e6
+
+
+def test_lp_unit_instant_needs_the_partnership_gate_maa_style():
+    # a REIT with stockholders equity: the OP-unit fragment must NOT become shares
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    gaap["StockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 6e9, accn="q126")])
+    gaap["LimitedPartnersCapitalAccountUnitsOutstanding"] = tagdata("shares", [
+        inst("2026-03-31", 2.9e6, accn="q126")])
+    assert build(gaap).shares_outstanding is None
+
+    # a true partnership: partners capital, no stockholders equity -> units count
+    del gaap["StockholdersEquity"]
+    gaap["PartnersCapital"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    assert float(build(gaap).shares_outstanding.value) == 2.9e6
+
+
+# --- Release 2, batches F-G: financial income, quality notes, working capital ---
+
+def test_bdc_investment_income_becomes_the_revenue_series_arcc_style():
+    gaap = dict(GAAP)
+    gaap["GrossInvestmentIncomeOperating"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 2.9e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 3.052e9, accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert float(s.annual_revenue[2025].value) == 3.052e9
+
+
+def test_investment_company_per_share_element_yields_eps_bxsl_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["InvestmentCompanyInvestmentIncomeLossFromOperationsPerShare"] = tagdata("USD/shares", [
+        dur("2024-01-01", "2024-12-31", 3.1, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 3.4, accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert float(s.annual_eps[2025].value) == 3.4
+
+
+def test_one_time_gain_is_disclosed_with_flipped_wording():
+    gaap = dict(GAAP)
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+        tagdata("USD", [dur("2026-01-01", "2026-03-31", 1e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["GainLossOnInvestments"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 300e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    s = build(gaap)
+    note = next(n for n in s.earnings_quality if "investment gain" in n.lower())
+    assert "added to" in note  # positive gain BOOSTS income — opposite of a charge
+
+
+def test_impairment_rollup_note_only_without_a_specific_line_gis_style():
+    base = dict(GAAP)
+    base["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+        tagdata("USD", [dur("2026-01-01", "2026-03-31", 2e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap = dict(base)
+    gaap["GoodwillImpairmentLoss"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 302.9e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["GoodwillAndIntangibleAssetImpairment"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 1750e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    notes = build(gaap).earnings_quality
+    assert not any("rollup" in n or "Goodwill and intangible" in n for n in notes)
+
+    gaap = dict(base)
+    gaap["GoodwillAndIntangibleAssetImpairment"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 1750e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    notes = build(gaap).earnings_quality
+    assert any("goodwill and intangible impairment" in n.lower() for n in notes)
+
+
+def test_warrant_remeasurement_note_claims_no_direction():
+    gaap = dict(GAAP)
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+        tagdata("USD", [dur("2026-01-01", "2026-03-31", 1e9, form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["FairValueAdjustmentOfWarrants"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 200e6, form="10-Q", accn="q126", filed="2026-05-05")])
+    note = next(n for n in build(gaap).earnings_quality if "warrant" in n.lower())
+    assert "cannot settle" in note
+    assert "added to" not in note and "reduced" not in note
+
+
+def test_afs_successor_tag_is_the_fragment_never_the_total_pfe_style():
+    gaap = dict(OE_GAAP)
+    gaap["OtherShortTermInvestments"] = tagdata("USD", [inst("2026-03-31", 12454e6, accn="q126")])
+    gaap["AvailableForSaleSecuritiesDebtSecuritiesCurrent"] = tagdata("USD", [inst("2026-03-31", 9183e6, accn="q126")])
+    s = build(gaap)
+    # invested capital = 1000e9 assets - 40e9 cash - 12.454e9 investments - 150e9 nibcl
+    assert float(s.owner_earnings.invested_capital) == 1000e9 - 40e9 - 12454e6 - 150e9
+
+    # with no earlier chain member, the successor tag finally serves (AGIO)
+    del gaap["OtherShortTermInvestments"]
+    s = build(gaap)
+    assert float(s.owner_earnings.invested_capital) == 1000e9 - 40e9 - 9183e6 - 150e9
+
+
+def test_restricted_cash_netted_only_from_the_inclusive_rollup_aal_style():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "CashAndCashEquivalentsAtCarryingValue"}
+    gaap["CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"] = \
+        tagdata("USD", [inst("2026-03-31", 40e9, accn="q126")])
+    gaap["RestrictedCash"] = tagdata("USD", [inst("2026-03-31", 3e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.owner_earnings.invested_capital) == 1000e9 - 37e9 - 150e9
+    assert any("restricted" in c for c in s.owner_earnings.caveats)
+
+    # plain carrying-value tag: never netted
+    s = build(OE_GAAP | {"RestrictedCash": tagdata("USD", [inst("2026-03-31", 3e9, accn="q126")])})
+    assert float(s.owner_earnings.invested_capital) == 810e9
+
+
+def test_segment_capex_fills_only_missing_years_schl_style():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "PaymentsToAcquirePropertyPlantAndEquipment"}
+    gaap["PaymentsToAcquirePropertyPlantAndEquipment"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 10e9, accn="k24", filed="2025-02-15")])
+    gaap["SegmentExpenditureAdditionToLongLivedAssets"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 99e9, accn="k24", filed="2025-02-15"),  # loses to payments
+        dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15")])  # fills the dead year
+    s = build(gaap)
+    # latest shared year 2025 uses the segment figure: 100 + 12 - 20 - 12
+    assert float(s.owner_earnings.owner_earnings) == 80e9

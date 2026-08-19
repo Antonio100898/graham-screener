@@ -53,6 +53,10 @@ EPS_TAGS = (
     "NetIncomeLossPerOutstandingLimitedPartnershipUnit",
     "NetIncomeLossPerLimitedPartnershipUnitDiluted",
     "NetIncomeLossPerLimitedPartnershipUnitBasic",
+    # Investment companies report per-share operating results under their own
+    # element (equals diluted EPS at BXSL four years running); the NII-only
+    # sibling fragments are deliberately excluded
+    "InvestmentCompanyInvestmentIncomeLossFromOperationsPerShare",
 )
 # Last resort per missing year only. Basic >= diluted, so it flatters EPS slightly —
 # but a year dropped entirely is worse: it staled the whole series and the TTM anchor.
@@ -63,6 +67,10 @@ _WEIGHTED_SHARE_TAGS = (
     "WeightedAverageNumberOfBasicAndDilutedSharesOutstanding",
     "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
     "WeightedAverageNumberOfSharesIssuedBasic",
+    # LP unit counts are true totals (ET/EPD/BSM within 0.6% of the dei cover);
+    # the BASIC LP variant is deliberately absent — depositary-receipt filers
+    # tag it 27x off the real count (NEN)
+    "WeightedAverageLimitedPartnershipUnitsOutstandingDiluted",
 )
 # EPS moves when the share count moves, so the numerator is carried separately:
 # a company can grow EPS on buybacks alone while earnings are flat or falling.
@@ -90,6 +98,11 @@ REVENUE_TAGS = (
     "RealEstateRevenueNet",
     "RevenuesNetOfInterestExpense",
     "InterestAndDividendIncomeOperating",
+    # BDC total investment income (ARCC/BXSL have no revenue series without it)
+    # ranks above the narrower interest-only line, so the fuller total wins the
+    # tie-break (PSEC); SYF's $22.6B of interest income has no other home
+    "GrossInvestmentIncomeOperating",
+    "InterestIncomeOperating",
     "PremiumsEarnedNet",
 )
 # Banks and insurers have no operating-income subtotal; absent stays absent.
@@ -100,18 +113,40 @@ DIVIDEND_TAGS = (
     ("DividendsCommonStock", ("USD",)),
     ("CommonStockDividendsPerShareDeclared", ("USD/shares",)),
     ("CommonStockDividendsPerShareCashPaid", ("USD/shares",)),
-    # Aggregates below: they roll up preferred and noncontrolling distributions too,
-    # so they evidence "a dividend" but not specifically a common one. Tried last and
-    # labelled in provenance so criterion 5 discloses what it rested on.
+    # Partnerships distribute rather than pay dividends; the LP payout to
+    # unitholders is the common payout for criterion 5 (EPD, MPLX, UAN). The
+    # LLC-member variant is deliberately ABSENT: in Up-C structures it names
+    # payouts to NCI holders only and would mark non-payers as paying.
+    ("DistributionMadeToLimitedPartnerCashDistributionsPaid", ("USD",)),
+    ("DistributionMadeToLimitedPartnerDistributionsPaidPerUnit", ("USD/shares",)),
+    # BDCs/investment companies: the per-share element first — MAIN's dollar
+    # amount tag carries supplemental-declaration fragments, the per-share one
+    # reproduces the true total (BXSL: 3.08 x shares == the paid amount).
+    ("InvestmentCompanyDistributionToShareholdersPerShare", ("USD/shares",)),
+    ("InvestmentCompanyDividendDistribution", ("USD",)),
+    # Aggregates below: they roll up preferred, GP/IDR and noncontrolling
+    # distributions too, so they evidence "a payout" but not specifically a
+    # common one. Tried last and labelled in provenance so criterion 5
+    # discloses what it rested on.
+    ("PaymentsOfOrdinaryDividends", ("USD",)),
     ("PaymentsOfDividends", ("USD",)),
     ("DividendsCash", ("USD",)),
     ("Dividends", ("USD",)),
+    ("PartnersCapitalAccountDistributions", ("USD",)),
 )
-_AGGREGATE_DIVIDEND_TAGS = frozenset(("PaymentsOfDividends", "DividendsCash", "Dividends"))
-# inbound dividends (received/income/proceeds/equity-method) and subsidiary
-# minority-interest payouts are not common dividends; preferred alone isn't either
+_AGGREGATE_DIVIDEND_TAGS = frozenset((
+    "PaymentsOfOrdinaryDividends", "PaymentsOfDividends", "DividendsCash", "Dividends",
+    "InvestmentCompanyDividendDistribution", "PartnersCapitalAccountDistributions",
+))
+# inbound dividends (received/income/proceeds/equity-method), subsidiary
+# minority-interest payouts, preferred-only lines, EPS-allocation mechanics
+# (undistributed/distributable), temporary-equity accretion, and cost lines that
+# merely contain the word "distribution" are not common payouts
 _DIVIDEND_EVIDENCE_EXCLUDE_RE = re.compile(
-    r"received|income|proceeds|equitymethod|minorityinterest|noncontrolling|preferred", re.I
+    r"received|income|proceeds|equitymethod|minorityinterest|noncontrolling|preferred"
+    r"|receivable|paidtoparent|policyholder|temporaryequity|statutoryaccounting"
+    r"|undistributed|distributable|affiliates|servicing|productionanddistribution"
+    r"|propertyplant|deferredcompensation|fees", re.I
 )
 _ANNUAL_DAYS = range(340, 401)  # full-fiscal-year duration incl. 52/53-week years
 _DIVIDEND_RECENCY_DAYS = 400  # broad window for the unknown-evidence scan only
@@ -125,10 +160,26 @@ NONCASH_TAGS = (
     ("InventoryLIFOReserveEffectOnIncomeNet", "inventory valuation (LCM/LIFO) adjustment"),
     ("AssetImpairmentCharges", "asset impairment"),
     ("GoodwillImpairmentLoss", "goodwill impairment"),
+    ("ImpairmentOfIntangibleAssetsExcludingGoodwill", "intangible-asset impairment"),
     ("RestructuringCharges", "restructuring charges"),
     ("InventoryWriteDown", "inventory write-down"),
     ("BusinessCombinationAcquisitionRelatedCosts", "acquisition costs"),
 )
+# GIS files the rollup AND both specific impairments at different amounts; the
+# rollup speaks only when neither specific line produced a material note.
+_IMPAIRMENT_ROLLUP = ("GoodwillAndIntangibleAssetImpairment", "goodwill and intangible impairment")
+_IMPAIRMENT_SPECIFICS = frozenset(("GoodwillImpairmentLoss", "ImpairmentOfIntangibleAssetsExcludingGoodwill"))
+# Gain-signed lines: a positive value ADDS to pre-tax income. One-time gains
+# silently flatter the P/E test the same way one-time charges depress it.
+GAIN_TAGS = (
+    ("GainLossOnInvestments", "investment gain/loss"),
+    ("UnrealizedGainLossOnInvestments", "unrealized investment gain/loss"),
+    ("GainLossOnSaleOfPropertyPlantEquipment", "property disposal gain/loss"),
+    ("GainLossOnDispositionOfAssets1", "asset disposition gain/loss"),
+)
+# Warrant remeasurement has no reliable sign convention in the wild (AMZN vs
+# CVNA file opposite orientations), so its note reports magnitude only.
+_WARRANT_TAG = ("FairValueAdjustmentOfWarrants", "warrant fair-value remeasurement")
 PRETAX_TAGS = (
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
@@ -197,9 +248,24 @@ def build_snapshot(
         total_debt = None
     total_liabilities = _latest_instant(gaap, "Liabilities", ("Liabilities",), not_before=fresh)
     parent_only_derivation = False
+    liabilities_derived = False
     if total_liabilities is None:
         total_liabilities, parent_only_derivation = _derive_liabilities(gaap, fresh)
+        liabilities_derived = total_liabilities is not None
     goodwill = _latest_instant(gaap, "Goodwill", ("Goodwill",), not_before=fresh)
+    if goodwill is None:
+        # RNR files no Goodwill element at all; the combined line minus the
+        # ex-goodwill line is the same figure by identity
+        goodwill = _derived_instant(
+            gaap, "Goodwill (derived: combined line - intangibles excluding goodwill)",
+            "IntangibleAssetsNetIncludingGoodwill", "IntangibleAssetsNetExcludingGoodwill", fresh,
+        )
+    if goodwill is None:
+        goodwill = _derived_instant(
+            gaap, "Goodwill (derived: gross - accumulated impairment)",
+            "GoodwillGross", "GoodwillImpairedAccumulatedImpairmentLoss", fresh,
+            subtrahend_optional=True,
+        )
     intangibles = _intangibles(gaap, fresh)
     if goodwill is None and intangibles is None:
         goodwill, intangibles = _combined_goodwill_and_intangibles(gaap, fresh)
@@ -215,14 +281,74 @@ def build_snapshot(
     # come out of common TBV — except when liabilities were derived via parent-only
     # StockholdersEquity, which already left NCI inside the liabilities figure.
     nci = None
+    redeemable_nci = None
     if not parent_only_derivation:
-        nci = _sum_facts("NoncontrollingInterest", [
-            _latest_instant(gaap, "NoncontrollingInterest", ("MinorityInterest",), not_before=fresh),
-            _latest_instant(
-                gaap, "NoncontrollingInterest (redeemable)",
-                ("RedeemableNoncontrollingInterestEquityCarryingAmount",), not_before=fresh,
-            ),
-        ])
+        # permanent leg: alternatives for one concept — first the classic tag,
+        # then the fuller variants some filers use instead (MS: 1,111M under
+        # NonredeemableNoncontrollingInterest while MinorityInterest sits stale)
+        permanent_nci = _latest_instant_across(
+            gaap, "NoncontrollingInterest",
+            ("MinorityInterest", "NonredeemableNoncontrollingInterest",
+             "MinorityInterestInOperatingPartnerships",
+             "PartnersCapitalAttributableToNoncontrollingInterest"),
+            not_before=fresh,
+        )
+        redeemable_nci = _latest_instant(
+            gaap, "NoncontrollingInterest (redeemable)",
+            ("RedeemableNoncontrollingInterestEquityCarryingAmount",), not_before=fresh,
+        )
+        if redeemable_nci is None:
+            # disjoint components, summed only when the total is absent (UDR
+            # tags a component equal to the total)
+            redeemable_nci = _sum_facts("NoncontrollingInterest (redeemable components)", [
+                _latest_instant(
+                    gaap, "NoncontrollingInterest (redeemable preferred)",
+                    ("RedeemableNoncontrollingInterestEquityPreferredCarryingAmount",),
+                    not_before=fresh),
+                _latest_instant(
+                    gaap, "NoncontrollingInterest (redeemable common)",
+                    ("RedeemableNoncontrollingInterestEquityCommonCarryingAmount",),
+                    not_before=fresh),
+            ])
+        if redeemable_nci is None and _latest_instant(
+            gaap, "TemporaryEquity (incl. NCI)",
+            ("TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests",),
+            not_before=fresh,
+        ) is None:
+            # fair value only when every carrying representation is absent —
+            # HEICO tags fair value AND the incl-NCI temporary line for the
+            # same holders; counting both would remove them twice
+            redeemable_nci = _latest_instant(
+                gaap, "NoncontrollingInterest (redeemable, fair value)",
+                ("RedeemableNoncontrollingInterestEquityFairValue",), not_before=fresh,
+            )
+        nci = _sum_facts("NoncontrollingInterest", [permanent_nci, redeemable_nci])
+    # Mezzanine (temporary) equity is senior to common but sits outside both the
+    # preferred tag and liabilities (GTN: $600M of redeemable preferred = 28% of
+    # equity, invisible to tangible book). Deducted only when the preferred slot
+    # is empty or a zero placeholder (KDP tags PreferredStockValue=0 beside
+    # $4.4B of mezzanine) and liabilities were NOT derived from the accounting
+    # identity — a derived figure already contains the mezzanine.
+    temporary_equity = None
+    if not liabilities_derived and (preferred is None or preferred.value == 0):
+        temporary_equity = _latest_instant(
+            gaap, "TemporaryEquity", ("TemporaryEquityCarryingAmountAttributableToParent",),
+            not_before=fresh,
+        )
+        if temporary_equity is None and redeemable_nci is None:
+            # the incl-NCI variant only when no redeemable-NCI leg was counted,
+            # or the same holders would come out twice (HEICO/ADM)
+            temporary_equity = _latest_instant(
+                gaap, "TemporaryEquity (incl. NCI)",
+                ("TemporaryEquityCarryingAmountIncludingPortionAttributableToNoncontrollingInterests",),
+                not_before=fresh,
+            )
+        if temporary_equity is None:
+            # liquidation preference >= carrying value: the conservative stand-in
+            temporary_equity = _latest_instant(
+                gaap, "TemporaryEquity (liquidation preference)",
+                ("TemporaryEquityLiquidationPreference",), not_before=fresh,
+            )
     shares = _latest_instant(
         gaap, "SharesOutstanding", ("CommonStockSharesOutstanding",), unit=("shares",), not_before=fresh
     )
@@ -232,7 +358,21 @@ def build_snapshot(
             ns="dei", unit=("shares",), not_before=fresh,
         )
     if shares is None:
+        # the generic instant only AFTER the specific tags and the dei cover:
+        # fragment and mis-scale cases are shielded by that ranking (SLB)
+        shares = _latest_instant(
+            gaap, "SharesOutstanding", ("SharesOutstanding",), unit=("shares",), not_before=fresh
+        )
+    if shares is None:
         shares = _weighted_shares(gaap, fresh)
+    if shares is None and _is_partnership(gaap, fresh):
+        # LP unit instants are OP-unit fragments at REITs (MAA: 2.9M against a
+        # 116M cover), so they count only for a filer that has partners capital
+        # and no stockholders equity at all (SUN, KRP, DLNG)
+        shares = _latest_instant(
+            gaap, "SharesOutstanding (limited partner units)",
+            ("LimitedPartnersCapitalAccountUnitsOutstanding",), unit=("shares",), not_before=fresh,
+        )
     shares = _sane_shares(shares, gaap, dei, fresh,
                           implied=_implied_shares(gaap, annual_eps, annual_net_income))
 
@@ -285,6 +425,7 @@ def build_snapshot(
         goodwill=goodwill,
         intangibles=intangibles,
         preferred_stock=preferred,
+        temporary_equity=temporary_equity,
         shares_outstanding=shares,
         dividend=dividend,
         dividend_per_share=dividend_per_share,
@@ -846,31 +987,48 @@ def _earnings_quality(gaap: dict, ttm_inputs: tuple[Fact, ...], annual_eps: dict
     # Same line is sometimes tagged twice (DINO tags one LCM adjustment under two
     # elements); report each distinct amount once.
     seen: set[Decimal] = set()
-    for tag, label in NONCASH_TAGS:
-        amount = _duration_fact(gaap, tag, start, end)
-        if amount is None or amount == 0 or amount in seen:
-            continue
-        if not (pretax and pretax != 0 and abs(amount) / abs(pretax) >= _NONCASH_MATERIALITY):
-            continue
-        seen.add(amount)
-        share = abs(amount) / abs(pretax) * 100
-        direction = "added to" if amount < 0 else "reduced"
+    emitted: set[str] = set()
+
+    def swing_text(tag: str, amount: Decimal) -> str:
         # the year-earlier comparable period shows whether this line is steady or a swing
         prior = _year_earlier_fact(gaap, tag, cur.period_start, cur.period_end)
         if prior is None:
-            swing = " No comparable figure is tagged for the year-earlier period."
-        elif abs(amount - prior) < abs(amount) * Decimal("0.25"):
-            swing = (f" It was {prior / _MILLION:+,.0f}M in the same period a year earlier — "
-                     "steady, so it is not what makes this period unusual.")
+            return " No comparable figure is tagged for the year-earlier period."
+        if abs(amount - prior) < abs(amount) * Decimal("0.25"):
+            return (f" It was {prior / _MILLION:+,.0f}M in the same period a year earlier — "
+                    "steady, so it is not what makes this period unusual.")
+        return (f" The same line was {prior / _MILLION:+,.0f}M a year earlier, a swing of "
+                f"{abs(amount - prior) / _MILLION:,.0f}M between the two periods.")
+
+    def emit(tag: str, label: str, gain_signed: bool = False, neutral: bool = False) -> None:
+        amount = _duration_fact(gaap, tag, start, end)
+        if amount is None or amount == 0 or amount in seen:
+            return
+        if not (pretax and pretax != 0 and abs(amount) / abs(pretax) >= _NONCASH_MATERIALITY):
+            return
+        seen.add(amount)
+        emitted.add(tag)
+        share = abs(amount) / abs(pretax) * 100
+        if neutral:
+            lead = (f"{label.capitalize()} of {abs(amount) / _MILLION:,.0f}M moved pre-tax income "
+                    "in a direction the filing's sign convention cannot settle")
         else:
-            swing = (f" The same line was {prior / _MILLION:+,.0f}M a year earlier, a swing of "
-                     f"{abs(amount - prior) / _MILLION:,.0f}M between the two periods.")
+            positive_adds = amount > 0 if gain_signed else amount < 0
+            direction = "added to" if positive_adds else "reduced"
+            lead = f"{label.capitalize()} of {abs(amount) / _MILLION:,.0f}M {direction} pre-tax income"
         notes.append(
-            f"{label.capitalize()} of {abs(amount) / _MILLION:,.0f}M {direction} pre-tax income "
-            f"for {start} to {end}, a period inside the trailing window — {share:.0f}% of that "
-            f"period's {pretax / _MILLION:,.0f}M pre-tax income.{swing} Judge for yourself "
-            "whether it belongs in a run-rate earnings figure."
+            f"{lead} for {start} to {end}, a period inside the trailing window — {share:.0f}% of "
+            f"that period's {pretax / _MILLION:,.0f}M pre-tax income.{swing_text(tag, amount)} "
+            "Judge for yourself whether it belongs in a run-rate earnings figure."
         )
+
+    for tag, label in NONCASH_TAGS:
+        emit(tag, label)
+    if not (emitted & _IMPAIRMENT_SPECIFICS):
+        emit(*_IMPAIRMENT_ROLLUP)
+    for tag, label in GAIN_TAGS:
+        emit(tag, label, gain_signed=True)
+    emit(*_WARRANT_TAG, neutral=True)
 
     # a loss quarter dropping out of (or sitting inside) the window swings the TTM
     tag = ttm_inputs[0].provenance.tag.split(":", 1)[1]
@@ -978,11 +1136,25 @@ def _latest_instant_across(
     return _fact(concept, best[1], best[0])
 
 
-# Short-bucket slots a combined long-bucket tag makes redundant. Every tag that
-# rolls current maturities into the long bucket must name its suppressions here,
-# or the current portion is counted twice across the buckets.
-_LTD_SUPPRESSIONS = {
+def _tag_of(fact: Fact | None) -> str | None:
+    return fact.provenance.tag.split(":", 1)[1] if fact else None
+
+
+# Short-bucket slots a combined (current + noncurrent) long-bucket tag makes
+# redundant. Every combined tag counted in the long bucket must name its
+# suppressions here, or the current portion is counted twice across the buckets.
+# NotesPayable-family totals also cover their convertible members, so counting
+# them suppresses the convertible-current family too.
+_COMBINED_SUPPRESSIONS = {
     "LongTermDebt": frozenset({"ltd_current"}),  # the plain tag includes current maturities
+    "NotesAndLoansPayable": frozenset({"ltd_current", "notes_current", "loans_current", "convertible_current"}),
+    "NotesPayable": frozenset({"ltd_current", "notes_current", "convertible_current"}),
+    "LoansPayable": frozenset({"ltd_current", "loans_current"}),
+    "ConvertibleDebt": frozenset({"convertible_current"}),
+    "ConvertibleNotesPayable": frozenset({"convertible_current"}),
+    "LineOfCredit": frozenset({"loc_current"}),
+    "SecuredDebt": frozenset({"secured_current"}),
+    "FinanceLeaseLiability": frozenset({"finance_lease_current"}),
 }
 
 
@@ -993,24 +1165,77 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
          "LongTermNotesPayable", "LongTermDebt"),
         not_before=not_before,
     )
-    picked = primary.provenance.tag.split(":", 1)[1] if primary else None
+    picked = _tag_of(primary)
     parts = [primary] if primary else []
     if primary is None:
-        # "Other…" is a component of the primary tags; additive only when they are absent
+        # Everything below is a component of the primary rollups — additive ONLY
+        # when no rollup exists (GT/CAG: a component can equal the whole rollup).
         parts.append(_latest_instant(
             gaap, "LongTermDebt (other)", ("OtherLongTermDebtNoncurrent",), not_before=not_before
         ))
+        # notes/loans family: the parent rollup wins over the pair
+        notes_group = _latest_instant_across(
+            gaap, "LongTermDebt (notes and loans)", ("NotesAndLoansPayable",), not_before=not_before
+        )
+        if notes_group is None:
+            notes_group = _sum_facts("LongTermDebt (notes and loans)", [
+                _latest_instant_across(gaap, "LongTermDebt (notes payable)", ("NotesPayable",),
+                                       not_before=not_before),
+                _latest_instant_across(gaap, "LongTermDebt (loans payable)", ("LoansPayable",),
+                                       not_before=not_before),
+            ])
+        instruments = [notes_group] if notes_group else []
+        if notes_group is None:
+            # convertibles hide inside the notes totals; a separate slot only
+            # when no notes group fired (DDOG/SNOW: converts are the whole debt)
+            instruments.append(_latest_instant_across(
+                gaap, "LongTermDebt (convertible)",
+                ("ConvertibleDebtNoncurrent", "ConvertibleLongTermNotesPayable",
+                 "ConvertibleDebt", "ConvertibleNotesPayable"),
+                not_before=not_before,
+            ))
+            instruments.append(_latest_instant_across(
+                gaap, "LongTermDebt (loans)", ("LongTermLoansPayable",), not_before=not_before
+            ))
+            instruments.append(_latest_instant_across(
+                gaap, "LongTermDebt (senior notes)", ("SeniorLongTermNotes",), not_before=not_before
+            ))
+        instruments.append(_latest_instant_across(
+            gaap, "LongTermDebt (credit line)", ("LongTermLineOfCredit", "LineOfCredit"),
+            not_before=not_before,
+        ))
+        instruments = [f for f in instruments if f is not None]
+        # Secured debt is an AXIS over the same instruments, not another
+        # instrument: take whichever representation shows more, never both.
+        # A skip-if-present guard misfires on fresh zeros (BRT) and fragments
+        # (AVA would report 3M instead of 2,759M).
+        secured = _latest_instant_across(
+            gaap, "LongTermDebt (secured)", ("SecuredLongTermDebt", "SecuredDebt"),
+            not_before=not_before,
+        )
+        if secured is not None and secured.value > sum((f.value for f in instruments), Decimal(0)):
+            parts.append(secured)
+        else:
+            parts.extend(instruments)
+            secured = None
     parts.append(_latest_instant(
         gaap, "LongTermDebt (subordinated debentures)",
         ("JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent",),
         not_before=not_before,
     ))
     if picked != "LongTermDebtAndCapitalLeaseObligations":
-        parts.append(_latest_instant(
-            gaap, "LongTermDebt (finance leases)", ("FinanceLeaseLiabilityNoncurrent",),
+        parts.append(_latest_instant_across(
+            gaap, "LongTermDebt (finance leases)",
+            ("FinanceLeaseLiabilityNoncurrent", "FinanceLeaseLiability"),
             not_before=not_before,
         ))
-    return _sum_facts("LongTermDebt", parts), _LTD_SUPPRESSIONS.get(picked, frozenset())
+    suppress: set[str] = set()
+    for f in parts:
+        if f is None:
+            continue
+        for tag in f.provenance.tag.split(" + "):  # summed facts carry every component tag
+            suppress |= _COMBINED_SUPPRESSIONS.get(tag.split(":", 1)[1], frozenset())
+    return _sum_facts("LongTermDebt", parts), frozenset(suppress)
 
 
 def _short_term_debt(
@@ -1019,25 +1244,89 @@ def _short_term_debt(
     whole = _latest_instant_across(gaap, "ShortTermDebt", ("DebtCurrent",), not_before=not_before)
     if whole is not None:
         return whole  # DebtCurrent already rolls up the whole short bucket
-    ltd_current = None
-    if "ltd_current" not in suppress:  # skipped when the long bucket already includes current maturities
-        ltd_current = _latest_instant_across(
-            gaap, "ShortTermDebt (current portion of long-term)",
-            ("LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
-             "UnsecuredDebtCurrent"),
-            not_before=not_before,
-        )
+
+    # Borrowings slot. ShortTermBankLoansAndNotesPayable TERMINATES the slot and
+    # the notes-current family: KEY files it equal to OtherShortTermBorrowings,
+    # so summing anything beside it doubles the figure.
     borrowings = _latest_instant_across(
-        gaap, "ShortTermDebt (borrowings)", ("ShortTermBorrowings", "CommercialPaper"),
+        gaap, "ShortTermDebt (borrowings)",
+        ("ShortTermBorrowings", "ShortTermBankLoansAndNotesPayable"),
         not_before=not_before,
     )
+    bank_loans_won = _tag_of(borrowings) == "ShortTermBankLoansAndNotesPayable"
+    if borrowings is None:
+        # KO: commercial paper and other short-term borrowings are disjoint lines
+        borrowings = _sum_facts("ShortTermDebt (borrowings)", [
+            _latest_instant_across(gaap, "ShortTermDebt (commercial paper)", ("CommercialPaper",),
+                                   not_before=not_before),
+            _latest_instant_across(gaap, "ShortTermDebt (other borrowings)",
+                                   ("OtherShortTermBorrowings",), not_before=not_before),
+        ])
+
+    ltd_current = None
+    if "ltd_current" not in suppress:  # skipped when the long bucket already includes current maturities
+        chain = ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
+                 "UnsecuredDebtCurrent"]
+        if "notes_current" not in suppress and not bank_loans_won:
+            chain.append("NotesPayableCurrent")
+        chain.append("OtherLongTermDebtCurrent")  # strict component: chained, never summed (SMP/NTAP)
+        if "secured_current" not in suppress:
+            chain.append("SecuredDebtCurrent")
+        ltd_current = _latest_instant_across(
+            gaap, "ShortTermDebt (current portion of long-term)", tuple(chain),
+            not_before=not_before,
+        )
+        # ED: NotesPayableCurrent 869M == CommercialPaper 869M, same period end —
+        # the tag is often the commercial paper under another name; count once.
+        if (ltd_current is not None and _tag_of(ltd_current) == "NotesPayableCurrent"
+                and borrowings is not None
+                and borrowings.provenance.period_end == ltd_current.provenance.period_end
+                and borrowings.value == ltd_current.value):
+            ltd_current = None
+
+    # Current-side instrument families exist only when NO current rollup fired:
+    # MELI's LoansPayableCurrent and SMP's LinesOfCreditCurrent are components
+    # of the rollup and would double count beside it.
+    family: list[Fact | None] = []
+    if ltd_current is None and "ltd_current" not in suppress:
+        parent = None
+        if {"notes_current", "loans_current"}.isdisjoint(suppress) and not bank_loans_won:
+            parent = _latest_instant_across(
+                gaap, "ShortTermDebt (notes and loans, current)", ("NotesAndLoansPayableCurrent",),
+                not_before=not_before,
+            )
+        if parent is not None:
+            family.append(parent)
+        else:
+            if "loc_current" not in suppress:
+                family.append(_latest_instant_across(
+                    gaap, "ShortTermDebt (credit line, current)", ("LinesOfCreditCurrent",),
+                    not_before=not_before))
+            if "loans_current" not in suppress:
+                family.append(_latest_instant_across(
+                    gaap, "ShortTermDebt (loans, current)", ("LoansPayableCurrent",),
+                    not_before=not_before))
+            if "notes_current" not in suppress and not bank_loans_won:
+                family.append(_latest_instant_across(
+                    gaap, "ShortTermDebt (other notes, current)", ("OtherNotesPayableCurrent",),
+                    not_before=not_before))
+                family.append(_latest_instant_across(
+                    gaap, "ShortTermDebt (senior notes, current)", ("SeniorNotesCurrent",),
+                    not_before=not_before))
+        if "convertible_current" not in suppress:
+            family.append(_latest_instant_across(
+                gaap, "ShortTermDebt (convertible, current)",
+                ("ConvertibleNotesPayableCurrent", "ConvertibleDebtCurrent"),
+                not_before=not_before))
+
     leases = None
-    if ltd_current is None or "CapitalLeaseObligations" not in ltd_current.provenance.tag:
+    if ("finance_lease_current" not in suppress
+            and (ltd_current is None or "CapitalLeaseObligations" not in ltd_current.provenance.tag)):
         leases = _latest_instant(
             gaap, "ShortTermDebt (finance leases)", ("FinanceLeaseLiabilityCurrent",),
             not_before=not_before,
         )
-    return _sum_facts("ShortTermDebt", [ltd_current, borrowings, leases])
+    return _sum_facts("ShortTermDebt", [ltd_current, *family, borrowings, leases])
 
 
 def _sum_facts(concept: str, parts: list[Fact | None]) -> Fact | None:
@@ -1064,7 +1353,8 @@ def _sum_facts(concept: str, parts: list[Fact | None]) -> Fact | None:
 
 _DEBT_EVIDENCE_RE = re.compile(
     r"debt|borrowing|notespayable|loanspayable|debenture|commercialpaper"
-    r"|financeleaseliability|lineofcredit", re.I,
+    r"|financeleaseliability|lineofcredit|seniornotes|subordinatednotes"
+    r"|mediumtermnotes|federalhomeloan|federalfundspurchased|bankoverdraft", re.I,
 )
 _DEBT_EVIDENCE_EXCLUDE_RE = re.compile(
     r"securit|maturit|capacity|issuancecost|weightedaverage|interestrate|remaining"
@@ -1126,6 +1416,10 @@ def _derive_liabilities(gaap: dict, not_before: date | None) -> tuple[Fact | Non
     for equity_tag, parent_only in (
         ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", False),
         ("StockholdersEquity", True),
+        # partnerships have no stockholders equity at all (PAA's Liabilities tag
+        # is stale since 2011); their capital accounts carry the same identity
+        ("PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest", False),
+        ("PartnersCapital", True),
     ):
         equity = _latest_instant(gaap, "Equity", (equity_tag,), not_before=not_before)
         if equity and equity.provenance.period_end == lse.provenance.period_end:
@@ -1142,11 +1436,65 @@ def _derive_liabilities(gaap: dict, not_before: date | None) -> tuple[Fact | Non
     return None, False
 
 
+def _instants_by_end(gaap: dict, tag: str, not_before: date | None) -> dict[str, dict]:
+    """Freshness-filtered instant entries keyed by period end, latest-filed wins."""
+    floor = not_before.isoformat() if not_before else ""
+    out: dict[str, dict] = {}
+    for e in _entries(gaap, tag, ("USD",)):
+        if "start" in e or not _is_financial_form(e.get("form", "")) or e["end"] < floor:
+            continue
+        cur = out.get(e["end"])
+        if cur is None or e["filed"] > cur["filed"]:
+            out[e["end"]] = e
+    return out
+
+
+def _derived_instant(
+    gaap: dict, concept: str, minuend: str, subtrahend: str,
+    not_before: date | None, subtrahend_optional: bool = False,
+) -> Fact | None:
+    """minuend − subtrahend at their latest COMMON period end. Mixed period ends
+    would subtract different balance sheets (BBY: gross-only overstates 96x), and
+    a negative result marks a mistagged pair (CALM), never a value. With
+    subtrahend_optional the bare minuend stands when the subtrahend was never
+    tagged — overstating a deduction is the conservative direction."""
+    a = _instants_by_end(gaap, minuend, not_before)
+    if not a:
+        return None
+    b = _instants_by_end(gaap, subtrahend, not_before)
+    if not b and subtrahend_optional:
+        end = max(a)
+        return _fact(f"{concept} — {subtrahend} never tagged", minuend, a[end])
+    common = set(a) & set(b)
+    if not common:
+        return None
+    end = max(common)
+    value = _dec(a[end]["val"]) - _dec(b[end]["val"])
+    if value < 0:
+        return None
+    base = a[end] if a[end]["filed"] >= b[end]["filed"] else b[end]
+    return Fact(
+        value=value,
+        provenance=Provenance(
+            concept=concept,
+            tag=f"us-gaap:{minuend} - us-gaap:{subtrahend}",
+            fiscal_year=None, form=base.get("form", ""), accession=base.get("accn", ""),
+            filed=date.fromisoformat(base["filed"]), period_end=date.fromisoformat(end),
+        ),
+    )
+
+
+_INDEFINITE_CLASS_TAGS = (
+    "IndefiniteLivedTradeNames", "IndefiniteLivedTrademarks",
+    "IndefiniteLivedLicenseAgreements", "OtherIndefiniteLivedIntangibleAssets",
+)
+
+
 def _intangibles(gaap: dict, not_before: date | None) -> Fact | None:
-    """Total ex-goodwill tag when present; otherwise finite + indefinite-lived parts;
-    otherwise the OtherIntangibleAssetsNet line some filers use as their only total.
-    Last because when the specific tags exist it may be a residual category, and
-    adding it to them would risk double counting."""
+    """Total ex-goodwill tag when present; otherwise the larger of the
+    finite+indefinite parts sum and the OtherIntangibleAssetsNet line (HBAN files
+    both, and the Other line holds MSRs the parts miss — max never sums, so it
+    cannot double count); then derivations; then sector last resorts."""
     total = _latest_instant(
         gaap, "Intangibles", ("IntangibleAssetsNetExcludingGoodwill",), not_before=not_before
     )
@@ -1159,11 +1507,48 @@ def _intangibles(gaap: dict, not_before: date | None) -> Fact | None:
         gaap, "Intangibles (indefinite-lived)", ("IndefiniteLivedIntangibleAssetsExcludingGoodwill",),
         not_before=not_before,
     )
+    if indefinite is None:
+        # KO's trademarks and VZ's spectrum live only in class tags
+        indefinite = _sum_facts("Intangibles (indefinite-lived classes)", [
+            _latest_instant(gaap, f"Intangibles ({tag})", (tag,), not_before=not_before)
+            for tag in _INDEFINITE_CLASS_TAGS
+        ])
     summed = _sum_facts("Intangibles", [finite, indefinite])
-    if summed is not None:
-        return summed
-    return _latest_instant(
+    other = _latest_instant(
         gaap, "Intangibles (other, net)", ("OtherIntangibleAssetsNet",), not_before=not_before
+    )
+    if summed is not None and other is not None:
+        return other if other.value > summed.value else summed
+    if summed is not None or other is not None:
+        return summed or other
+    derived = _derived_instant(
+        gaap, "Intangibles (derived: combined line - goodwill)",
+        "IntangibleAssetsNetIncludingGoodwill", "Goodwill", not_before,
+    )
+    if derived is not None:
+        return derived
+    for minuend in ("IntangibleAssetsGrossExcludingGoodwill", "FiniteLivedIntangibleAssetsGross"):
+        derived = _derived_instant(
+            gaap, "Intangibles (derived: gross - accumulated amortization)",
+            minuend, "FiniteLivedIntangibleAssetsAccumulatedAmortization",
+            not_before, subtrahend_optional=True,
+        )
+        if derived is not None:
+            return derived
+    servicing = _sum_facts("Intangibles (mortgage servicing rights)", [
+        # the two measurement books are disjoint under ASC 860-50; WFC carries both
+        _latest_instant(gaap, "Intangibles (servicing, fair value)",
+                        ("ServicingAssetAtFairValueAmount",), not_before=not_before),
+        _latest_instant(gaap, "Intangibles (servicing, amortized)",
+                        ("ServicingAssetAtAmortizedValue",), not_before=not_before),
+    ]) or _latest_instant(
+        gaap, "Intangibles (mortgage servicing rights)", ("ServicingAsset",), not_before=not_before
+    )
+    if servicing is not None:
+        return servicing
+    return _latest_instant(
+        gaap, "Intangibles (capitalized software standing in for an untagged intangibles line)",
+        ("CapitalizedComputerSoftwareNet",), not_before=not_before,
     )
 
 
@@ -1211,16 +1596,26 @@ CAPEX_TAGS = (
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
     "PaymentsForCapitalImprovements",
+    # last, so per-year fill only covers years the payments tags lack (SCHL's
+    # payments tag died in FY2020); accrual-basis overstatement is conservative
+    # for owner earnings and the provenance discloses the segment source
+    "SegmentExpenditureAdditionToLongLivedAssets",
 )
 CASH_TAGS = (
     "CashAndCashEquivalentsAtCarryingValue",
     "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
 )
+# The two post-ASU-2016-01 AFS successors and held-to-maturity go END of chain:
+# PFE tags OtherShortTermInvestments as the total and the AFS tag as its
+# footnote fragment. The dead pre-ASU AvailableForSaleSecuritiesCurrent is gone
+# (zero fresh instants across the cache).
 SHORT_TERM_INVESTMENT_TAGS = (
     "ShortTermInvestments",
-    "AvailableForSaleSecuritiesCurrent",
     "MarketableSecuritiesCurrent",
     "OtherShortTermInvestments",
+    "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+    "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent",
+    "HeldToMaturitySecuritiesCurrent",
 )
 
 
@@ -1325,6 +1720,22 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     assets, cur_liab = snap_parts.get("total_assets"), snap_parts.get("current_liabilities")
     short_debt = snap_parts.get("short_term_debt")
     cash = _latest_instant(gaap, "Cash", CASH_TAGS, not_before=fresh)
+    # When the cash rollup includes restricted cash, net out exactly ONE
+    # restricted representation at the SAME period end — restricted cash is not
+    # deployable capital (AAL), but a mismatched period would net a different
+    # balance sheet. Never against the plain carrying-value tag.
+    if cash is not None and _tag_of(cash) == "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents":
+        restricted = _restricted_cash(gaap, fresh, cash.provenance.period_end)
+        if restricted is not None and Decimal(0) < restricted.value <= cash.value:
+            cash = Fact(value=cash.value - restricted.value, provenance=Provenance(
+                concept="Cash (restricted portion netted out)",
+                tag=f"{cash.provenance.tag} - {restricted.provenance.tag}",
+                fiscal_year=None, form=cash.provenance.form,
+                accession=cash.provenance.accession, filed=cash.provenance.filed,
+                period_end=cash.provenance.period_end,
+            ))
+            caveats.append("the cash rollup includes restricted cash; the restricted portion "
+                           "was netted out of invested capital at the same period end")
     investments = _latest_instant(gaap, "ShortTermInvestments", SHORT_TERM_INVESTMENT_TAGS,
                                   not_before=fresh)
     if assets is not None and cur_liab is not None:
@@ -1349,6 +1760,30 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     return OwnerEarnings(fiscal_year=fy, owner_earnings=owner, invested_capital=invested,
                          roic=roic, roic_maintenance=roic_maint, components=components,
                          caveats=tuple(caveats))
+
+
+def _restricted_cash(gaap: dict, fresh: date | None, end: date | None) -> Fact | None:
+    """One restricted-cash representation at exactly the given period end: the
+    single total first, else current+noncurrent, else the cash-equivalents pair
+    (GE's only fresh figure is the noncurrent variant of the latter)."""
+    def at_end(concept: str, tag: str) -> Fact | None:
+        f = _latest_instant(gaap, concept, (tag,), not_before=fresh)
+        return f if f is not None and f.provenance.period_end == end else None
+
+    total = at_end("RestrictedCash", "RestrictedCash")
+    if total is not None:
+        return total
+    summed = _sum_facts("RestrictedCash", [
+        at_end("RestrictedCash (current)", "RestrictedCashCurrent"),
+        at_end("RestrictedCash (noncurrent)", "RestrictedCashNoncurrent"),
+    ])
+    if summed is not None:
+        return summed
+    return _sum_facts("RestrictedCash", [
+        at_end("RestrictedCash (and equivalents)", "RestrictedCashAndCashEquivalents"),
+        at_end("RestrictedCash (and equivalents, noncurrent)",
+               "RestrictedCashAndCashEquivalentsNoncurrent"),
+    ])
 
 
 def _implied_shares(gaap: dict, annual_eps: dict[int, Fact],
@@ -1412,6 +1847,23 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
         if max(chosen.value, implied) / min(chosen.value, implied) > 10:
             return None
     return chosen
+
+
+def _is_partnership(gaap: dict, not_before: date | None) -> bool:
+    """Partners capital present and stockholders equity absent — the shape of a
+    filer whose 'shares' are limited-partner units."""
+    partners = _latest_instant(
+        gaap, "PartnersCapital",
+        ("PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest", "PartnersCapital"),
+        not_before=not_before,
+    )
+    stockholders = _latest_instant(
+        gaap, "StockholdersEquity",
+        ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+         "StockholdersEquity"),
+        not_before=not_before,
+    )
+    return partners is not None and stockholders is None
 
 
 def _weighted_shares(gaap: dict, not_before: date | None) -> Fact | None:
@@ -1498,16 +1950,21 @@ def _dividend(gaap: dict, reference: date | None) -> tuple[bool | None, Fact | N
             concept = ("Dividends (aggregate — may include preferred and noncontrolling)"
                        if tag in _AGGREGATE_DIVIDEND_TAGS else "Dividends (common stock)")
             return True, _fact(concept, tag, e)
-    # The chain missed, but a recent positive fact under ANY other dividend-named
-    # tag means the filer likely pays via a tag we don't read: unknown, never FAIL.
+    # The chain missed, but a recent positive fact under ANY other dividend- or
+    # distribution-named tag means the filer likely pays via a tag we don't
+    # read: unknown, never FAIL. Up-C filers whose only payouts go to NCI
+    # holders (SDHC/GLXY pattern) intentionally land here as unknown.
     floor = (reference - timedelta(days=_DIVIDEND_RECENCY_DAYS)).isoformat()
     chained = {tag for tag, _ in DIVIDEND_TAGS}
     for tag, tagdata in gaap.items():
-        if tag in chained or "dividend" not in tag.lower():
+        low = tag.lower()
+        if tag in chained or ("dividend" not in low and "distribut" not in low):
             continue
         if _DIVIDEND_EVIDENCE_EXCLUDE_RE.search(tag):
             continue
-        for unit in tagdata.get("units", {}).values():
+        for unit_name, unit in tagdata.get("units", {}).items():
+            if unit_name in ("shares", "pure"):  # counts and ratios are not payouts
+                continue
             for e in unit:
                 if (_is_financial_form(e.get("form", ""))
                         and e.get("end", "") >= floor

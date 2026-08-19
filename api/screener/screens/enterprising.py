@@ -255,6 +255,8 @@ def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> Crite
         inputs += (s.preferred_stock,)
     if s.noncontrolling_interest is not None:
         inputs += (s.noncontrolling_interest,)
+    if s.temporary_equity is not None:
+        inputs += (s.temporary_equity,)
     if missing:
         return CriterionResult(7, name, Status.INSUFFICIENT_DATA, None, threshold, inputs,
                                note="missing: " + ", ".join(missing))
@@ -273,6 +275,8 @@ def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> Crite
                      + " (no evidence in any filing; assume_absent_zero opt-in)")
     if s.preferred_stock is None:
         notes.append("no preferred-stock value tagged; defaulted to 0 (flagged per §5.1)")
+    if s.temporary_equity is not None:
+        notes.append("mezzanine (temporary) equity deducted — senior to common, outside the preferred tag")
     value_of = lambda f: f.value if f is not None else Decimal(0)  # noqa: E731
     tangible = (
         s.total_assets.value
@@ -282,6 +286,7 @@ def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> Crite
         - value_of(s.preferred_stock)
         # A - L is equity incl. NCI; minority holders' share is not the common's
         - value_of(s.noncontrolling_interest)
+        - value_of(s.temporary_equity)
     )
     tbvps = tangible / s.shares_outstanding.value
     if tbvps <= 0:

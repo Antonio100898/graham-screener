@@ -155,7 +155,8 @@ def _bvps(snap) -> float | None:
     need = (snap.total_assets, snap.total_liabilities, snap.shares_outstanding)
     if any(f is None for f in need) or snap.shares_outstanding.value <= 0:
         return None
-    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest) if f)
+    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
+                                     snap.temporary_equity) if f)
     book = snap.total_assets.value - snap.total_liabilities.value - optional
     return float(book / snap.shares_outstanding.value)
 
@@ -165,7 +166,8 @@ def _tbvps(snap) -> float | None:
             snap.intangibles, snap.shares_outstanding)
     if any(f is None for f in need) or snap.shares_outstanding.value <= 0:
         return None
-    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest) if f)
+    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
+                                     snap.temporary_equity) if f)
     tangible = (snap.total_assets.value - snap.total_liabilities.value
                 - snap.goodwill.value - snap.intangibles.value - optional)
     return float(tangible / snap.shares_outstanding.value)
