@@ -1440,6 +1440,9 @@ def _sum_facts(concept: str, parts: list[Fact | None]) -> Fact | None:
             tag=" + ".join(p.provenance.tag for p in parts),
             fiscal_year=None, form=latest.form, accession=latest.accession,
             filed=latest.filed, period_end=latest.period_end,
+            # components may carry different (individually fresh) period ends, so
+            # the summary line's date belongs to one of them and not the rest
+            components=tuple(p.provenance for p in parts),
         ),
     )
 
@@ -1674,8 +1677,14 @@ OPERATING_INCOME_TAGS = ("OperatingIncomeLoss",)
 PRETAX_INCOME_TAGS = (
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
-    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeignAndDomestic",
 )
+# The domestic figure is one geography, not the consolidated company: standing
+# alone it understates a multinational's profit, and with it the owner earnings
+# and return on capital built on top. It serves only added to its foreign twin,
+# and only where both cover the same year.
+_PRETAX_GEOGRAPHY_TAGS = ("IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+                          "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign")
 # Rollup tags first: a filer that reports the combined figure rarely also splits it,
 # and summing the parts when the rollup exists would double-count.
 DA_TAGS = (
@@ -1771,6 +1780,11 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
         flows["operating profit"] = series
         caveats.append("no operating subtotal is reported, so pre-tax income stands in for "
                        "operating profit and carries non-operating items with it")
+    if "operating profit" not in flows and (series := _geographic_pretax(gaap)):
+        flows["operating profit"] = series
+        caveats.append("no operating subtotal or consolidated pre-tax total is reported, so "
+                       "pre-tax income is the sum of the domestic and foreign figures for the "
+                       "same year, and carries non-operating items with it")
 
     da = _annual_union(gaap, DA_TAGS)
     parts = [s for tag in DA_PART_TAGS if (s := _annual_series(gaap, tag, unit=("USD",)))]
@@ -1947,6 +1961,23 @@ def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
                 filed=p.filed, period_end=p.period_end, period_start=p.period_start,
             ),
         )
+    return out
+
+
+def _geographic_pretax(gaap: dict) -> dict[int, Fact]:
+    """Consolidated pre-tax income rebuilt from its two geographies, for the year
+    both cover. Either half alone describes part of a company; only the pair
+    describes the whole, so a year missing one of them stays missing."""
+    domestic, foreign = (_annual_series(gaap, tag, unit=("USD",))
+                         for tag in _PRETAX_GEOGRAPHY_TAGS)
+    out: dict[int, Fact] = {}
+    for year in set(domestic) & set(foreign):
+        pair = [domestic[year], foreign[year]]
+        if len({f.provenance.period_end for f in pair}) != 1:
+            continue
+        summed = _sum_facts("PretaxIncome (domestic + foreign)", pair)
+        if summed is not None:
+            out[year] = summed
     return out
 
 

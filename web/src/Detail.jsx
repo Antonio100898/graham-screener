@@ -221,9 +221,23 @@ const SOURCE_LABELS = {
   dividend: "Dividend paid (tagged period)",
 };
 
+/** The filing's index page, which names its primary document — not the bare
+ * archive folder, which leaves the reader to guess which file is the filing. */
 function edgarUrl(cik, accn) {
   if (!cik || !accn) return null;
-  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replaceAll("-", "")}/`;
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replaceAll("-", "")}/${accn}-index.htm`;
+}
+
+function SourceCell({ cik, source }) {
+  const url = edgarUrl(cik, source.accn);
+  const label = `${source.form} · ${source.end ?? "—"}`;
+  return (
+    <>
+      {url ? <a href={url} target="_blank" rel="noreferrer" title={`Open filing ${source.accn}`}>{label}</a>
+           : label}
+      <small className="accn">{source.accn}</small>
+    </>
+  );
 }
 
 /** Every figure names its tag, filing and date — the audit trail behind the screen. */
@@ -238,21 +252,29 @@ function Provenance({ row }) {
         <table className="criteria-clean">
           <thead><tr><th>Figure</th><th>Value</th><th>Tag</th><th>Filing</th></tr></thead>
           <tbody>
-            {Object.entries(SOURCE_LABELS).filter(([key]) => sources[key]).map(([key, label]) => {
+            {Object.entries(SOURCE_LABELS).filter(([key]) => sources[key]).flatMap(([key, label]) => {
               const s = sources[key];
-              const url = edgarUrl(row.cik, s.accn);
               const raw = key === "dividend" && row[key] == null ? undefined : row[key];
               const value = key === "shares" ? number(raw) : money(raw);
-              return (
+              const out = [(
                 <tr key={key}>
                   <td><b>{label}</b></td>
                   <td className="num">{value}</td>
                   <td className="rule"><code>{s.tag}</code></td>
-                  <td>{url
-                    ? <a href={url} target="_blank" rel="noreferrer">{s.form} · {s.end ?? "—"}</a>
-                    : `${s.form} · ${s.end ?? "—"}`}</td>
+                  <td><SourceCell cik={row.cik} source={s} /></td>
                 </tr>
-              );
+              )];
+              // a summed figure's own filing is whichever component was newest,
+              // so each component states its own rather than borrowing that one
+              (s.components ?? []).forEach((part, i) => out.push(
+                <tr key={`${key}-${i}`} className="component-row">
+                  <td><span className="component-mark">↳ component</span></td>
+                  <td className="num"></td>
+                  <td className="rule"><code>{part.tag}</code></td>
+                  <td><SourceCell cik={row.cik} source={part} /></td>
+                </tr>
+              ));
+              return out;
             })}
           </tbody>
         </table>

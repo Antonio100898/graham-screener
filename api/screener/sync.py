@@ -49,13 +49,24 @@ def _facts_path(edgar: EdgarClient, cik: str) -> Path:
 
 
 def _source(fact) -> dict | None:
-    """Compact provenance for the payload: enough to open the exact filing."""
+    """Compact provenance for the payload: enough to open the exact filing.
+
+    A summed or derived figure carries each component, because its own filing
+    metadata belongs to whichever component was newest and describes none of the
+    others."""
     if fact is None:
         return None
+
+    def one(p) -> dict:
+        return {"tag": p.tag, "form": p.form, "accn": p.accession,
+                "end": p.period_end.isoformat() if p.period_end else None,
+                "filed": p.filed.isoformat() if p.filed else None}
+
     p = fact.provenance
-    return {"tag": p.tag, "form": p.form, "accn": p.accession,
-            "end": p.period_end.isoformat() if p.period_end else None,
-            "filed": p.filed.isoformat() if p.filed else None}
+    src = one(p)
+    if p.components:
+        src["components"] = [one(c) for c in p.components]
+    return src
 
 
 def _series_mix(series: dict) -> dict | None:

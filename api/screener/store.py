@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 46  # derived EPS and TTM where the per-share element is dimension-only or stale
+ENGINE_VERSION = 47  # consolidated pre-tax income only; component-level provenance
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

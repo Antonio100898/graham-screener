@@ -1825,3 +1825,37 @@ def test_a_share_count_struck_long_after_the_year_never_derives_it():
 def test_a_reported_eps_is_never_replaced_by_a_derived_one():
     s = build()  # GAAP has EarningsPerShareDiluted for every year
     assert all("derived" not in f.provenance.concept for f in s.annual_eps.values())
+
+
+# --- Review v46 follow-ups ---
+
+def test_domestic_pretax_alone_never_becomes_owner_earnings():
+    """The domestic figure is one geography, not the consolidated company."""
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15")])
+    assert build(gaap).owner_earnings is None
+
+
+def test_domestic_and_foreign_pretax_sum_to_a_consolidated_figure():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15")])
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 70e9, accn="k25", filed="2026-02-15")])
+    oe = build(gaap).owner_earnings
+    assert float(dict(oe.components)["operating profit"]) == 100e9
+    assert any("domestic and foreign" in c for c in oe.caveats)
+
+
+def test_a_summed_figure_keeps_every_component_filing():
+    gaap = dict(GAAP)
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [
+        inst("2025-12-31", 30e9, form="10-K", accn="k25", filed="2026-02-15")])
+    gaap["FinanceLeaseLiabilityNoncurrent"] = tagdata("USD", [inst("2026-03-31", 1e9, accn="q126")])
+    parts = build(gaap).long_term_debt.provenance.components
+    assert len(parts) == 2
+    assert {p.accession for p in parts} == {"k25", "q126"}
+    # the summary line's own date belongs to the newest part, which is exactly
+    # why the parts must state their own
+    assert {str(p.period_end) for p in parts} == {"2025-12-31", "2026-03-31"}

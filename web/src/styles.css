@@ -481,3 +481,8 @@ table.grid { font-size: 14px; }
 /* Disclosure notes: context and earnings composition (release 4) */
 .disclosure-notes { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 0.5rem; }
 .disclosure-notes li { font-size: 11px; line-height: 1.55; color: var(--dim); }
+
+/* Provenance: accession and per-component filings (review v46, findings 2-3) */
+.provenance-section .accn { display: block; color: var(--dim); font-size: 9.5px; letter-spacing: 0.02em; }
+.provenance-section .component-row td { padding-top: 2px; padding-bottom: 2px; opacity: 0.82; }
+.provenance-section .component-mark { color: var(--dim); font-size: 10px; }

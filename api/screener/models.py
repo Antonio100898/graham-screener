@@ -30,6 +30,10 @@ class Provenance:
     filed: date
     period_end: date | None = None
     period_start: date | None = None  # duration facts only; None for balance-sheet instants
+    # a figure summed or derived from several facts keeps each of them here: the
+    # combined tag string alone cannot say which filing or which balance-sheet
+    # date a given component came from
+    components: tuple["Provenance", ...] = ()
 
 
 @dataclass(frozen=True)
