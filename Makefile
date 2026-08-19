@@ -26,6 +26,9 @@ derive:                        ## recompute snapshots after an engine change (no
 export:                        ## write dashboard.json (adds live prices)
 	cd api && .venv/bin/python -m screener.sync export
 
+verify-coverage:               ## prove the sampled companies hide no unread material facts
+	cd api && .venv/bin/python -m screener.coverage
+
 status:
 	cd api && .venv/bin/python -m screener.sync status
 
