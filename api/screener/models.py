@@ -34,6 +34,9 @@ class Provenance:
     # combined tag string alone cannot say which filing or which balance-sheet
     # date a given component came from
     components: tuple["Provenance", ...] = ()
+    # the dimension a fact was reported under, when it has one — "which slice of
+    # the company is this" is part of what the number means
+    segments: str = ""
 
 
 @dataclass(frozen=True)

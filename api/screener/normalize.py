@@ -211,15 +211,25 @@ _MILLION = Decimal("1000000")
 
 
 def build_snapshot(
-    ticker: str, cik: str, companyfacts: dict, assume_absent_zero: bool = False
+    ticker: str, cik: str, companyfacts: dict, assume_absent_zero: bool = False,
+    dimensioned: dict | None = None,
 ) -> FinancialSnapshot:
     facts = companyfacts.get("facts", {})
     _reject_foreign(facts)
     gaap = facts.get("us-gaap", {})
     dei = facts.get("dei", {})
+    # Company Facts cannot express a dimension, so a filer that reports only by
+    # share class looks silent to it. The unambiguous half of those facts is read
+    # through the same chains, and only ever fills a gap: a consolidated figure
+    # always outranks a figure that had to be attributed to one class.
+    classed = _unambiguous_dimensioned(dimensioned)
 
     annual_eps = _annual_eps(gaap)
+    if classed:
+        annual_eps = {**_annual_eps(classed), **annual_eps}
     ttm_eps, ttm_inputs = _ttm_eps(gaap, annual_eps)
+    if ttm_eps is None and classed:
+        ttm_eps, ttm_inputs = _ttm_eps(classed, annual_eps)
     annual_net_income = _annual_net_income(gaap)
     ttm_net_income, ttm_ni_inputs = _ttm_eps(gaap, annual_net_income, unit=("USD",),
                                              per_share=False)
@@ -400,6 +410,11 @@ def build_snapshot(
         )
     if shares is None:
         shares = _weighted_shares(gaap, fresh)
+    if shares is None and classed:
+        shares = _latest_instant(
+            classed, "SharesOutstanding", ("CommonStockSharesOutstanding",),
+            unit=("shares",), not_before=fresh,
+        ) or _weighted_shares(classed, fresh)
     if shares is None and _is_partnership(gaap, fresh):
         # LP unit instants are OP-unit fragments at REITs (MAA: 2.9M against a
         # 116M cover), so they count only for a filer that has partners capital
@@ -585,6 +600,7 @@ def _fact(concept: str, tag: str, e: dict, fiscal_year: int | None = None, ns: s
             filed=date.fromisoformat(e["filed"]),
             period_end=date.fromisoformat(e["end"]),
             period_start=date.fromisoformat(e["start"]) if "start" in e else None,
+            segments=e.get("segments", ""),
         ),
     )
 
@@ -1925,24 +1941,18 @@ def _has_minority_interest(gaap: dict, fresh: date | None, nci: Fact | None) -> 
 
 
 def _annual_share_counts(gaap: dict, dei: dict) -> dict[int, Fact]:
-    """One share count per fiscal year: the weighted average the filer used for
-    its own per-share figures, else the count on that year's report cover."""
-    counts = _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
-    covers: dict[int, Fact] = {}
-    for tag, taxo, ns in (("EntityCommonStockSharesOutstanding", dei, "dei"),
-                          ("CommonStockSharesOutstanding", gaap, "us-gaap")):
-        for e in _entries(taxo, tag, ("shares",)):
-            if "start" in e or not _is_financial_form(e.get("form", "")):
-                continue
-            if not isinstance(e.get("val"), (int, float)) or e["val"] <= 0:
-                continue
-            end = date.fromisoformat(e["end"])
-            # a cover is dated after the year it reports on; attribute it to that year
-            year = _fy_label(end)
-            kept = covers.get(year)
-            if kept is None or e["filed"] > kept.provenance.filed.isoformat():
-                covers[year] = _fact("SharesOutstanding (report cover)", tag, e, ns=ns)
-    return {**covers, **counts}  # a weighted average always outranks a cover count
+    """The share count a filer itself divided by for a given year.
+
+    Only the weighted average serves. The count on a report cover looked like a
+    reasonable stand-in and is not: measured against the figures companies
+    actually report, it produced errors of exactly five, ten and a hundred and
+    fifty times — a reverse split leaves today's small count against an old
+    year's income, and a multi-class filer's cover names one class while the
+    income belongs to all of them. Both failures are silent and both read as a
+    bargain, so the stand-in is gone: a year without its own weighted average
+    keeps no derived figure.
+    """
+    return _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
 
 
 def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
@@ -2016,6 +2026,43 @@ def _tax_record(gaap: dict, fresh: date | None) -> dict | None:
             _annual_union(gaap, ("InvestmentCompanyInvestmentIncomeLossFromOperationsPerShare",
                                  "InvestmentIncomeOperatingAfterExpenseAndTax"))),
     }
+
+
+# A dimension answers "which slice of the company", and most slices are not the
+# company: a segment, a geography, a parent-only view. Only the share-class axis
+# names a security a ticker can be, so only it can supply a company's figure.
+_CLASS_AXES = frozenset(("ClassOfStock", "StatementClassOfStock", "EquityClassOfStock"))
+
+
+def _unambiguous_dimensioned(dimensioned: dict | None) -> dict:
+    """The dimensioned facts that can only mean one thing, shaped like the facts
+    Company Facts returns so the ordinary chains can read them.
+
+    Two conditions. The dimension must be a share class alone — a fact carrying a
+    segment or a geography describes part of a business, and a fact carrying two
+    axes at once describes a corner of it. And the filer must report exactly one
+    class for that concept and period: KKR reports one and it is unarguably KKR's
+    earnings, while Visa reports three and none of them is Visa's without knowing
+    which class the ticker is.
+    """
+    if not dimensioned:
+        return {}
+    out: dict[str, dict] = {}
+    for tag, data in (dimensioned.get("facts", {}).get("us-gaap", {}) or {}).items():
+        for unit, entries in (data.get("units") or {}).items():
+            by_period: dict[tuple, list[dict]] = {}
+            for e in entries:
+                segments = e.get("segments") or ""
+                pairs = [p for p in segments.split(";") if p]
+                if len(pairs) != 1 or pairs[0].split("=", 1)[0] not in _CLASS_AXES:
+                    continue
+                by_period.setdefault((e.get("start"), e.get("end")), []).append(e)
+            keep = [e for group in by_period.values()
+                    if len({g["segments"] for g in group}) == 1
+                    for e in group]
+            if keep:
+                out.setdefault(tag, {"units": {}})["units"][unit] = keep
+    return out
 
 
 def _newest_period_end(facts) -> date:

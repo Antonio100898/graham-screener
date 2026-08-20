@@ -5,6 +5,7 @@
     python -m screener.sync daily                   catch up via the daily index
     python -m screener.sync derive                  recompute snapshots after a code change
     python -m screener.sync export                  write dashboard.json
+    python -m screener.sync dera --from 2021q1      dimensioned + extension facts
     python -m screener.sync status
 
 Raw facts are never re-derived from the network when the engine changes — only
@@ -27,10 +28,11 @@ from pathlib import Path
 import httpx
 
 from . import ch13, pricestats, profiles, store
+from . import normalize
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
                                    evaluate)
-from .sources import indexes
+from .sources import dera, indexes
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError
 from .sources.prices import YahooPriceProvider
 
@@ -91,10 +93,12 @@ def _series_mix(series: dict) -> dict | None:
     return {tag: sorted(years) for tag, years in tags.items()}
 
 
-def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict | None]:
+def _derive(cik: str, ticker: str, facts: dict, quote=None,
+            dimensioned: dict | None = None) -> tuple[str, dict | None]:
     """Snapshot + screen result, flattened for the dashboard."""
     try:
-        snap = build_snapshot(ticker, cik, facts, assume_absent_zero=False)
+        snap = build_snapshot(ticker, cik, facts, assume_absent_zero=False,
+                              dimensioned=dimensioned)
     except UnsupportedFilerError:
         return "foreign", None
     except Exception as exc:  # a malformed filing must not stop a 4,000-company run
@@ -187,6 +191,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None) -> tuple[str, dict |
             ("noncontrolling_interest", _source(snap.noncontrolling_interest)),
             ("shares", _source(snap.shares_outstanding)),
             ("dividend", _source(snap.dividend)),
+            # the newest annual earnings figure: which element stated it, and in
+            # which filing — a restatement changes both
+            ("eps", _source(snap.annual_eps[max(snap.annual_eps)]) if snap.annual_eps else None),
         ) if src is not None},
         # scope-switch disclosure: annual series stitched from more than one tag
         "series_mix": {name: mix for name, mix in (
@@ -285,7 +292,8 @@ def bootstrap(conn, limit: int | None = None, progress=_print_progress) -> None:
             facts = json.loads(fp.read_text())
         except ValueError:
             continue
-        status, data = _derive(cik, ticker or cik, facts)
+        status, data = _derive(cik, ticker or cik, facts,
+                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
         store.upsert_company(conn, cik, ticker, name, facts_synced=True)
         store.put_snapshot(conn, cik, status, data)
         if i % 100 == 0:
@@ -321,7 +329,8 @@ def bulk(conn, limit: int | None = None, progress=_print_progress) -> None:
             except ValueError:
                 continue
             (edgar.cache_dir / f"companyfacts_{cik}.json").write_bytes(z.read(n))
-            status, data = _derive(cik, ticker or cik, facts)
+            status, data = _derive(cik, ticker or cik, facts,
+                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
             store.upsert_company(conn, cik, ticker, name, facts_synced=True)
             store.put_snapshot(conn, cik, status, data)
             if i % 500 == 0:
@@ -381,6 +390,52 @@ def metadata(conn, progress=_print_progress) -> None:
                 progress("reading company metadata", i, len(names))
     conn.commit()
     progress("done", len(names), len(names))
+
+
+def _dera_tags() -> tuple[frozenset[str], frozenset[str]]:
+    """The concepts worth carrying over from the quarterly datasets, and which of
+    them are per-share. Both come from the chains themselves, so the two sources
+    can never drift apart."""
+    per_share = frozenset(
+        normalize.EPS_TAGS + normalize.EPS_BASIC_TAGS + (normalize.EPS_CONTINUING_TAG,)
+        + tuple(tag for tag, unit in normalize.DIVIDEND_TAGS if "USD/shares" in unit)
+    )
+    wanted = frozenset(
+        tuple(per_share)
+        + tuple(normalize._WEIGHTED_SHARE_TAGS)
+        + normalize.NET_INCOME_TAGS + normalize.REVENUE_TAGS
+        + normalize.OPERATING_INCOME_TAGS + normalize.PRETAX_TAGS
+        + tuple(tag for tag, _ in normalize.DIVIDEND_TAGS)
+        + ("Assets", "Liabilities", "AssetsCurrent", "LiabilitiesCurrent",
+           "CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding",
+           "Goodwill", "IntangibleAssetsNetExcludingGoodwill")
+    )
+    return wanted, per_share
+
+
+def dera_sync(conn, start: str | None = None, progress=_print_progress) -> None:
+    """Carry the dimension-qualified and issuer-extension facts that Company
+    Facts cannot express into a sidecar cache beside the raw filings.
+
+    Nothing reads the sidecars yet: this only makes the data local and
+    measurable, which is the whole of step 5a in DIMENSIONS-PLAN.md."""
+    edgar = EdgarClient()
+    cache = edgar.cache_dir
+    ciks = {r["cik"] for r in conn.execute(
+        "SELECT cik FROM company WHERE ticker IS NOT NULL").fetchall()}
+    wanted, per_share = _dera_tags()
+    first = dera.parse_quarter(start) if start else dera.Quarter(date.today().year - 2, 1)
+    quarters = dera.quarters_through(first, dera.latest_published(date.today()))
+    progress(f"{len(quarters)} quarters to read for {len(ciks)} companies")
+    for i, quarter in enumerate(quarters, 1):
+        path = dera.download(quarter, cache, edgar.user_agent)
+        if path is None:
+            progress(f"{quarter} is not published yet", i, len(quarters))
+            continue
+        harvested = dera.harvest(path, ciks, wanted, per_share)
+        written = dera.merge_into_sidecars(harvested, cache, quarter)
+        progress(f"{quarter}: {written} companies", i, len(quarters))
+    progress("done", len(quarters), len(quarters))
 
 
 def listing_age(conn, progress=_print_progress) -> None:
@@ -466,7 +521,8 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
         except EdgarError as exc:
             print(f"  {ticker}: {exc}")
             continue
-        status, data = _derive(cik, ticker or cik, facts)
+        status, data = _derive(cik, ticker or cik, facts,
+                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
         store.upsert_company(conn, cik, ticker, name, facts_synced=True)
         store.put_snapshot(conn, cik, status, data)
         progress("refetching filers", i, len(pending))
@@ -487,7 +543,8 @@ def derive(conn, progress=_print_progress) -> None:
         if not fp.exists():
             continue
         ticker, name = tickers.get(cik, (None, None))
-        status, data = _derive(cik, ticker or cik, json.loads(fp.read_text()))
+        status, data = _derive(cik, ticker or cik, json.loads(fp.read_text()),
+                               dimensioned=dera.load_sidecar(fp.parent, cik))
         store.put_snapshot(conn, cik, status, data)
         if i % 200 == 0:
             conn.commit()
@@ -720,10 +777,11 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
-                                        "derive", "export", "listing-age", "status"])
+                                        "derive", "export", "listing-age", "dera", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
+    ap.add_argument("--from", dest="start", help="first quarter for dera, e.g. 2021q1")
     args = ap.parse_args(argv)
     conn = store.connect()
     if args.command == "bootstrap":
@@ -738,6 +796,8 @@ def main(argv=None) -> int:
         derive(conn)
     elif args.command == "listing-age":
         listing_age(conn)
+    elif args.command == "dera":
+        dera_sync(conn, args.start)
     elif args.command == "export":
         export(conn, not args.no_prices)
     else:

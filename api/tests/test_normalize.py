@@ -1773,13 +1773,13 @@ def test_eps_derived_when_no_per_share_element_exists_kkr_style():
     gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
     gaap["NetIncomeLoss"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 2400e6, accn="k25", filed="2026-02-15")])
-    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
-        inst("2025-12-31", 900e6, form="10-K", accn="k25", filed="2026-02-15"),
-        inst("2026-03-31", 900e6, accn="q126")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 900e6, accn="k25", filed="2026-02-15")])
     s = build(gaap)
     assert round(float(s.annual_eps[2025].value), 4) == round(2400 / 900, 4)
     assert "derived" in s.annual_eps[2025].provenance.concept
-    assert s.annual_eps[2025].provenance.tag == "us-gaap:NetIncomeLoss / us-gaap:CommonStockSharesOutstanding"
+    assert s.annual_eps[2025].provenance.tag == (
+        "us-gaap:NetIncomeLoss / us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding")
 
 
 def test_derived_eps_nets_preferred_dividends_first():
@@ -1788,8 +1788,8 @@ def test_derived_eps_nets_preferred_dividends_first():
         dur("2025-01-01", "2025-12-31", 1000e6, accn="k25", filed="2026-02-15")])
     gaap["DividendsPreferredStock"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
-    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
-        inst("2025-12-31", 100e6, form="10-K", accn="k25", filed="2026-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
     assert float(build(gaap).annual_eps[2025].value) == 9.0  # 900M to common, not 1,000M
 
 
@@ -1800,8 +1800,8 @@ def test_profit_loss_never_derives_eps_for_a_filer_with_minority_interest_ares_s
     gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
     gaap["ProfitLoss"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 465e6, accn="k25", filed="2026-02-15")])
-    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
-        inst("2025-12-31", 180e6, form="10-K", accn="k25", filed="2026-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 180e6, accn="k25", filed="2026-02-15")])
     gaap["StockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 4025e6, accn="q126")])
     gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = \
         tagdata("USD", [inst("2026-03-31", 8602e6, accn="q126")])
@@ -1813,12 +1813,16 @@ def test_profit_loss_never_derives_eps_for_a_filer_with_minority_interest_ares_s
     assert 2025 in build(gaap).annual_eps
 
 
-def test_a_share_count_struck_long_after_the_year_never_derives_it():
+def test_a_year_without_its_own_weighted_average_derives_nothing():
+    """Measured against reported figures, the count on a report cover produced
+    errors of exactly five, ten and a hundred and fifty times: a reverse split
+    leaves a small current count against an old year's income, and a
+    multi-class cover names one class while the income belongs to all."""
     gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
     gaap["NetIncomeLoss"] = tagdata("USD", [
         dur("2021-01-01", "2021-12-31", 1000e6, accn="k21", filed="2022-02-15")])
     gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
-        inst("2026-03-31", 100e6, accn="q126")])  # five years later
+        inst("2026-03-31", 100e6, accn="q126")])
     assert 2021 not in build(gaap).annual_eps
 
 
@@ -1928,3 +1932,69 @@ def test_a_per_share_rate_repeated_across_contexts_is_not_a_years_dividends():
         dur("2025-07-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
     ])
     assert build(gaap).dividend_per_share == Decimal("2.36")
+
+
+# --- Release 5c: dimensioned facts, single-member rule ---
+
+def dimensioned(tag, unit, entries):
+    return {"facts": {"us-gaap": {tag: {"units": {unit: entries}}}}}
+
+
+def classed_entry(start, end, val, segments, accn="k25", form="10-K", filed="2026-02-15"):
+    return {"start": start, "end": end, "val": val, "accn": accn, "form": form,
+            "filed": filed, "fy": 0, "fp": "FY", "segments": segments}
+
+
+def test_a_lone_share_class_is_the_companys_own_figure_kkr_style():
+    """KKR reports earnings per share only under ClassOfStock=CommonStock, so
+    Company Facts returns nothing at all for it."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
+        classed_entry("2025-01-01", "2025-12-31", 2.34, "ClassOfStock=CommonStock;")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=dim)
+    assert float(s.annual_eps[2025].value) == 2.34
+    assert s.annual_eps[2025].provenance.segments == "ClassOfStock=CommonStock;"
+
+
+def test_several_share_classes_leave_the_figure_missing_visa_style():
+    """Visa reports Class A at 3.03, B1 at 4.71 and B2 at 4.61 for one quarter.
+    None of them is Visa's without knowing which class the ticker is, and a
+    wrong class is a wrong multiple on a real company."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
+        classed_entry("2025-01-01", "2025-12-31", 3.03, "ClassOfStock=CommonClassA;"),
+        classed_entry("2025-01-01", "2025-12-31", 4.71, "ClassOfStock=CommonClassB1;"),
+        classed_entry("2025-01-01", "2025-12-31", 4.61, "ClassOfStock=CommonClassB2;")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=dim)
+    assert 2025 not in s.annual_eps
+
+
+def test_a_dimension_that_is_not_a_share_class_is_a_slice_not_the_company():
+    """A segment, a geography or a parent-only view describes part of a
+    business; only the share-class axis names a security a ticker can be."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    for segments in ("ConsolidatedEntities=ParentCompany;",
+                     "BusinessSegments=InsuranceSegment;",
+                     "Geographical=AsiaPacific;",
+                     "ClassOfStock=CommonStock;Geographical=AsiaPacific;"):
+        dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
+            classed_entry("2025-01-01", "2025-12-31", 9.99, segments)])
+        s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=dim)
+        assert 2025 not in s.annual_eps, segments
+
+
+def test_a_consolidated_figure_always_outranks_a_classed_one():
+    dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
+        classed_entry("2025-01-01", "2025-12-31", 99.0, "ClassOfStock=CommonStock;")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(GAAP), dimensioned=dim)
+    assert float(s.annual_eps[2025].value) == 6.0   # the undimensioned fact stands
+
+
+def test_a_classed_share_count_serves_when_every_other_source_is_silent():
+    gaap = {k: v for k, v in GAAP.items() if k != "CommonStockSharesOutstanding"}
+    dim = dimensioned("CommonStockSharesOutstanding", "shares", [
+        {**classed_entry(None, "2026-03-31", 890e6, "ClassOfStock=CommonStock;",
+                         accn="q126", form="10-Q", filed="2026-05-05")}])
+    del dim["facts"]["us-gaap"]["CommonStockSharesOutstanding"]["units"]["shares"][0]["start"]
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=dim)
+    assert float(s.shares_outstanding.value) == 890e6
