@@ -540,7 +540,9 @@ def build_snapshot(
         earnings_quality=_earnings_quality(gaap, ttm_inputs, annual_eps),
         context_notes=_context_notes(gaap, annual_eps, annual_net_income,
                                      _annual_operating_income(gaap),
-                                     annual_revenue, long_term_debt, shares),
+                                     annual_revenue, long_term_debt, shares,
+                                     _common_equity(total_assets, total_liabilities,
+                                                    preferred, nci, temporary_equity)),
         tax_record=_tax_record(gaap, fresh),
         owner_earnings=owner_earnings,
     )
@@ -2083,6 +2085,11 @@ def _unambiguous_dimensioned(dimensioned: dict | None) -> dict:
     return out
 
 
+def _equity_for_scale(gaap: dict, equity: Decimal | None) -> Decimal | None:
+    """Common equity, only as a yardstick for whether an obligation is large."""
+    return equity if equity and equity > 0 else None
+
+
 def _note(kind: str, text: str) -> dict:
     """A disclosure note and what kind of thing it is. The kind is decided where
     the evidence is, not guessed from the prose by whatever displays it."""
@@ -2134,6 +2141,14 @@ def _divergence_note(gaap: dict, tags: tuple[str, ...], annual_revenue: dict[int
             f"{now_ratio * 100:.0f}% of sales against {then_ratio * 100:.0f}% then. {meaning}")
 
 
+def _common_equity(assets, liabilities, preferred, nci, temporary) -> Decimal | None:
+    """What the common shareholders own, for scale only."""
+    if assets is None or liabilities is None:
+        return None
+    other = sum(f.value for f in (preferred, nci, temporary) if f is not None)
+    return assets.value - liabilities.value - other
+
+
 def _newest_period_end(facts) -> date:
     return max((f.provenance.period_end for f in facts if f.provenance.period_end),
                default=date.min)
@@ -2160,7 +2175,8 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
                    annual_ni: dict[int, Fact], annual_op: dict[int, Fact],
                    annual_revenue: dict[int, Fact] | None = None,
                    long_term_debt: Fact | None = None,
-                   shares: Fact | None = None) -> tuple[str, ...]:
+                   shares: Fact | None = None,
+                   fresh_equity: Decimal | None = None) -> tuple[str, ...]:
     """Three standing questions a passing multiple cannot answer by itself.
 
     Disclosure only: nothing here enters a criterion, a grade or an adjustment —
@@ -2192,11 +2208,20 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
                     "what the business collects."
                 ))
 
+    # Share counts must be compared within one filing. A split restates every
+    # earlier year, so a count taken from a pre-split report against one from a
+    # post-split report measures the split and calls it dilution: NVIDIA's
+    # ten-for-one made it look like an 867% issuance when the count had fallen.
+    # A report states three years on one basis, which is basis enough.
     weighted = _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
-    years = sorted(weighted)
-    if len(years) >= 5:
-        latest, base = years[-1], years[-5]
-        old, new = weighted[base].value, weighted[latest].value
+    newest = max((f.provenance.accession for f in weighted.values()), default=None,
+                 key=lambda a: max(f.provenance.filed for f in weighted.values()
+                                   if f.provenance.accession == a))
+    same_filing = {y: f for y, f in weighted.items() if f.provenance.accession == newest}
+    years = sorted(same_filing)
+    if len(years) >= 3:
+        latest, base = years[-1], years[0]
+        old, new = same_filing[base].value, same_filing[latest].value
         if old > 0:
             change = (new / old - 1) * 100
             if change > 10:
@@ -2279,7 +2304,12 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
     leases = _latest_instant(gaap, "OperatingLeaseLiability", LEASE_OBLIGATION_TAGS)
     if leases is not None and leases.value > 0:
         debt = long_term_debt.value if long_term_debt else Decimal(0)
-        if leases.value >= max(debt, Decimal(0)) * Decimal("0.25"):
+        # Large against the debt is only half of it: NVIDIA's lease book is more
+        # than a quarter of its borrowings and 2% of its equity, which tells a
+        # reader nothing. The obligation has to matter to the company too.
+        equity = _equity_for_scale(gaap, fresh_equity)
+        material = equity is None or leases.value >= equity * Decimal("0.10")
+        if material and leases.value >= max(debt, Decimal(0)) * Decimal("0.25"):
             against = (f"against {debt / _MILLION:,.0f}M of long-term debt"
                        if debt else "with no long-term debt reported")
             notes.append(_note(

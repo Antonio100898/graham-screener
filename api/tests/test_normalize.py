@@ -1753,11 +1753,24 @@ def test_context_notes_flag_weak_cash_conversion():
 def test_context_notes_flag_a_rising_share_count():
     gaap = dict(GAAP)
     gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
-        dur(f"{y}-01-01", f"{y}-12-31", shares, accn=f"k{y}", filed=f"{y+1}-02-15")
-        for y, shares in ((2021, 100e6), (2022, 105e6), (2023, 110e6),
-                          (2024, 118e6), (2025, 130e6))])
+        dur(f"{y}-01-01", f"{y}-12-31", shares, accn="k25", filed="2026-02-15")
+        for y, shares in ((2023, 100e6), (2024, 118e6), (2025, 130e6))])
     note = next(n for n in texts(build(gaap)) if "share count grew" in n)
     assert "30%" in note
+
+
+def test_a_stock_split_is_not_dilution():
+    """NVIDIA's ten-for-one restated every earlier year. A count from a
+    pre-split report against one from a post-split report measures the split:
+    it read as an 867% issuance while the count had in fact fallen."""
+    gaap = dict(GAAP)
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2021-01-01", "2021-12-31", 2535e6, accn="k21", filed="2022-02-15"),
+        dur("2023-01-01", "2023-12-31", 24940e6, accn="k25", filed="2026-02-25"),
+        dur("2024-01-01", "2024-12-31", 24804e6, accn="k25", filed="2026-02-25"),
+        dur("2025-01-01", "2025-12-31", 24514e6, accn="k25", filed="2026-02-25"),
+    ])
+    assert not any("share count grew" in n for n in texts(build(gaap)))
 
 
 def test_context_notes_flag_thin_interest_cover():
@@ -2042,10 +2055,20 @@ def test_inventory_in_line_with_sales_says_nothing():
 
 
 def test_lease_obligations_are_disclosed_beside_the_debt_test_that_ignores_them():
+    # GAAP's equity is 1000bn - 400bn = 600bn, so the lease must be large to speak
     gaap = dict(GAAP)
-    gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 8e9, accn="q126")])
+    gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 200e9, accn="q126")])
     note = next(n for n in texts(build(gaap)) if "lease obligations" in n)
-    assert "8,000M" in note and "long-term debt" in note
+    assert "200,000M" in note and "long-term debt" in note
+
+
+def test_a_lease_book_that_is_trivial_to_the_company_says_nothing():
+    """NVIDIA's leases are more than a quarter of its borrowings and 2% of its
+    equity; against a balance sheet that size the obligation tells a reader
+    nothing."""
+    gaap = dict(GAAP)
+    gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 4.3e9, accn="q126")])
+    assert not any("lease obligations" in n for n in texts(build(gaap)))
 
 
 # --- Graham's NVF case: what a filing still has to disclose ---
