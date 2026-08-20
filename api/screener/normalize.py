@@ -539,7 +539,8 @@ def build_snapshot(
         noncontrolling_interest=nci,
         earnings_quality=_earnings_quality(gaap, ttm_inputs, annual_eps),
         context_notes=_context_notes(gaap, annual_eps, annual_net_income,
-                                     _annual_operating_income(gaap)),
+                                     _annual_operating_income(gaap),
+                                     annual_revenue, long_term_debt),
         tax_record=_tax_record(gaap, fresh),
         owner_earnings=owner_earnings,
     )
@@ -1758,6 +1759,16 @@ INTEREST_EXPENSE_TAGS = (
     "InterestExpense", "InterestExpenseDebt", "InterestAndDebtExpense",
     "InterestExpenseNonoperating", "InterestIncomeExpenseNet",
 )
+# Where trouble accumulates quietly. None of these decides a criterion: a
+# receivable growing faster than the sales it came from, inventory the customers
+# did not take, and rent obligations that criterion 3 does not count as debt are
+# all things a reader should see before trusting reported earnings.
+RECEIVABLE_TAGS = ("AccountsReceivableNetCurrent", "ReceivablesNetCurrent",
+                   "AccountsReceivableNet")
+INVENTORY_TAGS = ("InventoryNet",)
+LEASE_OBLIGATION_TAGS = ("OperatingLeaseLiability",)
+_DIVERGENCE = Decimal("1.30")   # this much faster than sales is worth saying
+_DIVERGENCE_SPAN = 3            # years back to compare against
 # The two post-ASU-2016-01 AFS successors and held-to-maturity go END of chain:
 # PFE tags OtherShortTermInvestments as the total and the AFS tag as its
 # footnote fragment. The dead pre-ASU AvailableForSaleSecuritiesCurrent is gone
@@ -2065,6 +2076,51 @@ def _unambiguous_dimensioned(dimensioned: dict | None) -> dict:
     return out
 
 
+def _annual_balances(gaap: dict, tags: tuple[str, ...]) -> dict[int, Fact]:
+    """A balance-sheet line at each fiscal year end, from the annual reports.
+
+    Balance figures appear in every quarterly filing too; only the ones a 10-K
+    states are comparable year to year, which is what a trend needs."""
+    for tag in tags:
+        out: dict[int, Fact] = {}
+        for e in _entries(gaap, tag, ("USD",)):
+            if "start" in e or not e.get("form", "").startswith(ANNUAL_FORMS):
+                continue
+            year = _fy_label(date.fromisoformat(e["end"]))
+            kept = out.get(year)
+            if kept is None or e["filed"] > kept.provenance.filed.isoformat():
+                out[year] = _fact(tag, tag, e)
+        if out:
+            return out
+    return {}
+
+
+def _divergence_note(gaap: dict, tags: tuple[str, ...], annual_revenue: dict[int, Fact],
+                     label: str, meaning: str) -> str | None:
+    """Whether a balance has grown faster than the sales behind it.
+
+    Receivables and inventory are where an income statement and reality part
+    company: revenue booked but not collected, and goods made but not sold, both
+    look like growth until the write-down arrives."""
+    balances = _annual_balances(gaap, tags)
+    years = sorted(set(balances) & set(annual_revenue))
+    if len(years) < _DIVERGENCE_SPAN + 1:
+        return None
+    latest, base = years[-1], years[-1 - _DIVERGENCE_SPAN]
+    if base not in years:
+        return None
+    now_sales, then_sales = annual_revenue[latest].value, annual_revenue[base].value
+    now, then = balances[latest].value, balances[base].value
+    if then <= 0 or then_sales <= 0 or now_sales <= 0:
+        return None
+    now_ratio, then_ratio = now / now_sales, then / then_sales
+    if then_ratio <= 0 or now_ratio / then_ratio < _DIVERGENCE:
+        return None
+    return (f"{label} grew {(now / then - 1) * 100:.0f}% between FY{base} and FY{latest} "
+            f"while sales grew {(now_sales / then_sales - 1) * 100:.0f}%, so it now stands at "
+            f"{now_ratio * 100:.0f}% of sales against {then_ratio * 100:.0f}% then. {meaning}")
+
+
 def _newest_period_end(facts) -> date:
     return max((f.provenance.period_end for f in facts if f.provenance.period_end),
                default=date.min)
@@ -2088,7 +2144,9 @@ def _geographic_pretax(gaap: dict) -> dict[int, Fact]:
 
 
 def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
-                   annual_ni: dict[int, Fact], annual_op: dict[int, Fact]) -> tuple[str, ...]:
+                   annual_ni: dict[int, Fact], annual_op: dict[int, Fact],
+                   annual_revenue: dict[int, Fact] | None = None,
+                   long_term_debt: Fact | None = None) -> tuple[str, ...]:
     """Three standing questions a passing multiple cannot answer by itself.
 
     Disclosure only: nothing here enters a criterion, a grade or an adjustment —
@@ -2153,6 +2211,34 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
                     "Graham's debt test measures the balance sheet; this is what the "
                     "income statement pays for it."
                 )
+
+    revenue = annual_revenue or {}
+    if revenue:
+        for tags, label, meaning in (
+            (RECEIVABLE_TAGS, "Receivables",
+             "Revenue booked and not yet collected is revenue the customer has not "
+             "confirmed with cash."),
+            (INVENTORY_TAGS, "Inventory",
+             "Goods made and not sold sit at cost until they are written down."),
+        ):
+            note = _divergence_note(gaap, tags, revenue, label, meaning)
+            if note:
+                notes.append(note)
+
+    # Rent is not borrowed money under criterion 3, which is Graham's reading and
+    # the engine's policy — but a company can carry more of it than debt, and the
+    # test that ignores it should say how much it is ignoring.
+    leases = _latest_instant(gaap, "OperatingLeaseLiability", LEASE_OBLIGATION_TAGS)
+    if leases is not None and leases.value > 0:
+        debt = long_term_debt.value if long_term_debt else Decimal(0)
+        if leases.value >= max(debt, Decimal(0)) * Decimal("0.25"):
+            against = (f"against {debt / _MILLION:,.0f}M of long-term debt"
+                       if debt else "with no long-term debt reported")
+            notes.append(
+                f"Operating-lease obligations of {leases.value / _MILLION:,.0f}M {against}. "
+                "The debt test counts borrowed money and not rent, which is Graham's "
+                "reading, so this obligation sits outside it."
+            )
     return tuple(notes)
 
 

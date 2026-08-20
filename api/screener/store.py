@@ -15,7 +15,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 53  # earnings provenance in the payload
+ENGINE_VERSION = 54  # receivables and inventory against sales; lease obligations disclosed
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 

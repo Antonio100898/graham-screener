@@ -64,6 +64,7 @@ export default function Detail({ row, onClose }) {
             <Metric label="Working capital" value={money(workingCapital)} />
             <Metric label="Net current assets" value={money(nca)} />
             <Metric label="Long-term debt" value={money(ltd)} />
+            <Metric label="Short-term debt" sub="due within a year" value={money(row.short_term_debt)} />
             <Metric label="Tangible book / share" value={moneyPrice(row.tbvps)} />
             <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} emphasis={row.ncavps != null && row.price != null && row.price <= row.ncavps} />
             <Metric label="Price / NCAV" sub="Graham buys under 0.67×"

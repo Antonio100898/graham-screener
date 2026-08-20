@@ -1998,3 +1998,46 @@ def test_a_classed_share_count_serves_when_every_other_source_is_silent():
     del dim["facts"]["us-gaap"]["CommonStockSharesOutstanding"]["units"]["shares"][0]["start"]
     s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=dim)
     assert float(s.shares_outstanding.value) == 890e6
+
+
+# --- Where trouble accumulates quietly ---
+
+def _years(tag, unit, values, instant=False):
+    out = []
+    for year, value in values.items():
+        if instant:
+            out.append(inst(f"{year}-12-31", value, form="10-K", accn=f"k{year}",
+                            filed=f"{year + 1}-02-15"))
+        else:
+            out.append(dur(f"{year}-01-01", f"{year}-12-31", value, accn=f"k{year}",
+                           filed=f"{year + 1}-02-15"))
+    return tagdata(unit, out)
+
+
+def test_receivables_outrunning_sales_are_stated():
+    """Revenue booked and not collected looks like growth until it is written off."""
+    gaap = dict(GAAP)
+    gaap["Revenues"] = _years("Revenues", "USD", {2022: 1000e6, 2023: 1050e6,
+                                                  2024: 1100e6, 2025: 1150e6})
+    gaap["AccountsReceivableNetCurrent"] = _years(
+        "AccountsReceivableNetCurrent", "USD",
+        {2022: 100e6, 2023: 140e6, 2024: 190e6, 2025: 260e6}, instant=True)
+    note = next(n for n in build(gaap).context_notes if n.startswith("Receivables"))
+    assert "160%" in note and "15%" in note        # receivables +160%, sales +15%
+
+
+def test_inventory_in_line_with_sales_says_nothing():
+    gaap = dict(GAAP)
+    gaap["Revenues"] = _years("Revenues", "USD", {2022: 1000e6, 2023: 1100e6,
+                                                  2024: 1200e6, 2025: 1300e6})
+    gaap["InventoryNet"] = _years("InventoryNet", "USD",
+                                  {2022: 200e6, 2023: 220e6, 2024: 240e6, 2025: 260e6},
+                                  instant=True)
+    assert not any(n.startswith("Inventory") for n in build(gaap).context_notes)
+
+
+def test_lease_obligations_are_disclosed_beside_the_debt_test_that_ignores_them():
+    gaap = dict(GAAP)
+    gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 8e9, accn="q126")])
+    note = next(n for n in build(gaap).context_notes if "lease obligations" in n)
+    assert "8,000M" in note and "long-term debt" in note
