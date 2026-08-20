@@ -540,7 +540,7 @@ def build_snapshot(
         earnings_quality=_earnings_quality(gaap, ttm_inputs, annual_eps),
         context_notes=_context_notes(gaap, annual_eps, annual_net_income,
                                      _annual_operating_income(gaap),
-                                     annual_revenue, long_term_debt),
+                                     annual_revenue, long_term_debt, shares),
         tax_record=_tax_record(gaap, fresh),
         owner_earnings=owner_earnings,
     )
@@ -1765,6 +1765,13 @@ INTEREST_EXPENSE_TAGS = (
 # all things a reader should see before trusting reported earnings.
 RECEIVABLE_TAGS = ("AccountsReceivableNetCurrent", "ReceivablesNetCurrent",
                    "AccountsReceivableNet")
+# NVF bought a company seven times its size with debentures sold at 43 cents on
+# the dollar, and Graham's objection was that neither the interest statement nor
+# the share count told the truth afterwards: the coupon understated the cost of
+# money, and warrants issued as currency diluted holders who could not see them.
+# Both leave a trace a filing still has to make.
+DEBT_DISCOUNT_TAGS = ("AmortizationOfDebtDiscountPremium",)
+WARRANT_SHARE_TAGS = ("ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights",)
 INVENTORY_TAGS = ("InventoryNet",)
 LEASE_OBLIGATION_TAGS = ("OperatingLeaseLiability",)
 _DIVERGENCE = Decimal("1.30")   # this much faster than sales is worth saying
@@ -2146,7 +2153,8 @@ def _geographic_pretax(gaap: dict) -> dict[int, Fact]:
 def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
                    annual_ni: dict[int, Fact], annual_op: dict[int, Fact],
                    annual_revenue: dict[int, Fact] | None = None,
-                   long_term_debt: Fact | None = None) -> tuple[str, ...]:
+                   long_term_debt: Fact | None = None,
+                   shares: Fact | None = None) -> tuple[str, ...]:
     """Three standing questions a passing multiple cannot answer by itself.
 
     Disclosure only: nothing here enters a criterion, a grade or an adjustment —
@@ -2224,6 +2232,38 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
             note = _divergence_note(gaap, tags, revenue, label, meaning)
             if note:
                 notes.append(note)
+
+    # NVF's debentures paid a 5% coupon and were sold at 43% of par, so the
+    # interest statement described a cheaper company than the one that existed.
+    # Where amortised discount is most of the interest bill, the coupon is not
+    # the cost of the money.
+    discount = _annual_union(gaap, DEBT_DISCOUNT_TAGS)
+    shared_interest = sorted(set(discount) & set(interest), reverse=True)[:1]
+    for year in shared_interest:
+        amortised, total = abs(discount[year].value), abs(interest[year].value)
+        if total > 0 and amortised / total >= Decimal("0.25"):
+            notes.append(
+                f"FY{year} interest of {total / _MILLION:,.0f}M includes "
+                f"{amortised / _MILLION:,.0f}M of amortised debt discount, "
+                f"{amortised / total * 100:.0f}% of the bill. Debt sold below face value "
+                "costs more than its coupon says, and the difference arrives as a charge "
+                "rather than a payment."
+            )
+
+    # Graham devotes a whole section to warrants because they are dilution a
+    # share count does not show: NVF paid for Sharon Steel partly in warrants on
+    # its own stock, and every per-share figure afterwards was struck on a
+    # denominator that ignored them.
+    warrants = _latest_instant(gaap, "WarrantShares", WARRANT_SHARE_TAGS, unit=("shares",))
+    if warrants is not None and warrants.value > 0 and shares is not None and shares.value > 0:
+        overhang = warrants.value / shares.value
+        if overhang >= Decimal("0.05"):
+            notes.append(
+                f"Warrants call for {warrants.value / _MILLION:,.1f}M shares against "
+                f"{shares.value / _MILLION:,.1f}M outstanding, {overhang * 100:.0f}% more. "
+                "Every per-share figure here is struck on the count as it stands, not as "
+                "it would stand if the warrants were exercised."
+            )
 
     # Rent is not borrowed money under criterion 3, which is Graham's reading and
     # the engine's policy — but a company can carry more of it than debt, and the

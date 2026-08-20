@@ -167,6 +167,29 @@ def _enterprising(row: dict, profile: str) -> dict:
     return result
 
 
+def acquisition_book_note(row: dict) -> str | None:
+    """Whether the company's book value is anything more than what it paid for
+    other companies.
+
+    NVF ended with a balance sheet whose assets were the accounting of its own
+    takeover — Graham's point was that a book value made of goodwill is a book
+    value that has never been tested by a buyer. When goodwill and intangibles
+    reach the whole of common equity, tangible book is gone."""
+    assets, liabilities = row.get("total_assets"), row.get("total_liabilities")
+    goodwill = row.get("goodwill") or 0
+    intangibles = row.get("intangibles") or 0
+    if assets is None or liabilities is None or goodwill + intangibles <= 0:
+        return None
+    equity = (assets - liabilities - (row.get("preferred_stock") or 0)
+              - (row.get("noncontrolling_interest") or 0) - (row.get("temporary_equity") or 0))
+    if equity <= 0 or goodwill + intangibles < equity:
+        return None
+    return (f"Goodwill and intangibles of {(goodwill + intangibles) / 1e6:,.0f}M stand against "
+            f"{equity / 1e6:,.0f}M of common equity, so tangible book value is gone: what the "
+            "company paid for other businesses is worth more than everything its shareholders "
+            "own. Criterion 7 measures what is left after removing it.")
+
+
 def peer_efficiency_note(row: dict) -> str | None:
     """Penn Central's operating ratio ran at 47.5% against a comparable
     railroad's 35.2%, and Graham's point was that the gap had been visible for
@@ -385,6 +408,8 @@ def enrich(row: dict) -> dict:
     if (note := tax_note(row)) is not None:
         notes.append(note)
     if (note := peer_efficiency_note(row)) is not None:
+        notes.append(note)
+    if (note := acquisition_book_note(row)) is not None:
         notes.append(note)
     return {
         "graham_profile": profile,

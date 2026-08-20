@@ -2041,3 +2041,33 @@ def test_lease_obligations_are_disclosed_beside_the_debt_test_that_ignores_them(
     gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 8e9, accn="q126")])
     note = next(n for n in build(gaap).context_notes if "lease obligations" in n)
     assert "8,000M" in note and "long-term debt" in note
+
+
+# --- Graham's NVF case: what a filing still has to disclose ---
+
+def test_debt_sold_below_face_costs_more_than_its_coupon_says():
+    """NVF's debentures paid 5% and sold at 43% of par. Where amortised discount
+    is most of the interest bill, the coupon is not the cost of the money."""
+    gaap = dict(GAAP)
+    gaap["InterestExpense"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
+    gaap["AmortizationOfDebtDiscountPremium"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 60e6, accn="k25", filed="2026-02-15")])
+    note = next(n for n in build(gaap).context_notes if "amortised debt discount" in n)
+    assert "60%" in note
+
+
+def test_warrants_are_dilution_a_share_count_does_not_show():
+    """NVF paid for Sharon Steel partly in warrants on its own stock."""
+    gaap = dict(GAAP)
+    gaap["ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights"] = tagdata(
+        "shares", [inst("2026-03-31", 2e9, accn="q126")])   # against 10bn outstanding
+    note = next(n for n in build(gaap).context_notes if "Warrants call for" in n)
+    assert "20%" in note
+
+
+def test_a_small_warrant_overhang_says_nothing():
+    gaap = dict(GAAP)
+    gaap["ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights"] = tagdata(
+        "shares", [inst("2026-03-31", 100e6, accn="q126")])   # 1% of the count
+    assert not any("Warrants call for" in n for n in build(gaap).context_notes)

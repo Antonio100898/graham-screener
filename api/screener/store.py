@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -15,9 +16,10 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 54  # receivables and inventory against sales; lease obligations disclosed
+ENGINE_VERSION = 55  # Graham's NVF signals: debt discount, warrant overhang, acquisition-only book value
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
+_WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS company (
@@ -138,6 +140,20 @@ def upsert_company(conn, cik: str, ticker: str | None, name: str | None,
 
 
 def put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
+    """A long recompute runs while the dashboard is being served, and the two
+    share one database. WAL lets them, but a writer can still meet a moment when
+    the file is briefly held; waiting a beat is the whole remedy, and failing the
+    run would mean taking the site down to recompute it."""
+    for attempt in range(_WRITE_ATTEMPTS):
+        try:
+            return _put_snapshot(conn, cik, status, data)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or attempt == _WRITE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
     conn.execute(
         """INSERT INTO snapshot (cik, engine_version, computed_at, status, data)
            VALUES (?, ?, ?, ?, ?)

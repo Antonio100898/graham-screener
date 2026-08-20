@@ -253,3 +253,15 @@ def test_a_margin_in_line_with_peers_says_nothing():
     row = screen_row()
     row["peer_efficiency"] = {"margin": 11.0, "industry_median": 12.5, "peers": 18, "behind": False}
     assert enrich(row)["context_notes"] == []
+
+
+def test_a_book_value_made_entirely_of_acquisitions_is_stated():
+    """NVF's balance sheet was the accounting of its own takeover."""
+    row = screen_row()
+    row.update(total_assets=1000, total_liabilities=700, goodwill=200, intangibles=150)
+    note = enrich(row)["context_notes"][-1]
+    assert "tangible book value is gone" in note
+
+    row.update(goodwill=50, intangibles=50)      # 100 against 300 of equity
+    assert not any("tangible book value is gone" in n
+                   for n in enrich(row)["context_notes"])
