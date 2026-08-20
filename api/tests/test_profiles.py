@@ -222,19 +222,19 @@ def taxed_row(untaxed=4, profitable=9, **over):
 
 
 def test_profits_without_tax_carry_the_penn_central_warning():
-    note = enrich(taxed_row())["context_notes"][-1]
+    note = enrich(taxed_row())["context_notes"][-1]["text"]
     assert "Penn Central" in note and "4 of 9" in note
 
 
 def test_a_pass_through_structure_is_explained_not_accused():
     row = taxed_row()
     row["tax_record"]["pass_through"] = True
-    note = enrich(row)["context_notes"][-1]
+    note = enrich(row)["context_notes"][-1]["text"]
     assert "pass-through" in note and "Penn Central" not in note
 
     # a REIT is a pass-through the facts alone cannot show; its industry does
     reit = taxed_row(industry="Real Estate Investment Trusts")
-    assert "pass-through" in enrich(reit)["context_notes"][-1]
+    assert "pass-through" in enrich(reit)["context_notes"][-1]["text"]
 
 
 def test_an_ordinary_tax_record_says_nothing():
@@ -245,7 +245,7 @@ def test_an_ordinary_tax_record_says_nothing():
 def test_a_margin_far_under_the_industry_median_is_stated():
     row = screen_row()
     row["peer_efficiency"] = {"margin": 4.2, "industry_median": 12.5, "peers": 18, "behind": True}
-    note = enrich(row)["context_notes"][-1]
+    note = enrich(row)["context_notes"][-1]["text"]
     assert "4.2%" in note and "12.5%" in note and "18 companies" in note
 
 
@@ -259,9 +259,9 @@ def test_a_book_value_made_entirely_of_acquisitions_is_stated():
     """NVF's balance sheet was the accounting of its own takeover."""
     row = screen_row()
     row.update(total_assets=1000, total_liabilities=700, goodwill=200, intangibles=150)
-    note = enrich(row)["context_notes"][-1]
+    note = enrich(row)["context_notes"][-1]["text"]
     assert "tangible book value is gone" in note
 
     row.update(goodwill=50, intangibles=50)      # 100 against 300 of equity
     assert not any("tangible book value is gone" in n
-                   for n in enrich(row)["context_notes"])
+                   for n in enrich(row)["context_notes"] for n in [n["text"]])

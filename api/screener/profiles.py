@@ -405,12 +405,11 @@ def enrich(row: dict) -> dict:
     profile = profile_for(row.get("sector"))
     # the tax reading needs the company's industry, which the facts do not carry
     notes = list(row.get("context_notes") or ())
-    if (note := tax_note(row)) is not None:
-        notes.append(note)
-    if (note := peer_efficiency_note(row)) is not None:
-        notes.append(note)
-    if (note := acquisition_book_note(row)) is not None:
-        notes.append(note)
+    for kind, builder in (("Income tax", tax_note),
+                          ("Peer efficiency", peer_efficiency_note),
+                          ("Acquisition-only book", acquisition_book_note)):
+        if (note := builder(row)) is not None:
+            notes.append({"kind": kind, "text": note})
     return {
         "graham_profile": profile,
         "graham_profile_meta": PROFILE_META[profile],

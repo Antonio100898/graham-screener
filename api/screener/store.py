@@ -16,7 +16,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 55  # Graham's NVF signals: debt discount, warrant overhang, acquisition-only book value
+ENGINE_VERSION = 56  # disclosure notes carry what kind of thing they are
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read

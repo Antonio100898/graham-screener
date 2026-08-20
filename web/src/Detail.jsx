@@ -96,7 +96,7 @@ export default function Detail({ row, onClose }) {
 
         <OwnerEarnings oe={row.owner_earnings} />
         <Notes title="What the multiples do not say"
-               subtitle="Cash conversion, dilution and interest cover — context, never part of a grade"
+               subtitle="Cash conversion, dilution, interest cover, leases, receivables and inventory against sales, untaxed profits, peer efficiency, warrants and debt discount — context, never part of a grade"
                notes={row.context_notes} />
         <Notes title="What the trailing earnings are made of"
                subtitle="Non-recurring lines large enough to decide criterion 1 on their own"
@@ -218,7 +218,12 @@ function Notes({ title, subtitle, notes }) {
     <section className="criteria-section notes-section">
       <div className="criteria-title"><div><h3>{title}</h3><p>{subtitle}</p></div></div>
       <ul className="disclosure-notes">
-        {notes.map((note, i) => <li key={i}>{note}</li>)}
+        {notes.map((note, i) => (
+          <li key={i}>
+            {note.kind && <b className="note-kind">{note.kind}</b>}
+            {note.text ?? note}
+          </li>
+        ))}
       </ul>
     </section>
   );

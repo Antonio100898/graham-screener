@@ -2083,6 +2083,12 @@ def _unambiguous_dimensioned(dimensioned: dict | None) -> dict:
     return out
 
 
+def _note(kind: str, text: str) -> dict:
+    """A disclosure note and what kind of thing it is. The kind is decided where
+    the evidence is, not guessed from the prose by whatever displays it."""
+    return {"kind": kind, "text": text}
+
+
 def _annual_balances(gaap: dict, tags: tuple[str, ...]) -> dict[int, Fact]:
     """A balance-sheet line at each fiscal year end, from the annual reports.
 
@@ -2171,20 +2177,20 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
         if income > 0:
             ratio = cash / income
             if ratio < Decimal("0.8"):
-                notes.append(
+                notes.append(_note("Cash conversion",
                     f"Over FY{min(shared)}–FY{max(shared)} the business turned "
                     f"{ratio * 100:.0f}% of reported net income into operating cash "
                     f"({cash / _MILLION:,.0f}M against {income / _MILLION:,.0f}M). "
                     "Earnings that do not arrive as cash still count in every "
                     "multiple on this page."
-                )
+                ))
             elif ratio > Decimal("1.5"):
-                notes.append(
+                notes.append(_note("Cash conversion",
                     f"Operating cash flow over FY{min(shared)}–FY{max(shared)} is "
                     f"{ratio * 100:.0f}% of reported net income — depreciation-heavy "
                     "or working-capital-driven, so the earnings multiple understates "
                     "what the business collects."
-                )
+                ))
 
     weighted = _annual_union(gaap, _WEIGHTED_SHARE_TAGS)
     years = sorted(weighted)
@@ -2194,17 +2200,17 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
         if old > 0:
             change = (new / old - 1) * 100
             if change > 10:
-                notes.append(
+                notes.append(_note("Dilution",
                     f"The share count grew {change:.0f}% between FY{base} and FY{latest} "
                     f"({old / _MILLION:,.1f}M to {new / _MILLION:,.1f}M shares). Per-share "
                     "figures are divided by a denominator that keeps rising."
-                )
+                ))
             elif change < -10:
-                notes.append(
+                notes.append(_note("Buybacks",
                     f"The share count fell {abs(change):.0f}% between FY{base} and FY{latest} "
                     f"({old / _MILLION:,.1f}M to {new / _MILLION:,.1f}M shares) — buybacks "
                     "are lifting per-share figures independently of the business."
-                )
+                ))
 
     interest = _annual_union(gaap, INTEREST_EXPENSE_TAGS)
     shared_op = sorted(set(interest) & set(annual_op), reverse=True)[:1]
@@ -2213,12 +2219,12 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
         if cost > 0 and profit > 0:
             cover = profit / cost
             if cover < 3:
-                notes.append(
+                notes.append(_note("Interest cover",
                     f"FY{year} operating profit covers interest {cover:.1f}x "
                     f"({profit / _MILLION:,.0f}M against {cost / _MILLION:,.0f}M of interest). "
                     "Graham's debt test measures the balance sheet; this is what the "
                     "income statement pays for it."
-                )
+                ))
 
     revenue = annual_revenue or {}
     if revenue:
@@ -2231,7 +2237,7 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
         ):
             note = _divergence_note(gaap, tags, revenue, label, meaning)
             if note:
-                notes.append(note)
+                notes.append(_note(label, note))
 
     # NVF's debentures paid a 5% coupon and were sold at 43% of par, so the
     # interest statement described a cheaper company than the one that existed.
@@ -2242,13 +2248,14 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
     for year in shared_interest:
         amortised, total = abs(discount[year].value), abs(interest[year].value)
         if total > 0 and amortised / total >= Decimal("0.25"):
-            notes.append(
+            notes.append(_note(
+                "Debt discount",
                 f"FY{year} interest of {total / _MILLION:,.0f}M includes "
                 f"{amortised / _MILLION:,.0f}M of amortised debt discount, "
                 f"{amortised / total * 100:.0f}% of the bill. Debt sold below face value "
                 "costs more than its coupon says, and the difference arrives as a charge "
                 "rather than a payment."
-            )
+            ))
 
     # Graham devotes a whole section to warrants because they are dilution a
     # share count does not show: NVF paid for Sharon Steel partly in warrants on
@@ -2258,12 +2265,13 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
     if warrants is not None and warrants.value > 0 and shares is not None and shares.value > 0:
         overhang = warrants.value / shares.value
         if overhang >= Decimal("0.05"):
-            notes.append(
+            notes.append(_note(
+                "Warrant overhang",
                 f"Warrants call for {warrants.value / _MILLION:,.1f}M shares against "
                 f"{shares.value / _MILLION:,.1f}M outstanding, {overhang * 100:.0f}% more. "
                 "Every per-share figure here is struck on the count as it stands, not as "
                 "it would stand if the warrants were exercised."
-            )
+            ))
 
     # Rent is not borrowed money under criterion 3, which is Graham's reading and
     # the engine's policy — but a company can carry more of it than debt, and the
@@ -2274,11 +2282,12 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
         if leases.value >= max(debt, Decimal(0)) * Decimal("0.25"):
             against = (f"against {debt / _MILLION:,.0f}M of long-term debt"
                        if debt else "with no long-term debt reported")
-            notes.append(
+            notes.append(_note(
+                "Lease obligations",
                 f"Operating-lease obligations of {leases.value / _MILLION:,.0f}M {against}. "
                 "The debt test counts borrowed money and not rent, which is Graham's "
                 "reading, so this obligation sits outside it."
-            )
+            ))
     return tuple(notes)
 
 

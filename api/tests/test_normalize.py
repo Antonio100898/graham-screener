@@ -54,6 +54,11 @@ GAAP = {
 }
 
 
+def texts(snapshot):
+    """Disclosure notes carry their kind now; the wording is what tests read."""
+    return [n["text"] for n in snapshot.context_notes]
+
+
 def build(gaap=GAAP):
     return build_snapshot("TEST", "0000000001", facts_doc(gaap))
 
@@ -1741,7 +1746,7 @@ def test_context_notes_flag_weak_cash_conversion():
     gaap["NetCashProvidedByUsedInOperatingActivities"] = tagdata("USD", [
         dur(f"{y}-01-01", f"{y}-12-31", 400e6, accn=f"k{y}", filed=f"{y+1}-02-15")
         for y in (2023, 2024, 2025)])
-    note = next(n for n in build(gaap).context_notes if "operating cash" in n)
+    note = next(n for n in texts(build(gaap)) if "operating cash" in n)
     assert "40%" in note
 
 
@@ -1751,7 +1756,7 @@ def test_context_notes_flag_a_rising_share_count():
         dur(f"{y}-01-01", f"{y}-12-31", shares, accn=f"k{y}", filed=f"{y+1}-02-15")
         for y, shares in ((2021, 100e6), (2022, 105e6), (2023, 110e6),
                           (2024, 118e6), (2025, 130e6))])
-    note = next(n for n in build(gaap).context_notes if "share count grew" in n)
+    note = next(n for n in texts(build(gaap)) if "share count grew" in n)
     assert "30%" in note
 
 
@@ -1761,7 +1766,7 @@ def test_context_notes_flag_thin_interest_cover():
         dur("2025-01-01", "2025-12-31", 200e6, accn="k25", filed="2026-02-15")])
     gaap["InterestExpense"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
-    note = next(n for n in build(gaap).context_notes if "covers interest" in n)
+    note = next(n for n in texts(build(gaap)) if "covers interest" in n)
     assert "2.0x" in note
 
 
@@ -2022,7 +2027,7 @@ def test_receivables_outrunning_sales_are_stated():
     gaap["AccountsReceivableNetCurrent"] = _years(
         "AccountsReceivableNetCurrent", "USD",
         {2022: 100e6, 2023: 140e6, 2024: 190e6, 2025: 260e6}, instant=True)
-    note = next(n for n in build(gaap).context_notes if n.startswith("Receivables"))
+    note = next(n for n in texts(build(gaap)) if n.startswith("Receivables"))
     assert "160%" in note and "15%" in note        # receivables +160%, sales +15%
 
 
@@ -2033,13 +2038,13 @@ def test_inventory_in_line_with_sales_says_nothing():
     gaap["InventoryNet"] = _years("InventoryNet", "USD",
                                   {2022: 200e6, 2023: 220e6, 2024: 240e6, 2025: 260e6},
                                   instant=True)
-    assert not any(n.startswith("Inventory") for n in build(gaap).context_notes)
+    assert not any(n.startswith("Inventory") for n in texts(build(gaap)))
 
 
 def test_lease_obligations_are_disclosed_beside_the_debt_test_that_ignores_them():
     gaap = dict(GAAP)
     gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 8e9, accn="q126")])
-    note = next(n for n in build(gaap).context_notes if "lease obligations" in n)
+    note = next(n for n in texts(build(gaap)) if "lease obligations" in n)
     assert "8,000M" in note and "long-term debt" in note
 
 
@@ -2053,7 +2058,7 @@ def test_debt_sold_below_face_costs_more_than_its_coupon_says():
         dur("2025-01-01", "2025-12-31", 100e6, accn="k25", filed="2026-02-15")])
     gaap["AmortizationOfDebtDiscountPremium"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 60e6, accn="k25", filed="2026-02-15")])
-    note = next(n for n in build(gaap).context_notes if "amortised debt discount" in n)
+    note = next(n for n in texts(build(gaap)) if "amortised debt discount" in n)
     assert "60%" in note
 
 
@@ -2062,7 +2067,7 @@ def test_warrants_are_dilution_a_share_count_does_not_show():
     gaap = dict(GAAP)
     gaap["ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights"] = tagdata(
         "shares", [inst("2026-03-31", 2e9, accn="q126")])   # against 10bn outstanding
-    note = next(n for n in build(gaap).context_notes if "Warrants call for" in n)
+    note = next(n for n in texts(build(gaap)) if "Warrants call for" in n)
     assert "20%" in note
 
 
@@ -2070,4 +2075,4 @@ def test_a_small_warrant_overhang_says_nothing():
     gaap = dict(GAAP)
     gaap["ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights"] = tagdata(
         "shares", [inst("2026-03-31", 100e6, accn="q126")])   # 1% of the count
-    assert not any("Warrants call for" in n for n in build(gaap).context_notes)
+    assert not any("Warrants call for" in n for n in texts(build(gaap)))

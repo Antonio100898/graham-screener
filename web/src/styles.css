@@ -486,3 +486,7 @@ table.grid { font-size: 14px; }
 .provenance-section .accn { display: block; color: var(--dim); font-size: 9.5px; letter-spacing: 0.02em; }
 .provenance-section .component-row td { padding-top: 2px; padding-bottom: 2px; opacity: 0.82; }
 .provenance-section .component-mark { color: var(--dim); font-size: 10px; }
+
+/* Disclosure notes: what kind of thing each note is (release 4d) */
+.disclosure-notes .note-kind { display: block; color: var(--ink); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 1px; }
