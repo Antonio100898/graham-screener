@@ -59,6 +59,16 @@ _SHARES_UNSCALED = re.compile(r"shares?\s+in\s+(thousands|millions|billions)", r
 # Shareholders" contains the word "share" and is money; scaling it as a share count
 # left Markel's $2.1bn of profit reading as $2,107,010.
 _A_COUNT_OF_SHARES = re.compile(r"\bshares?\b(?!\s*holder)", re.I)
+# A per-share figure is already in dollars and takes no scale at all. Coca-Cola's
+# statement is headed "$ in Millions" and prints diluted earnings of 3.04; scaling
+# that as money makes it $3,040,000 a share.
+# "(in dollars per share)", "(in shares)" — the renderer's note of the unit, not
+# part of what the line is called. JPM heads its earnings "Diluted earnings per
+# share (in dollars per share)" and Apple heads the same line just "Diluted".
+_UNIT_SUFFIX = re.compile(r"\s*\((?:in\s+)?(?:dollars|usd|shares|dollars per share)"
+                          r"(?:\s+per\s+share)?\)\s*$", re.I)
+_IN_SHARES = re.compile(r"\(\s*in\s+shares\s*\)", re.I)
+_PER_SHARE = re.compile(r"\bper\s+(?:basic\s+|diluted\s+|common\s+)?(?:share|unit)", re.I)
 # The sign comes from the parentheses and from nothing else. A label is not
 # evidence: Intellicheck heads its line "Net loss" and prints "$ 1,273" beside a
 # prior year of "$ (918)" — a stale caption over a real profit, which the page's own
@@ -200,7 +210,8 @@ def lines(document: str) -> list[tuple[str, list[Decimal]]]:
         label = cells[0].rstrip(" :")
         if not label or _CELL.match(label):
             continue
-        about_shares = bool(_A_COUNT_OF_SHARES.search(label))
+        per_share = bool(_PER_SHARE.search(label))
+        about_shares = bool(_A_COUNT_OF_SHARES.search(label)) and not per_share
         values = []
         for cell in cells[1:]:
             m = _CELL.match(cell)
@@ -212,11 +223,31 @@ def lines(document: str) -> list[tuple[str, list[Decimal]]]:
                 continue
             if "(" in cell:
                 value = -value
-            unit = share_factor if (about_shares and "$" not in cell) else factor
+            unit = (Decimal(1) if per_share else
+                    share_factor if (about_shares and "$" not in cell) else factor)
             values.append(value * unit)
         if values:
             out.append((label, values))
-    return out
+    # Rows that state fewer figures than the table has columns cannot be indexed by
+    # column: Sarepta's balance sheet heads three dates and prints two values per
+    # line, so the first value belongs to a column the reader cannot identify. Such
+    # rows are dropped rather than misread.
+    widest = max((len(v) for _, v in out), default=0)
+    return [(label, values) for label, values in out
+            if len(values) == widest or widest == 0]
+
+
+def _label_key(label: str) -> str:
+    """A printed label reduced to what it calls the line.
+
+    Footnote markers and the renderer's note of the unit fall away: JPMorgan heads
+    its earnings "Diluted earnings per share (in dollars per share)" and Apple heads
+    the same line just "Diluted". Written once, because the two matchers below had
+    a copy each and one of them drifted.
+    """
+    clean = re.sub(r"\s+", " ", label.lower()).strip(" .:")
+    clean = re.sub(r"\s*\[\d+\]$", "", clean)
+    return _UNIT_SUFFIX.sub("", clean).strip()
 
 
 def value_for(statement_lines, *phrases: str, column: int = 0) -> tuple[str, Decimal] | None:
@@ -231,8 +262,7 @@ def value_for(statement_lines, *phrases: str, column: int = 0) -> tuple[str, Dec
         target = phrase.lower().rstrip("*")
         prefix = phrase.endswith("*")
         for label, values in statement_lines:
-            clean = re.sub(r"\s+", " ", label.lower()).strip(" .:")
-            clean = re.sub(r"\s*\[\d+\]$", "", clean)          # footnote markers
+            clean = _label_key(label)
             if clean == target or (prefix and clean.startswith(target)
                                    and not _NOT_THE_PARENT.search(clean)):
                 if column < len(values):
@@ -240,7 +270,9 @@ def value_for(statement_lines, *phrases: str, column: int = 0) -> tuple[str, Dec
     return None
 
 
-def all_matching(statement_lines, *phrases: str, column: int = 0) -> list[tuple[str, Decimal]]:
+def all_matching(statement_lines, *phrases: str, column: int = 0,
+                 only_the_parent: bool = True,
+                 money_only: bool = False) -> list[tuple[str, Decimal]]:
     """Every line whose label matches one of these phrases, in printed order.
 
     Where one phrase means two different figures depending on the filer, a single
@@ -260,10 +292,14 @@ def all_matching(statement_lines, *phrases: str, column: int = 0) -> list[tuple[
         suffix, prefix = phrase.startswith("*"), phrase.endswith("*")
         target = phrase.lower().strip("*")
         for label, values in statement_lines:
-            clean = re.sub(r"\s+", " ", label.lower()).strip(" .:")
-            clean = re.sub(r"\s*\[\d+\]$", "", clean)
-            if _NOT_THE_PARENT.search(clean) and "common" not in clean:
+            clean = _label_key(label)
+            if only_the_parent and _NOT_THE_PARENT.search(clean) and "common" not in clean:
                 continue                        # the minority holders' own line
+            # "Diluted (in shares)" and "Diluted (in dollars per share)" are the same
+            # word once the unit suffix falls away, and one of them is a count of
+            # shares. Where a per-share figure is wanted, the count is not it.
+            if money_only and _IN_SHARES.search(label):
+                continue
             hit = (clean.endswith(target) if suffix else
                    clean.startswith(target) if prefix else clean == target)
             if hit and column < len(values):

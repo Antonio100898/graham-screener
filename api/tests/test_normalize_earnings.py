@@ -903,3 +903,38 @@ def test_a_real_sales_tax_leaves_the_pair_whole_and_the_chain_decides():
     }
     from screener.normalize import _annual_revenue
     assert float(_annual_revenue(gaap)[2025].value) == 100e6   # excluding the tax
+
+
+def test_a_retail_year_is_labelled_the_way_its_own_filer_labels_it():
+    """A year ending 2026-02-01 is fiscal 2025 to SEC's frame and 2026 to the month
+    it ends in. The earnings reader used the first and the balance-sheet reader the
+    second, so GameStop, Kohl's and Macy's printed the same date against two years
+    and paired one year's balance sheet with another year's earnings."""
+    end, prior = "2026-01-31", "2025-02-01"
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-02-02", end, 3.0, accn="k25"),
+            dur("2024-02-04", prior, 2.0, accn="k24")]),
+        "Assets": tagdata("USD", [
+            inst(end, 5e9, form="10-K", accn="k25"),
+            inst(prior, 4e9, form="10-K", accn="k24")]),
+        "AssetsCurrent": tagdata("USD", [
+            inst(end, 2e9, form="10-K", accn="k25"),
+            inst(prior, 1.8e9, form="10-K", accn="k24")]),
+    }
+    from screener.normalize import fiscal_year_ends
+    ends = fiscal_year_ends(gaap)
+    assert ends[2025] == end and ends[2024] == prior
+    # ...and one date is claimed by one year only, never by two
+    assert len(set(ends.values())) == len(ends)
+
+
+def test_the_balance_sheet_follows_the_earnings_labelling():
+    """The whole table has to agree on which year a date is, or a column pairs a
+    balance sheet with the wrong year's profit."""
+    from screener.normalize import _annual_balances
+    gaap = {"Assets": tagdata("USD", [inst("2026-02-01", 5e9, form="10-K", accn="k25")])}
+    naive = _annual_balances(gaap, ("Assets",))
+    assert 2026 in naive                                    # by the month it ends in
+    aligned = _annual_balances(gaap, ("Assets",), labels={"2026-02-01": 2025})
+    assert 2025 in aligned and 2026 not in aligned          # by the filer's own frame

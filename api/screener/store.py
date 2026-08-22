@@ -16,7 +16,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 83  # Class A and Class B differ by a letter, and the matcher was dropping it
+ENGINE_VERSION = 85  # one date belongs to one fiscal year
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read

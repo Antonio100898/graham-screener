@@ -228,6 +228,13 @@ PRINTED = (
     ("current_assets", ("total current assets",), None),
     ("current_liabilities", ("total current liabilities",), None),
     ("total_liabilities", ("total liabilities",), ("total assets", "total equity")),
+    ("goodwill", ("goodwill", "goodwill, net"), None),
+    ("intangibles", ("intangible assets, net", "other intangible assets, net",
+                     "intangible assets", "other intangibles, net",
+                     "intangibles, net", "other assets, intangible, net"), None),
+    ("noncontrolling_interest", ("noncontrolling interests", "noncontrolling interest",
+                                 "total noncontrolling interests",
+                                 "redeemable noncontrolling interests"), None),
 )
 # Every "total ..." form before any bare one. An income statement often opens with
 # a bare "Revenues:" as the heading of the section that follows, and a heading row
@@ -278,8 +285,36 @@ PRINTED_INCOME = (
                     "net loss attributable to common shareholders",
                     "net income", "net income (loss)", "net earnings", "net loss",
                     "consolidated net income")),
+    # the printed per-share line: the only part of the earnings chain a statement
+    # can confirm, since the trailing figure is stitched from quarters
+    ("eps", ("diluted net income per share", "diluted earnings per share",
+             "diluted net income (loss) per share", "diluted net loss per share",
+             "net income per share diluted", "earnings per share diluted",
+             "diluted income (loss) per share", "net income (loss) per share diluted",
+             # Berkshire states one per-share line and names the shareholders in it
+             "net earnings per share attributable to*", "net income per share attributable to*",
+             "earnings per share attributable to*", "net earnings per share",
+             "net income per share", "earnings per share",
+             # Apple names the line simply "Diluted", under a unit suffix the
+             # renderer adds; the bare word is only reached after every fuller form
+             "diluted")),
+    ("operating_income", ("total operating income", "operating income",
+                          "operating income (loss)", "income from operations",
+                          "operating profit", "operating income (expense)")),
 )
 FILING_TOLERANCE = 0.01     # the printed figure is rounded to the header's scale
+
+
+def _the_finite_part_only(facts: dict, sources: dict, printed_values: list) -> bool:
+    """Whether the printed intangibles line is the filer's own finite-lived figure."""
+    source = sources.get("intangibles") or {}
+    if "IntangibleAssetsNetExcludingGoodwill" not in (source.get("tag") or ""):
+        return False
+    finite = _at_period_end(facts, "us-gaap:FiniteLivedIntangibleAssetsNet", source.get("end"))
+    if finite is None:
+        return False
+    return any(abs(finite - v) <= FILING_TOLERANCE * max(abs(finite), abs(v), 1e-9)
+               for v in printed_values)
 
 
 def _only_the_scale_differs(shown: float, printed: float) -> bool:
@@ -333,7 +368,7 @@ def _read_statement(row: dict, edgar, kind: str):
     return printed, matching or [0], headings, None
 
 
-def against_filing(row: dict, edgar) -> list[tuple]:
+def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     """Compare the displayed balance-sheet figures against the published statement.
 
     The only check here that does not share an ancestor with what it is checking:
@@ -349,6 +384,7 @@ def against_filing(row: dict, edgar) -> list[tuple]:
         return [("FILING?", "balance_sheet", None, None, why)]
 
     out = []
+    facts = facts or {}
     ratio = _ratio(row)
     sources = row.get("sources") or {}
     for field, phrases, identity in PRINTED:
@@ -391,15 +427,26 @@ def against_filing(row: dict, edgar) -> list[tuple]:
                  <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)]
         if agree:
             out.append(("FILING-OK", field, shown, agree[0], note))
-        elif " - " in ((sources.get(field) or {}).get("tag") or ""):
-            # A derived figure is not the line the statement prints. Total
-            # liabilities from assets-minus-equity necessarily contains the
-            # mezzanine a balance sheet shows between the two — Crawford Capital's
-            # $176.5M of shares subject to redemption sits there, and its printed
-            # "Total liabilities" of $3.5M excludes it by design. Two quantities,
-            # not two answers.
+        elif field == "intangibles" and _the_finite_part_only(facts, sources, scaled):
+            # `IntangibleAssetsNetExcludingGoodwill` is finite-lived plus
+            # indefinite-lived; a balance sheet often prints only the first under a
+            # caption that reads like the whole. Apple's $25.4bn against a printed
+            # $20.3bn is the $5.1bn of indefinite-lived assets, and tangible book
+            # deducts both. Confirmed against the filer's own finite-lived tag
+            # rather than assumed from the size of the gap.
             out.append(("FILING?", field, shown, scaled[0],
-                        "derived by identity; the printed line is a narrower figure"))
+                        "the total of finite and indefinite intangibles; the printed "
+                        "line states the finite part"))
+        elif any(op in ((sources.get(field) or {}).get("tag") or "") for op in (" - ", " + ")):
+            # An assembled figure is not the line the statement prints. Total
+            # liabilities from assets-minus-equity necessarily contains the mezzanine
+            # a balance sheet shows between the two — Crawford Capital's $176.5M of
+            # shares subject to redemption sits there. And a summed one is wider than
+            # any single caption: Nephros' intangibles are $302,000 of finite-lived
+            # assets plus a $148,000 licence, and only the first is printed under
+            # "Intangible assets, net" though tangible book must deduct both.
+            out.append(("FILING?", field, shown, scaled[0],
+                        "assembled from components; the printed line is one of them"))
         elif any(_only_the_scale_differs(shown, v) for v in scaled):
             out.append(("FILING?", field, shown, scaled[0],
                         "the same figure under the scale the statement's header "
@@ -431,77 +478,67 @@ def _by_subtraction(printed, column: int, shown: float) -> bool:
     return False
 
 
-def against_income(row: dict, edgar) -> list[tuple]:
-    """The latest fiscal year's sales and profit, against the annual report's own
-    income statement. The balance-sheet check cannot reach either: they are flows,
-    and the panel's ratio table divides one by the other."""
+def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
+    """Every year the annual report prints, against the series the panel shows.
+
+    A statement of operations carries two or three fiscal years side by side and the
+    panel holds a series for each of revenue, profit, operating profit and earnings
+    per share. Each printed column is checked against its own year rather than only
+    the newest: three times the evidence for one request, and it reaches the history
+    the ratio table is built from.
+
+    Earnings per share needed this most. It is a printed line, and the trailing
+    figure the P/E divides by is stitched from quarters and matches no line
+    anywhere — the annual series is the only part of that chain a statement can
+    confirm at all.
+    """
     source = (row.get("sources") or {}).get("eps") or {}
-    end = source.get("end")
-    if not end or not (source.get("form") or "").startswith("10-K"):
-        return []                       # only an annual report prints an annual column
-    year = str(int(end[:4]))
-    revenue = (row.get("annual_revenue") or {}).get(year)
-    income = (row.get("annual_net_income") or {}).get(year)
-    if revenue is None and income is None:
-        return []
+    if not (source.get("form") or "").startswith("10-K"):
+        return []                       # only an annual report prints annual columns
     try:
-        printed, wanted_columns, _, why = _read_statement(row, edgar, "income")
+        printed, _, headings, why = _read_statement(row, edgar, "income")
     except Exception:
         return []
     if printed is None:
-        return [("FILING?", f"FY{year}", None, None, why)]
+        return [("FILING?", "income", None, None, why)]
 
+    facts = facts or {}
+    series = {
+        "revenue": row.get("annual_revenue") or {},
+        "net_income": row.get("annual_net_income") or {},
+        "eps": row.get("annual_eps") or {},
+        "operating_income": row.get("annual_operating_income") or {},
+    }
+    concepts = row.get("sources") or {}
     out = []
-    for field, phrases in PRINTED_INCOME:
-        shown = revenue if field == "revenue" else income
-        if shown is None:
-            continue
-        # Net income is corroborated against every line the statement prints for it,
-        # because one phrase means different figures at different filers and no
-        # ordering satisfies them all. Revenue has no such ambiguity and keeps the
-        # single best match, which is the stricter test.
-        if field in ("net_income", "revenue"):
-            options = [hit for col in wanted_columns
-                       for hit in statements.all_matching(printed, *phrases, column=col)]
-
-            def agrees(label: str, printed_value: float) -> bool:
-                if abs(shown - printed_value) <= FILING_TOLERANCE * max(
-                        abs(shown), abs(printed_value), 1e-9):
-                    return True
-                # A line captioned a loss and printed without parentheses states the
-                # magnitude and leaves the sign to the caption — Paramount Gold's
-                # "Net Loss 9,050,423" against a filed -$9,050,423. The page carries
-                # the figure; only its presentation of the sign is ambiguous, and
-                # Intellicheck proves the caption alone cannot settle it.
-                return ("loss" in label.lower() and shown < 0
-                        and abs(abs(shown) - abs(printed_value))
-                        <= FILING_TOLERANCE * max(abs(shown), abs(printed_value), 1e-9))
-
-            if any(agrees(label, float(v)) for label, v in options):
+    # Which fiscal year each printed column IS, from the dates the panel already
+    # carries. Guessing it from the heading fails for the retail convention — a year
+    # ending 2026-02-01 is fiscal 2025 at Lululemon and Gap and Dollar General — and
+    # SEC's own frame, which the engine honours, is the authority rather than the
+    # month. Fifteen companies read as wrong for this alone.
+    by_end = {v["end"]: y for y, v in (row.get("annual_ratios") or {}).items()
+              if isinstance(v, dict) and v.get("end")}
+    for column, heading in enumerate(headings):
+        year = by_end.get(heading.isoformat())
+        if year is None:
+            continue                    # a column the panel holds no year for
+        for field, phrases in PRINTED_INCOME:
+            shown = series[field].get(year)
+            if shown is None:
+                continue
+            # the parent-attribution guard is about whose profit a line states and
+            # says nothing useful about a per-share figure, which it would exclude
+            # outright for containing the words "per share"
+            options = statements.all_matching(printed, *phrases, column=column,
+                                              only_the_parent=(field != "eps"),
+                                              money_only=(field == "eps"))
+            if any(_agrees(shown, float(v), label) for label, v in options):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
                 continue
-            # Some statements print no parent line at all and leave the reader to do
-            # the subtraction: Delek states $43.3M of consolidated income and $66.1M
-            # attributed to minority holders, and the company's own share is the
-            # -$22.8M in between. Both directions are tried because filers differ on
-            # whether the minority line is printed as a positive to be deducted or as
-            # a negative already signed.
-            if field == "net_income" and any(_by_subtraction(printed, col, shown)
-                                             for col in wanted_columns):
+            if field == "net_income" and _by_subtraction(printed, column, shown):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
                 continue
-            # A figure whose concept the page never prints is not a mismatch. Both
-            # Occidental and Rhinebeck tag only income available to the common —
-            # after preferred dividends and after earnings allocated to participating
-            # securities — while their statements print the consolidated line and the
-            # attributable one, and neither equals it. The provenance names the
-            # concept, so the difference can be stated rather than scored.
-            concept = ((row.get("sources") or {}).get(field) or {}).get("tag", "")
-            # Contract revenue against a total that says "and other income" in its
-            # own caption: BKV's page totals $1,008.8M by adding $105.1M of
-            # derivative gains to $893.8M of sales to customers, and a derivative
-            # gain is not a sale. Phillips 66 prints both and the sales line matched;
-            # BKV prints only the total, so the concepts are named instead.
+            concept = (concepts.get(field) or {}).get("tag", "")
             if (field == "revenue" and "RevenueFromContractWithCustomer" in concept
                     and options and all("other" in label.lower() for label, _ in options)):
                 out.append(("FILING?", f"FY{year} {field}", shown, None,
@@ -513,21 +550,106 @@ def against_income(row: dict, edgar) -> list[tuple]:
                             "tagged as income available to the common, which the "
                             "statement does not print"))
                 continue
-            if options:
-                label, value = options[0]
-                out.append(("FILING", f"FY{year} {field}", shown, float(value),
-                            f"no printed line matches; nearest is {label!r}"))
+            if not options:
+                out.append(("FILING?", f"FY{year} {field}", shown, None, "no matching line"))
                 continue
-        hit = statements.value_for(printed, *phrases, column=wanted_columns[0])
-        if hit is None:
-            out.append(("FILING?", f"FY{year} {field}", shown, None, "no matching line"))
-            continue
-        expected = float(hit[1])
-        kind = ("FILING" if abs(shown - expected)
-                > FILING_TOLERANCE * max(abs(shown), abs(expected), 1e-9) else "FILING-OK")
-        out.append((kind, f"FY{year} {field}", shown, expected,
-                    f"printed as {hit[0]!r}" if kind == "FILING" else None))
+            label, value = options[0]
+            if _only_the_scale_differs(shown, float(value)):
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            "the same figure under the scale the statement declares"))
+                continue
+            if field == "eps" and _split_since(facts, heading, shown, float(value)):
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            "split-adjusted; this filing predates the split"))
+                continue
+            if any(_only_the_scale_differs(shown, float(v)) for _, v in options):
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            "the same figure under the scale the statement declares"))
+                continue
+            if _restated_since(facts, field, heading, shown):
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            "restated after this filing, which prints the original"))
+                continue
+            out.append(("FILING", f"FY{year} {field}", shown, float(value),
+                        f"no printed line matches; nearest is {label!r}"))
     return out
+
+
+# What each series is tagged as, for asking whether a later filing revised it.
+_CONCEPT_TAGS = {
+    "revenue": ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"),
+    "net_income": ("NetIncomeLoss", "ProfitLoss",
+                   "NetIncomeLossAvailableToCommonStockholdersBasic"),
+    "eps": ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted",
+            "IncomeLossFromContinuingOperationsPerDilutedShare"),
+    "operating_income": ("OperatingIncomeLoss",),
+}
+
+
+def _split_since(facts: dict, heading, shown: float, printed: float) -> bool:
+    """Whether the gap is a share split the panel has applied and the filing has not.
+
+    Mueller Industries' 10-K prints $6.86 of diluted earnings for 2025 and the panel
+    shows $3.43, because the company split two for one afterwards and every
+    per-share figure was restated onto the new count. The evidence is the share
+    count itself: for one period end the February filing states 111,179,750 and the
+    July filing 222,359,500.
+    """
+    if not shown or not printed:
+        return False
+    factor = printed / shown
+    if not 1.5 <= abs(factor) <= 1000:
+        return False
+    # A split restates the whole series, so the evidence is looked for at any period
+    # end the filer reports twice — not only at this column's. Mueller's doubled
+    # count stands against 2025-12-27 and the panel adjusts 2023 and 2024 with it.
+    by_end: dict[str, set] = {}
+    for tag in ("CommonStockSharesOutstanding",
+                "WeightedAverageNumberOfDilutedSharesOutstanding"):
+        for units in (facts.get("facts", {}).get("us-gaap", {}).get(tag) or {}).get("units", {}).values():
+            for e in units:
+                value = float(e.get("val") or 0)
+                if value > 0 and e.get("end"):
+                    by_end.setdefault(e["end"], set()).add(value)
+    return any(abs(big / small - factor) <= 0.02 * factor
+               for counts in by_end.values()
+               for small in counts for big in counts if small)
+
+
+def _restated_since(facts: dict, field: str, heading, shown: float) -> bool:
+    """Whether the panel's figure is a later filing's revision of this one.
+
+    An annual report prints the year as it stood when it was written. Berkshire
+    restated 2016 revenue from $223.6bn to $215.1bn in its 2019 report, and
+    Trans-American revised one year three times; the panel carries the latest, which
+    is the restatement rule working exactly as intended. Reading an older statement
+    then shows a real difference that is not a disagreement.
+
+    Confirmed rather than assumed: the figure on the panel has to actually appear in
+    a LATER filing for the same period.
+    """
+    end = heading.isoformat()
+    for tag in _CONCEPT_TAGS.get(field, ()):
+        for units in (facts.get("facts", {}).get("us-gaap", {}).get(tag) or {}).get("units", {}).values():
+            for e in units:
+                if e.get("end") != end or "start" not in e:
+                    continue
+                value = float(e["val"])
+                if abs(shown - value) <= FILING_TOLERANCE * max(abs(shown), abs(value), 1e-9):
+                    return True
+    return False
+
+
+def _agrees(shown: float, printed_value: float, label: str) -> bool:
+    """Whether the shown figure is the printed one, allowing for a loss stated as a
+    magnitude under a caption that carries the sign."""
+    if abs(shown - printed_value) <= FILING_TOLERANCE * max(
+            abs(shown), abs(printed_value), 1e-9):
+        return True
+    return ("loss" in label.lower() and shown < 0
+            and abs(abs(shown) - abs(printed_value))
+            <= FILING_TOLERANCE * max(abs(shown), abs(printed_value), 1e-9))
 
 
 def _one_moment(row: dict, facts: dict) -> list[tuple]:
@@ -644,7 +766,8 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
             lines.append(("ONE-DATE", name, parent, None,
                           "a newer value exists: " + ", ".join(stale)))
         if edgar is not None:
-            for line in against_filing(row, edgar) + against_income(row, edgar):
+            for line in (against_filing(row, edgar, facts)
+                         + against_income(row, edgar, facts)):
                 bucket = {"FILING": "filing_bad", "FILING-OK": "filing_ok"}.get(
                     line[0], "filing_unknown")
                 totals[bucket] += 1

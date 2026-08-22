@@ -1596,17 +1596,29 @@ def fiscal_year_ends(gaap: dict) -> dict[int, str]:
     so the date has always already happened.
     """
     ends: dict[int, str] = {}
-    sources = [_annual_balances(gaap, tags) for tags in
-               (("Assets", "LiabilitiesAndStockholdersEquity"),
-                ("StockholdersEquity",), ("AssetsCurrent",))]
-    # A year whose balance sheet is untagged still closed on a date, and its own
-    # income statement carries it. Without this the year would drop out of the
-    # series entirely, which is worse than reading its end from the earnings side.
-    sources.append(_annual_eps(gaap))
+    # The earnings series first, because it labels fiscal years from SEC's own frame
+    # and the balance-sheet reader labels them from the month the period ends in.
+    # Those disagree under the retail convention: Lululemon's year ending 2025-02-02
+    # is fiscal 2024 to the frame and 2025 to the month, so the ratio table paired
+    # one year's balance sheet with another year's earnings and printed the same date
+    # against two different years.
+    sources = [_annual_eps(gaap)]
+    sources += [_annual_balances(gaap, tags) for tags in
+                (("Assets", "LiabilitiesAndStockholdersEquity"),
+                 ("StockholdersEquity",), ("AssetsCurrent",))]
+    claimed: set[str] = set()
     for series in sources:
         for year, f in series.items():
-            if year not in ends and f.provenance.period_end is not None:
-                ends[year] = f.provenance.period_end.isoformat()
+            end = f.provenance.period_end
+            if end is None or year in ends or end.isoformat() in claimed:
+                continue
+            # one date belongs to one fiscal year. The balance-sheet reader labels
+            # by the month a period ends in and the earnings reader by SEC's frame,
+            # so under the retail convention the same date arrives twice under two
+            # names: Lululemon's 2026-02-01 came in as fiscal 2025 and again as
+            # 2026, and the ratio table grew a duplicate column of zeroes.
+            ends[year] = end.isoformat()
+            claimed.add(end.isoformat())
     return ends
 
 
@@ -3195,22 +3207,27 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
     multiple needs the price of that year, which lives in the price history at
     export time, not in the filings.
     """
-    ca = _annual_balances(gaap, ("AssetsCurrent",))
-    cl = _annual_balances(gaap, ("LiabilitiesCurrent",))
-    assets = _annual_balances(gaap, ("Assets", "LiabilitiesAndStockholdersEquity"))
-    liabilities = _annual_balances(gaap, ("Liabilities",))
-    minority = _annual_balances(gaap, ("MinorityInterest",))
-    parent_equity = _annual_balances(gaap, ("StockholdersEquity",))
-    group_equity = _annual_balances(
-        gaap, ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",))
-    preferred = _annual_balances(gaap, ("PreferredStockLiquidationPreferenceValue",
-                                        "PreferredStockValue", "PreferredStockValueOutstanding"))
-    goodwill = _annual_balances(gaap, ("Goodwill",))
-    intangibles = _annual_balances(gaap, ("IntangibleAssetsNetExcludingGoodwill",))
-    counts = _annual_share_counts(gaap, {})
-    options = _annual_balances(gaap, OPTION_COUNT_TAGS, unit=("shares",))
-    rsus = _annual_balances(gaap, RSU_COUNT_TAGS, unit=("shares",))
+    # one reading of which year each date belongs to, for the balance sheets and the
+    # earnings alike; see `_annual_balances`
     ends = fiscal_year_ends(gaap)
+    labels = {end: year for year, end in ends.items()}
+    ca = _annual_balances(gaap, ("AssetsCurrent",), labels=labels)
+    cl = _annual_balances(gaap, ("LiabilitiesCurrent",), labels=labels)
+    assets = _annual_balances(gaap, ("Assets", "LiabilitiesAndStockholdersEquity"), labels=labels)
+    liabilities = _annual_balances(gaap, ("Liabilities",), labels=labels)
+    minority = _annual_balances(gaap, ("MinorityInterest",), labels=labels)
+    parent_equity = _annual_balances(gaap, ("StockholdersEquity",), labels=labels)
+    group_equity = _annual_balances(
+        gaap, ("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",),
+        labels=labels)
+    preferred = _annual_balances(gaap, ("PreferredStockLiquidationPreferenceValue",
+                                        "PreferredStockValue", "PreferredStockValueOutstanding"),
+                                 labels=labels)
+    goodwill = _annual_balances(gaap, ("Goodwill",), labels=labels)
+    intangibles = _annual_balances(gaap, ("IntangibleAssetsNetExcludingGoodwill",), labels=labels)
+    counts = _annual_share_counts(gaap, {})
+    options = _annual_balances(gaap, OPTION_COUNT_TAGS, unit=("shares",), labels=labels)
+    rsus = _annual_balances(gaap, RSU_COUNT_TAGS, unit=("shares",), labels=labels)
 
     def at(series, year):
         f = series.get(year)
@@ -3268,17 +3285,27 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
 
 
 def _annual_balances(gaap: dict, tags: tuple[str, ...],
-                     unit: tuple[str, ...] = ("USD",)) -> dict[int, Fact]:
+                     unit: tuple[str, ...] = ("USD",),
+                     labels: dict[str, int] | None = None) -> dict[int, Fact]:
     """A balance-sheet line at each fiscal year end, from the annual reports.
 
     Balance figures appear in every quarterly filing too; only the ones a 10-K
-    states are comparable year to year, which is what a trend needs."""
+    states are comparable year to year, which is what a trend needs.
+
+    `labels` is the earnings series' own reading of which fiscal year each date
+    belongs to, and it wins where it has an opinion. The two disagree under the
+    retail convention — the year ending 2025-02-02 is fiscal 2024 to SEC's frame and
+    2025 to the month it ends in — and a table that labels its balance sheets one
+    way and its earnings the other pairs the wrong two together. GameStop and Kohl's
+    had every retail year off by one, printing the same date against two years.
+    """
+    labels = labels or {}
     for tag in tags:
         out: dict[int, Fact] = {}
         for e in _entries(gaap, tag, unit):
             if "start" in e or not e.get("form", "").startswith(ANNUAL_FORMS):
                 continue
-            year = _fy_label(date.fromisoformat(e["end"]))
+            year = labels.get(e["end"]) or _fy_label(date.fromisoformat(e["end"]))
             kept = out.get(year)
             if kept is None or e["filed"] > kept.provenance.filed.isoformat():
                 out[year] = _fact(tag, tag, e)
