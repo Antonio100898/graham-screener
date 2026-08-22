@@ -458,6 +458,18 @@ def against_income(row: dict, edgar) -> list[tuple]:
                                              for col in wanted_columns):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
                 continue
+            # A figure whose concept the page never prints is not a mismatch. Both
+            # Occidental and Rhinebeck tag only income available to the common —
+            # after preferred dividends and after earnings allocated to participating
+            # securities — while their statements print the consolidated line and the
+            # attributable one, and neither equals it. The provenance names the
+            # concept, so the difference can be stated rather than scored.
+            concept = ((row.get("sources") or {}).get(field) or {}).get("tag", "")
+            if field == "net_income" and "AvailableToCommon" in concept:
+                out.append(("FILING?", f"FY{year} {field}", shown, None,
+                            "tagged as income available to the common, which the "
+                            "statement does not print"))
+                continue
             if options:
                 label, value = options[0]
                 out.append(("FILING", f"FY{year} {field}", shown, float(value),
