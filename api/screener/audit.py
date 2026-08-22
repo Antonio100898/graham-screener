@@ -465,6 +465,17 @@ def against_income(row: dict, edgar) -> list[tuple]:
             # attributable one, and neither equals it. The provenance names the
             # concept, so the difference can be stated rather than scored.
             concept = ((row.get("sources") or {}).get(field) or {}).get("tag", "")
+            # Contract revenue against a total that says "and other income" in its
+            # own caption: BKV's page totals $1,008.8M by adding $105.1M of
+            # derivative gains to $893.8M of sales to customers, and a derivative
+            # gain is not a sale. Phillips 66 prints both and the sales line matched;
+            # BKV prints only the total, so the concepts are named instead.
+            if (field == "revenue" and "RevenueFromContractWithCustomer" in concept
+                    and options and all("other" in label.lower() for label, _ in options)):
+                out.append(("FILING?", f"FY{year} {field}", shown, None,
+                            "tagged as revenue from contracts with customers; the "
+                            "statement totals only to a line that adds other income"))
+                continue
             if field == "net_income" and "AvailableToCommon" in concept:
                 out.append(("FILING?", f"FY{year} {field}", shown, None,
                             "tagged as income available to the common, which the "

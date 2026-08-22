@@ -2789,3 +2789,33 @@ def test_interest_income_still_stands_where_there_is_no_net_line():
     }
     from screener.normalize import _annual_revenue
     assert float(_annual_revenue(gaap)[2025].value) == 500e6
+
+
+def test_the_series_rule_ranks_meaning_above_depth():
+    """Written three times with the three keys in three different orders, two of them
+    wrong. Recency first, so an abandoned element cannot answer for today; then what
+    the element MEANS; then how much of it there is. Starwood files sixteen years of
+    the group's profit beside fourteen of its own, and ranking depth second let two
+    extra years swap one concept for the other."""
+    from screener.normalize import _best_series
+    parent = {y: y for y in range(2012, 2026)}          # 14 years, preferred concept
+    group = {y: y for y in range(2010, 2026)}           # 16 years, wrong concept
+    order = {"NetIncomeLoss": 0, "ProfitLoss": 2}
+    tag, _ = _best_series([("NetIncomeLoss", parent), ("ProfitLoss", group)], order)
+    assert tag == "NetIncomeLoss"
+
+    # ...but a dead series of the right concept still yields to a live one
+    stopped = {y: y for y in range(2012, 2024)}
+    tag, _ = _best_series([("NetIncomeLoss", stopped), ("ProfitLoss", group)], order)
+    assert tag == "ProfitLoss"
+
+
+def test_a_preferred_concept_outranks_the_tag_order_itself():
+    """§5.3 prefers continuing operations, which is a statement about scope rather
+    than about which element a filer happens to use."""
+    from screener.normalize import _best_series
+    a = {y: y for y in range(2012, 2026)}
+    b = {y: y for y in range(2012, 2026)}
+    tag, _ = _best_series([("first", a), ("second", b)], {"first": 0, "second": 1},
+                          prefer=lambda t: t == "second")
+    assert tag == "second"

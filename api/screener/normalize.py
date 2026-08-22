@@ -1195,7 +1195,10 @@ def _annual_eps(gaap: dict) -> dict[int, Fact]:
     # Filers switch EPS tags mid-history (FCX moved to continuing-ops-only in 2022),
     # so recency dominates: a long-dead series must never beat a current one.
     # At equal currency, §5.3 prefers continuing operations; then deeper history.
-    best = max(candidates, key=lambda s: (max(s), s is continuing, len(s)))
+    named = [(f"tag{i}", series) for i, series in enumerate(candidates)]
+    continuing_key = next((k for k, series in named if series is continuing), None)
+    _, best = _best_series(named, {k: 0 for k, _ in named},
+                           prefer=lambda tag: tag == continuing_key)
     # reconciled after the gaps are filled — a year that enters the series from a
     # second tag needs checking too, and Eastern's fiscal 2020 is exactly that —
     # and before the split adjustment, since the check compares filed figures
@@ -1257,6 +1260,30 @@ def _fill_missing_years(series: dict[int, Fact], gaap: dict) -> dict[int, Fact]:
     return dict(sorted(series.items()))
 
 
+def _best_series(candidates: list[tuple[str, dict]], order: dict[str, int],
+                 prefer=lambda tag: False) -> tuple[str, dict]:
+    """Which of several elements is THE series for a concept.
+
+    One rule, in one place, because it was written three times with the three keys
+    in three different orders and two of them were wrong. It ranks:
+
+      1. recency — a series that stopped years ago cannot answer for today, whatever
+         it is called. This is what lets a filer abandon an element mid-history.
+      2. meaning — what the element IS. These chains are ordered by scope, and
+         `ProfitLoss` is the whole group's profit where `NetIncomeLoss` is the
+         parent's; `Revenues` is a total where a contract element is part of one.
+      3. depth — only then. Starwood files sixteen years of the group's profit
+         beside fourteen of its own, and ranking depth second handed two extra years
+         of history the power to swap one concept for the other, so every margin and
+         per-share figure divided profit the shareholders do not own.
+
+    `prefer` marks a tag that outranks the tag order itself — §5.3's preference for
+    continuing operations, which is a statement about scope rather than about which
+    element a filer happens to use.
+    """
+    return max(candidates, key=lambda c: (max(c[1]), prefer(c[0]), -order[c[0]], len(c[1])))
+
+
 def _annual_dollar_series(gaap: dict, tags: tuple[str, ...]) -> dict[int, Fact]:
     """Filers switch elements mid-history the same way they switch EPS elements —
     Advanced Energy's NetIncomeLoss series stops in 2024 while ProfitLoss runs on.
@@ -1280,7 +1307,7 @@ def _annual_dollar_series(gaap: dict, tags: tuple[str, ...]) -> dict[int, Fact]:
     if not candidates:
         return {}
     order = {tag: i for i, tag in enumerate(tags)}
-    _, best = max(candidates, key=lambda c: (max(c[1]), -order[c[0]], len(c[1])))
+    _, best = _best_series(candidates, order)
     for _, other in candidates:                      # fill gaps the winner lacks
         for fy, fact in other.items():
             best.setdefault(fy, fact)
@@ -1388,6 +1415,13 @@ def _annual_revenue(gaap: dict) -> dict[int, Fact]:
     pool = [(t, s) for t, s in candidates if max(s) >= latest_fy - 1]
     peak = max((float(s[max(s)].value) for _, s in pool if s[max(s)].value > 0), default=0)
     strong = [(t, s) for t, s in pool if float(s[max(s)].value) >= peak / 2] or pool
+    # NOT `_best_series`: revenue ranks depth above tag order, and alone among the
+    # three chains it is right to. REVENUE_TAGS is not ordered by scope but by
+    # generality — the sector top lines a bank, a REIT or a utility needs come after
+    # the generic elements, so preferring an earlier tag prefers a generic scrap over
+    # the line that is actually the company's revenue. Duke Energy's own statement
+    # totals to the $32,237M this ordering finds; ranking by tag order gave $31,741M.
+    # The scope guard here is `peak / 2` above, not the order.
     tag0, s0 = max(strong, key=lambda c: (max(c[1]), len(c[1]), -order[c[0]]))
     tag0, s0 = _wider_top_line(strong, tag0, s0)
     start = max(s0)
