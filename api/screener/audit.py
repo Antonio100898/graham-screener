@@ -335,6 +335,26 @@ def _only_the_scale_differs(shown: float, printed: float) -> bool:
                for power in (1e3, 1e6, 1e9))
 
 
+def _absent_concept(tagged: dict, provenance_tag: str | None) -> bool:
+    """Whether a plain concept the panel names is simply not on this statement."""
+    if not provenance_tag or any(op in provenance_tag for op in (" - ", " + ")):
+        return False                    # assembled figures have no single concept
+    return provenance_tag.replace(":", "_") not in tagged
+
+
+def _by_element(tagged: dict, provenance_tag: str | None, columns: list) -> list:
+    """The printed values for the exact concept the panel's provenance names."""
+    if not provenance_tag or not tagged:
+        return []
+    out = []
+    for part in re.split(r" [-+] ", provenance_tag):
+        key = part.strip().replace(":", "_")
+        values = tagged.get(key)
+        if values:
+            out += [(key, values[col]) for col in columns if col < len(values)]
+    return out
+
+
 def _read_statement(row: dict, edgar, kind: str):
     """The published statement's rows and the column the panel's date belongs to.
 
@@ -346,26 +366,27 @@ def _read_statement(row: dict, edgar, kind: str):
                                             else "eps") or {}
     accn, end = source.get("accn"), source.get("end")
     if not accn:
-        return None, None, None, "no provenance for the statement"
+        return (None, {}), None, None, "no provenance for the statement"
     bare, cik = accn.replace("-", ""), int(row["cik"])
     summary = edgar._get_text(statements.SUMMARY_URL.format(cik=cik, accn=bare))
     file = statements.find(summary, kind)
     if not file:
         # closed-end funds publish a statement of assets and liabilities, not a
         # balance sheet; nothing is wrong, there is simply nothing to compare
-        return None, None, None, f"no {kind} rendered in {accn}"
+        return (None, {}), None, None, f"no {kind} rendered in {accn}"
     document = edgar._get_text(statements.REPORT_URL.format(cik=cik, accn=bare, file=file))
     printed, headings = statements.lines(document), statements.columns(document)
+    tagged = statements.elements(document)
     if not printed:
-        return None, None, None, f"{file} held no numbered rows"
+        return (None, {}), None, None, f"{file} held no numbered rows"
     wanted = date.fromisoformat(end) if end else None
     # A rendered table can carry the same period twice — Great Wall's runs
     # 2025, 2024, 2025, 2024, two blocks side by side — and the figure may sit in
     # either. Every column bearing the date is a candidate.
     matching = [i for i, heading in enumerate(headings) if heading == wanted]
     if headings and wanted and not matching:
-        return None, None, None, f"{end} is not among the printed columns {headings}"
-    return printed, matching or [0], headings, None
+        return (None, {}), None, None, f"{end} is not among the printed columns {headings}"
+    return (printed, tagged), matching or [0], headings, None
 
 
 def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
@@ -377,7 +398,8 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     asks whether the number on the page is the number on the panel.
     """
     try:
-        printed, wanted_columns, headings, why = _read_statement(row, edgar, "balance_sheet")
+        (printed, tagged), wanted_columns, headings, why = _read_statement(
+            row, edgar, "balance_sheet")
     except Exception as exc:
         return [("FILING?", "balance_sheet", None, None, f"could not read: {exc!r}"[:110])]
     if printed is None:
@@ -411,8 +433,24 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
         # Liabilities" as a zeroed section line and again as the real total — so the
         # question is whether the panel's figure is one of the values printed under
         # that caption, not whether it is the first of them.
-        options = [hit for col in here
-                   for hit in statements.all_matching(printed, *phrases, column=col)]
+        # The concept the panel names, looked up as the concept the statement tagged.
+        # Labels were only ever a proxy for this: Apple prints its NON-CURRENT
+        # intangibles under a caption reading like the whole, and Hercules its GROSS
+        # ones, and no reading of the words separates those from a disagreement.
+        exact = _by_element(tagged, (sources.get(field) or {}).get("tag"), here)
+        if not exact and tagged and _absent_concept(tagged, (sources.get(field) or {}).get("tag")):
+            # The statement does not state this concept at all, and a caption that
+            # reads like it is a different figure: Apple prints
+            # `aapl_...NoncurrentIntangibleAssets` under "Intangible assets, net" and
+            # Hercules prints `FiniteLivedIntangibleAssetsGross` under "Intangible
+            # assets". Falling back to the words is what turned those into
+            # disagreements.
+            out.append(("FILING?", field, shown, None,
+                        "the statement tags no such concept; its nearest caption is "
+                        "a different one"))
+            continue
+        options = exact or [hit for col in here
+                            for hit in statements.all_matching(printed, *phrases, column=col)]
         scaled = [float(v) / (ratio if field == "shares" else 1) for _, v in options]
         note = f"printed as {options[0][0]!r}" if options else None
         if not scaled and identity:
@@ -505,7 +543,7 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     if not (source.get("form") or "").startswith("10-K"):
         return []                       # only an annual report prints annual columns
     try:
-        printed, _, headings, why = _read_statement(row, edgar, "income")
+        (printed, tagged), _, headings, why = _read_statement(row, edgar, "income")
     except Exception:
         return []
     if printed is None:
@@ -538,9 +576,10 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
             # the parent-attribution guard is about whose profit a line states and
             # says nothing useful about a per-share figure, which it would exclude
             # outright for containing the words "per share"
-            options = statements.all_matching(printed, *phrases, column=column,
-                                              only_the_parent=(field != "eps"),
-                                              money_only=(field == "eps"))
+            exact = _by_element(tagged, (concepts.get(field) or {}).get("tag"), [column])
+            options = exact or statements.all_matching(
+                printed, *phrases, column=column,
+                only_the_parent=(field != "eps"), money_only=(field == "eps"))
             if any(_agrees(shown, float(v), label) for label, v in options):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
                 continue

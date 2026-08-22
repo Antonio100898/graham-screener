@@ -305,3 +305,59 @@ def all_matching(statement_lines, *phrases: str, column: int = 0,
             if hit and column < len(values):
                 out.append((label, values[column]))
     return out
+
+
+# Every rendered row carries the concept it was tagged with, in the link that opens
+# its definition: `defref_us-gaap_Assets`, `defref_aapl_IntangibleAssets...`.
+_ELEMENT = re.compile(r"defref_([A-Za-z0-9-]+_[A-Za-z0-9]+)")
+
+
+def elements(document: str) -> dict[str, list[Decimal]]:
+    """The statement keyed by the concept each line was tagged with, not its label.
+
+    This is the exact question and the labels were only ever a proxy for it. Apple
+    prints "Intangible assets, net" against
+    `aapl_IntangibleAssetsNetExcludingGoodwillNoncurrent` — its own extension for the
+    non-current portion — while the panel carries
+    `us-gaap_IntangibleAssetsNetExcludingGoodwill`, the total of $25,417M that its
+    own note reconciles as $20,342M non-current plus $5,075M current. Two elements,
+    two correct figures, and no amount of reading the caption could have told them
+    apart. Hercules Capital's "Intangible assets" is
+    `FiniteLivedIntangibleAssetsGross`, gross of amortisation, against a net figure
+    on the panel.
+
+    Where a filer tags one concept on several rows the widest is kept, since a
+    statement states a total once and its parts around it.
+    """
+    factor = scale(document)
+    share_word = _SHARES_UNSCALED.search(_readable_head(document))
+    share_factor = _UNITS.get(share_word.group(1).lower() if share_word else "", Decimal(1))
+    out: dict[str, list[Decimal]] = {}
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", document, re.S | re.I):
+        found = _ELEMENT.search(row)
+        if not found:
+            continue
+        cells = [c for c in _cells(row) if c]
+        if len(cells) < 2:
+            continue
+        label = cells[0].rstrip(" :")
+        per_share = bool(_PER_SHARE.search(label)) or "PerShare" in found.group(1)
+        about_shares = (bool(_A_COUNT_OF_SHARES.search(label))
+                        or "SharesOutstanding" in found.group(1)) and not per_share
+        values = []
+        for cell in cells[1:]:
+            m = _CELL.match(cell)
+            if not m:
+                continue
+            try:
+                value = Decimal(m.group(1).replace(",", ""))
+            except InvalidOperation:
+                continue
+            if "(" in cell:
+                value = -value
+            unit = (Decimal(1) if per_share else
+                    share_factor if (about_shares and "$" not in cell) else factor)
+            values.append(value * unit)
+        if values and len(values) > len(out.get(found.group(1), ())):
+            out[found.group(1)] = values
+    return out
