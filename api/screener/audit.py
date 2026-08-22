@@ -142,10 +142,10 @@ def _values_in_filing(facts: dict, ns: str, tag: str, source: dict) -> list[floa
 ROUNDING = 0.005
 
 
-def _close(a, b) -> bool:
+def _close(a, b, slack: float = 0.0) -> bool:
     if a is None or b is None:
         return a is b
-    return abs(a - b) <= max(ROUNDING, TOLERANCE * max(abs(a), abs(b), 1e-9))
+    return abs(a - b) <= max(ROUNDING, slack, TOLERANCE * max(abs(a), abs(b), 1e-9))
 
 
 def _identities(row: dict) -> list[tuple]:
@@ -383,7 +383,15 @@ def _read_statement(row: dict, edgar, kind: str):
     # The rows are the authority on how many columns there are.
     width = max((len(v) for _, v in printed), default=0)
     if width and len(headings) > width:
-        headings = headings[-width:]
+        # A rendered header can repeat its dates across several rows, or carry one
+        # from a subtitle: Nektar's balance sheet heads five for two columns and
+        # Great Elm's income statement four for three. A statement prints its periods
+        # newest first, so the columns are the first run of that many in descending
+        # order — taking the first or the last few gets one of the two wrong.
+        headings = next(
+            (headings[i:i + width] for i in range(len(headings) - width + 1)
+             if all(headings[j] > headings[j + 1] for j in range(i, i + width - 1))),
+            headings[:width])
     if not printed:
         return (None, {}), None, None, f"{file} held no numbered rows"
     wanted = date.fromisoformat(end) if end else None
@@ -851,6 +859,19 @@ def _one_moment(row: dict, facts: dict) -> list[tuple]:
     return out
 
 
+def _rounding_slack(numerator: float, denominator: float) -> float:
+    """How far a ratio can move because its denominator was stored rounded.
+
+    The engine divides an exact book value; the payload keeps it to four decimals.
+    That is nothing for a $25 share and everything for a sub-penny one: Transportation
+    and Logistics Systems' book value stores as $0.0016, which is $0.0016 give or take
+    3%, and the ratio built on it inherits that.
+    """
+    if not denominator:
+        return 0.0
+    return abs(numerator / denominator) * (0.00005 / abs(denominator))
+
+
 def _derived_series(row: dict) -> list[tuple]:
     """The ratio table and the chapter-13 statistics, against their own inputs.
 
@@ -862,9 +883,9 @@ def _derived_series(row: dict) -> list[tuple]:
     """
     out = []
 
-    def check(name, shown, expected, formula):
+    def check(name, shown, expected, formula, slack=0.0):
         if shown is not None and expected is not None:
-            out.append((name, shown, expected, formula))
+            out.append((name, shown, expected, formula, slack))
 
     eps = {int(y): v for y, v in (row.get("annual_eps") or {}).items()}
     stats = row.get("ch13") or {}
@@ -899,11 +920,13 @@ def _derived_series(row: dict) -> list[tuple]:
         price, book = cell.get("price"), cell.get("bvps")
         if price and book:
             check(f"annual_ratios.{year}.pb", cell.get("pb"), round(price / book, 2),
-                  "that year's price over that year's book value per share")
+                  "that year's price over that year's book value per share",
+                  _rounding_slack(price, book))
         tangible = cell.get("tbvps")
         if price and tangible and tangible > 0:
             check(f"annual_ratios.{year}.ptbv", cell.get("ptbv"), round(price / tangible, 2),
-                  "that year's price over its tangible book value per share")
+                  "that year's price over its tangible book value per share",
+                  _rounding_slack(price, tangible))
         revenue = (row.get("annual_revenue") or {}).get(year)
         income = (row.get("annual_net_income") or {}).get(year)
         if revenue and income is not None:
@@ -977,8 +1000,8 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 totals["sourced_bad"] += 1
                 lines.append(("SOURCED", field, shown, filed,
                               f"{source['tag']} {source['end']} {source['accn']}"))
-        for name, shown, expected, formula in _identities(row) + _derived_series(row):
-            if _close(shown, expected):
+        for name, shown, expected, formula, *slack in _identities(row) + _derived_series(row):
+            if _close(shown, expected, slack[0] if slack else 0.0):
                 totals["derived_ok"] += 1
             else:
                 totals["derived_bad"] += 1
