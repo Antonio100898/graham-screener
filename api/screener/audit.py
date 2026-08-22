@@ -606,6 +606,14 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                 out.append(("FILING?", f"FY{year} {field}", shown, float(value),
                             "the same figure under the scale the statement declares"))
                 continue
+            ratio = _ratio(row)
+            if field == "eps" and ratio != 1 and abs(abs(shown / float(value)) - ratio) <= 0.02 * ratio:
+                # A depositary receipt earns what its ordinary shares earn, times the
+                # number it stands for. DBV Technologies' statement is per ordinary
+                # share and the panel is per receipt, five to one.
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            f"per receipt, which is {ratio:g} ordinary shares"))
+                continue
             if field == "eps" and _split_since(facts, heading, shown, float(value)):
                 out.append(("FILING?", f"FY{year} {field}", shown, float(value),
                             "split-adjusted; this filing predates the split"))
@@ -647,7 +655,13 @@ def _split_since(facts: dict, heading, shown: float, printed: float) -> bool:
     if not shown or not printed:
         return False
     factor = printed / shown
-    if not 1.5 <= abs(factor) <= 1000:
+    # Either direction. A forward split divides the per-share figures the panel
+    # carries and a reverse split multiplies them, and small companies do the
+    # second far more often — Palatin's earnings are fifty times the printed
+    # figure, Yarrow's fifty, Sunlands twelve.
+    if abs(factor) < 1:
+        factor = 1 / factor
+    if not 1.5 <= abs(factor) <= 10000:
         return False
     # A split restates the whole series, so the evidence is looked for at any period
     # end the filer reports twice — not only at this column's. Mueller's doubled
