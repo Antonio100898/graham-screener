@@ -180,7 +180,7 @@ def test_index_membership_parsers():
 def test_row_carries_per_figure_provenance_and_series_mix():
     """Release 3b: every extracted figure names its tag and filing; a series
     stitched from two tags discloses which years came from which."""
-    from tests.test_normalize import GAAP, facts_doc, tagdata, dur
+    from tests.helpers import GAAP, facts_doc, tagdata, dur
     from screener.sync import _derive
 
     gaap = dict(GAAP)
