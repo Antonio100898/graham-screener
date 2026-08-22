@@ -391,6 +391,15 @@ def against_filing(row: dict, edgar) -> list[tuple]:
                  <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)]
         if agree:
             out.append(("FILING-OK", field, shown, agree[0], note))
+        elif " - " in ((sources.get(field) or {}).get("tag") or ""):
+            # A derived figure is not the line the statement prints. Total
+            # liabilities from assets-minus-equity necessarily contains the
+            # mezzanine a balance sheet shows between the two — Crawford Capital's
+            # $176.5M of shares subject to redemption sits there, and its printed
+            # "Total liabilities" of $3.5M excludes it by design. Two quantities,
+            # not two answers.
+            out.append(("FILING?", field, shown, scaled[0],
+                        "derived by identity; the printed line is a narrower figure"))
         elif any(_only_the_scale_differs(shown, v) for v in scaled):
             out.append(("FILING?", field, shown, scaled[0],
                         "the same figure under the scale the statement's header "

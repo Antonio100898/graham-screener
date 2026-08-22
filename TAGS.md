@@ -260,6 +260,48 @@ $721.5M; its statement says -$292.2M. Rebuilding the parent's figure as group mi
 minority fixes it and breaks TKO, which tags only the redeemable half of its
 noncontrolling interests without a dimension. Left alone deliberately.
 
+### 1.15 What ~2,000 companies against their published statements settled (engine v82-83)
+
+Four sweeps, four seeds, every figure checked three ways: against the filing its own
+provenance names, against its own arithmetic, and against the balance sheet and
+income statement the company published.
+
+| | result |
+|---|---|
+| values matching the filing they name | **4,823 / 4,823** |
+| figures matching their own arithmetic | **4,008 / 4,008** |
+| lines matching the published statement | **3,456 ok, 10 wrong** |
+| components superseded by a newer filing | **0** |
+
+Defects this found, beyond §1.14:
+
+* **Sales tax cannot exceed the sale.** Precision Optics tags $53.5M including
+  assessed tax against $24.2M excluding it; thirty filers tag a pair no rate
+  explains (Lifestance 462x, SS Innovations exactly 1000x, a units error wearing a
+  revenue tag). Worse than the bad figure: the sub-scope guard anchors on the
+  LARGEST candidate, so one inflated element pushed Precision Optics' own $24.0M —
+  the "Net sales" its statement prints — out of contention as a scrap.
+* **`_class_member` could not tell Class A from Class B.** Its pattern needed a
+  lowercase tail, so the lone "A" was dropped and both classes read as
+  `{"class"}`. Every dual-class cover then produced two matches, read as ambiguous,
+  and was refused — the one thing the cover reader exists to settle. Resolution
+  went from 46 to 160 of the first 1,200 companies; PJT's count was a weighted
+  average and is now its Class A outstanding count.
+* **126 of 5,791 cover titles** run into the next rendered cell.
+* **Provenance now carries the share-class axis.** 137 figures were read on one
+  while naming only the tag, which points at a filing where the number differs.
+
+**Where the filing is the unreliable side.** Four classes, each now named rather
+than scored: a header declaring "$ in Millions" over whole dollars (ABVC's cash of
+"$ 31,944" would be $31.9 trillion); a newer figure in an S-1, which the engine
+does not read; a figure derived by identity, which contains the mezzanine a printed
+"Total liabilities" excludes; and a concept the statement never prints at all —
+income available to the common, which Occidental, Rhinebeck and Interactive Brokers
+tag and no line on their pages equals.
+
+**Still open**, each with its reason in the code: Benchmark Electronics, Blackstone
+Mortgage, Vivid Seats.
+
 ### 1.11 Settled debt → criterion 3 and the capitalisation figures (engine v70)
 
 `screens.enterprising.settled_debt()` is the single place the rollup-versus-parts
