@@ -427,6 +427,15 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                  <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)]
         if agree:
             out.append(("FILING-OK", field, shown, agree[0], note))
+        elif field == "intangibles" and any(
+                abs((shown + (row.get("goodwill") or 0)) - v)
+                <= FILING_TOLERANCE * max(abs(shown + (row.get("goodwill") or 0)), abs(v), 1e-9)
+                for v in scaled):
+            # A caption reading "Intangible assets" is often the combined line.
+            # Affinity Bancshares prints $17,984,000 against $17,200,000 of goodwill
+            # and $765,000 of intangibles, and tangible book deducts the sum either
+            # way — the split differs, the deduction does not.
+            out.append(("FILING-OK", field, shown, shown, "printed combined with goodwill"))
         elif field == "intangibles" and _the_finite_part_only(facts, sources, scaled):
             # `IntangibleAssetsNetExcludingGoodwill` is finite-lived plus
             # indefinite-lived; a balance sheet often prints only the first under a
@@ -690,6 +699,57 @@ def _one_moment(row: dict, facts: dict) -> list[tuple]:
     return out
 
 
+def _derived_series(row: dict) -> list[tuple]:
+    """The ratio table and the chapter-13 statistics, against their own inputs.
+
+    Nothing here needs a filing: every one of these is arithmetic on figures the
+    statement checks have already confirmed. They had never been checked at all, and
+    they are most of what a reader compares one company to another with — the
+    per-year multiples in the table, and the growth and stability figures beneath
+    it.
+    """
+    out = []
+
+    def check(name, shown, expected, formula):
+        if shown is not None and expected is not None:
+            out.append((name, shown, expected, formula))
+
+    eps = {int(y): v for y, v in (row.get("annual_eps") or {}).items()}
+    stats = row.get("ch13") or {}
+    if eps and stats.get("latest_fy"):
+        latest = stats["latest_fy"]
+        recent = [eps[y] for y in range(latest - 2, latest + 1) if y in eps]
+        if len(recent) == 3:
+            check("ch13.avg_recent", stats.get("avg_recent"),
+                  round(sum(recent) / 3, 2), "mean of the last three years' EPS")
+        window = [eps[y] for y in range(latest - 9, latest + 1) if y in eps]
+        if window:
+            check("ch13.ten_year_present", stats.get("ten_year_present"), len(window),
+                  "how many of the last ten years have an EPS")
+            # strictly positive: a year earning exactly nothing was not a positive
+            # year, though it is also not the deficit criterion 4 tests for
+            check("ch13.ten_year_positive", stats.get("ten_year_positive"),
+                  sum(1 for v in window if v > 0), "how many of those earned something")
+
+    for year, cell in (row.get("annual_ratios") or {}).items():
+        if not isinstance(cell, dict):
+            continue
+        price, book = cell.get("price"), cell.get("bvps")
+        if price and book:
+            check(f"annual_ratios.{year}.pb", cell.get("pb"), round(price / book, 2),
+                  "that year's price over that year's book value per share")
+        tangible = cell.get("tbvps")
+        if price and tangible and tangible > 0:
+            check(f"annual_ratios.{year}.ptbv", cell.get("ptbv"), round(price / tangible, 2),
+                  "that year's price over its tangible book value per share")
+        revenue = (row.get("annual_revenue") or {}).get(year)
+        income = (row.get("annual_net_income") or {}).get(year)
+        if revenue and income is not None:
+            check(f"annual_ratios.{year}.net_margin", cell.get("net_margin"),
+                  round(income / revenue * 100, 4), "that year's profit over its sales")
+    return out
+
+
 def _c(row: dict, n: int):
     """A criterion's displayed value, looked up by number — never by position."""
     return next((c.get("value") for c in (row.get("criteria") or ()) if c.get("n") == n), None)
@@ -755,7 +815,7 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 totals["sourced_bad"] += 1
                 lines.append(("SOURCED", field, shown, filed,
                               f"{source['tag']} {source['end']} {source['accn']}"))
-        for name, shown, expected, formula in _identities(row):
+        for name, shown, expected, formula in _identities(row) + _derived_series(row):
             if _close(shown, expected):
                 totals["derived_ok"] += 1
             else:
