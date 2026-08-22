@@ -103,6 +103,10 @@ class FinancialSnapshot:
     pays_dividend: bool | None
     balance_sheet_date: date | None
     total_debt: Fact | None = None  # total-style rollup tag; preferred over long+short when present
+    # employee options still outstanding — dilution a share count does not show
+    options_outstanding: Fact | None = None
+    # restricted stock still to vest: dilution that does not need a rising price
+    rsus_outstanding: Fact | None = None
     # concepts with zero facts anywhere in the filing history, opt-in treated as 0 (flagged)
     assumed_zero: frozenset = frozenset()
     # deducted in TBV: Assets - Liabilities includes minority holders' equity;
@@ -110,7 +114,7 @@ class FinancialSnapshot:
     noncontrolling_interest: Fact | None = None
     # disclosures about what the TTM earnings are made of — never criteria, but
     # criterion 1 can turn on a single non-recurring line, so they are surfaced
-    earnings_quality: tuple[str, ...] = ()
+    earnings_quality: tuple[dict, ...] = ()   # {"kind", "text"}, as context_notes carries
     owner_earnings: OwnerEarnings | None = None
     # "Dec 31" -> TTM EPS computable from facts FILED by that date, rebased onto
     # today's share count; the hindsight-free denominator for historical P/E
@@ -127,12 +131,21 @@ class FinancialSnapshot:
     temporary_equity: Fact | None = None
     # trailing preferred dividends: EPS nets them, NetIncomeLoss does not
     ttm_preferred_dividends: Decimal | None = None
+    # ...and the same series by year, for the implied-share cross-check
+    annual_preferred_dividends: dict[int, Decimal] = field(default_factory=dict)
+    # the dei cover-page count, whatever the chain finally chose. Kept only so that a
+    # depositary ratio can be seen: for a receipt-listed foreign issuer the cover
+    # counts receipts while the statements count ordinary shares.
+    cover_shares: Fact | None = None
     # cash conversion, dilution and interest coverage — context a passing
     # multiple cannot answer; never a criterion, never an adjustment
     context_notes: tuple[str, ...] = ()
     # profitable years against years that carried effectively no income tax
     # {"window_from", "window_to", "profitable_years", "untaxed_years", "pass_through"}
     tax_record: dict | None = None
+    # set when the earnings series and the share count cannot be the same security:
+    # every per-share figure would be wrong by the factor between them
+    basis_conflict: str | None = None
 
 
 @dataclass(frozen=True)

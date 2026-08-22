@@ -35,9 +35,17 @@ quarterly facts are never promoted to annual. TTM = latest FY + YTD − prior-YT
 | fill | `EarningsPerShareBasic`, `IncomeLossFromContinuingOperationsPerBasicShare` | last resort, per missing year only; basic ≥ diluted so it flatters slightly — disclosed |
 | split-guard | `IncomeLossFromContinuingOperationsPerDilutedShare` | continuing-ops cross-check |
 
-Split detection: unexplained year-over-year ratios near 1.5–100× against the
-weighted-share tags (`WeightedAverageNumberOfDilutedSharesOutstanding` + 4
-variants) mark a split and rescale history rather than reporting a fake collapse.
+Split detection: a period restated by a round multiple (1.5–100×) marks a split
+and rescales history rather than reporting a fake collapse. Since 2026-08-21 the
+evidence must clear three tests, because each was found producing wrong EPS on
+real filers: the values doing the voting must exceed five cents (a −0.02 quarter
+restated to −0.01 is rounding, not a corporate action — Idaho Copper); the
+weighted-share count must move by the reciprocal factor, which is what refutes
+another registrant's statements filed under one CIK (Essential Utilities, 2.5×
+earnings against 1.41× shares); and a run of restatements of the same factor
+collapses to one event measured from the run's **latest** observation, capped at
+two years, because Lam Research's 10:1 arrives one comparative at a time over 287
+days and was being booked twice.
 
 ### 1.2 Net income, revenue, operating income → size test, ch. 13, earnings quality
 
@@ -65,8 +73,17 @@ NOT_APPLICABLE for 2–3 — that is an answer, not a gap.
 | Noncontrolling interest | `MinorityInterest` + `RedeemableNoncontrollingInterestEquityCarryingAmount` (summed) | A − L is equity incl. NCI; the minority share is not the common's |
 | Shares outstanding | `CommonStockSharesOutstanding`, else `dei:EntityCommonStockSharesOutstanding`, else weighted-average tags | sanity-voted against implied NI/EPS shares — one number divides NCAV, TBV and market cap |
 
-Tangible book = assets − liabilities − goodwill − intangibles − preferred − NCI.
-NCAV/share = (current assets − total liabilities − preferred) / shares.
+Tangible book = assets − liabilities − goodwill − intangibles − preferred − NCI
+− temporary equity.
+NCAV/share = (current assets − total liabilities − preferred − NCI − temporary
+equity) / shares.
+
+Mezzanine (temporary) equity belongs in both and was missing from this page until
+2026-08-21, although `sync.py` has deducted it since v38 — the GTN fixture two
+sections down exists precisely because of it. It is not a rounding difference:
+22 of 101 audited filers diverge from the formula as it was written here, and
+Ingredion's NCAV/share flips sign on it, +0.41 documented against −0.365 shipped.
+That sign is what the P/NCAV column and the net-net filter key off.
 
 ### 1.4 Debt → criterion 3
 
@@ -114,17 +131,183 @@ P/E get a note, never an adjustment: `InventoryLIFOReserveEffectOnIncomeNet`,
 `AssetImpairmentCharges`, `GoodwillImpairmentLoss`, `RestructuringCharges`,
 `InventoryWriteDown`, `BusinessCombinationAcquisitionRelatedCosts`.
 
-### 1.8 What is *calculated* from these
+### 1.8 Deferred tax → context notes (engine v58)
+
+The tax footnote is the company's own opinion of its future earning power, and
+it is signed. Two readings are disclosed, neither ever a criterion.
+
+| Concept | Tags | Rule |
+|---|---|---|
+| Deferred portion of the tax charge | `DeferredIncomeTaxExpenseBenefit` against `IncomeTaxExpenseBenefit` | latest shared fiscal year, and only within a year of the newest earnings; a charge ≥ 80% deferred means the tax return has not collected it (DTE FY2025: 88M charged, 358M deferred, a 270M current refund — its own `CurrentIncomeTaxExpenseBenefit` confirms the figure) |
+| Valuation allowance | `DeferredTaxAssetsValuationAllowance` over `DeferredTaxAssetsGross`, else over `DeferredTaxAssetsNet` + allowance | one balance-sheet date for both; an allowance larger than the assets it reserves against proves the two tags are not one pair (VAL: 3,292M against a "gross" 1,368M → no note), and the derivation rescues filers whose gross tag went stale (BIIB's stopped in 2021) |
+
+Both fire only beside a profitable latest year — a loss-maker reserving its tax
+assets is doing the expected thing — and the allowance must matter against
+common equity. `DeferredIncomeTaxesAndTaxCredits` (18% of filers) is a tracked
+candidate, not read: it folds tax credits into the same figure.
+
+### 1.10 Convertible preferred and warrants → context notes, never the share count (engine v69)
+
+Graham counts shares "including the conversion of preferred" (table 18.6, where
+McGraw-Hill's book value per share is struck on 24.2M converted shares), and he
+prices warrants by adding their own market value to the capitalisation — the
+fully-diluted alternative he calls illogical, because assuming exercise and
+retiring debt with the proceeds left National General's EPS at $1.51 either way.
+
+Neither can be done deterministically here, so both are disclosed instead.
+
+| Concept | Tags | Why it is a note and not a figure |
+|---|---|---|
+| Convertible preferred | `ConvertiblePreferredStockSharesIssuedUponConversion` (8% of filers), `PreferredStockConvertibleSharesIssuable` (2%), `ConvertiblePreferredStockSharesOutstanding` (<1%) | One tag, three meanings: a conversion already done and inside the common count (Structure Therapeutics, 67.0M against 2023-02-07, its IPO); a ceiling on preferred that no longer exists (Aqua Power 500M, Ilustrato 31.98bn); a live conversion right (XWELL, 66.7M issuable against 31,333 preferred shares). The first is now separable — see below — but the second and third are not, so the count is never touched |
+| Warrants | `WARRANT_SHARE_TAGS` | The screen prices no warrants — they trade under their own symbols — so the note says the capitalisation is understated by whatever they are worth, rather than diluting the denominator |
+
+Both fire at a 5% overhang. The convertible note also raises a prose gap naming
+the capitalisation note to read; 42 companies carry it.
+
+**Which case a filer is in** (engine v72). `PreferredStockSharesOutstanding` is
+filed on a share-class axis, so Company Facts drops it and Sachem's Series A reads
+as absent rather than as a number. The quarterly DERA datasets keep the axis, so
+the tag joins the harvest whitelist (`sync._dera_tags`) and
+`normalize._preferred_outstanding()` sums it across **every** preferred class —
+the question is whether any is left, not which series it sits in, so a split
+across three series is not ambiguity. Zero means the conversion is history and the
+note is dropped rather than shown as a warning about nothing.
+
+Of the 42 companies flagged, 33 fall inside the harvested window and 9 are dormant
+shells whose last filing predates it; the full-archive scan resolves 34, of which
+13 had already converted. What no tag settles is whether the conversion figure is
+the common the preferred becomes or a ceiling nobody reaches, so the note reports
+what is outstanding and the prose gap asks for the conversion ratio.
+
+**Warrants stay a note, and cannot stop being one.** Graham's rule needs their
+market value. `FairValueAdjustmentOfWarrants` (93 of the 122 flagged companies) is
+the P&L *change*, not the balance. A balance exists for only 17, always as an
+issuer extension under a different name per filing agent (`WarrantLiabilityCurrent`,
+`WarrantLiabilityNoncurrent`, `PublicWarrantLiabilityNoncurrent`,
+`CurrentPortionOfWarrantLiability`). Two problems survive full coverage: only
+liability-classified warrants carry a mark at all — the equity-classified majority,
+which is Graham's NVF case, carries none — and a fair-value mark is a model number,
+not the traded price he means. The warrants trade under their own symbols and this
+screen prices none of them.
+
+### 1.13 Equity awards → dilution the share count does not show (engine v73-75)
+
+| Concept | Tags | Rule |
+|---|---|---|
+| Options outstanding | `ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber`, then `...OptionsExercisableNumber` | dimension-free and fresh |
+| Restricted stock | `...EquityInstrumentsOtherThanOptionsNonvestedNumber`, then `...OtherThanOptionsOutstandingNumber` | same |
+
+Summed into one overhang against shares outstanding — both promise shares to
+employees and dilute the same holders; what differs is that an option needs a
+rising price to be worth anything and a restricted share does not. The total
+carries the basis it was struck on (`awards_basis`), the way a trailing P/E carries
+`ttm_basis`: "options only" is a statement about the evidence, not about the
+company.
+
+2,192 companies (37%): **1,792 options only, 232 both, 168 RSUs only**. Median
+overhang **2.89%**, 95th percentile 21.6%. Restricted stock is the thinner series
+of the two — a fresh, dimension-free nonvested balance exists for only about 5% of
+filers, because the count sits in a roll-forward table dimensioned by award type.
+
+Apple, Microsoft, Nvidia, Tesla, JPMorgan and Coca-Cola tag **no machine-readable
+count of either kind** — not in Company Facts, and not in five quarters of the
+DERA datasets, which was checked directly. §5.1 applies: the panel shows an em
+dash, never 0%.
+
+**A pool larger than the company is a tagging error**, not dilution, and is
+withheld: Greenlane's reads 235,000 one quarter and 235,000,000 the next,
+Zerocarbon reports 3.2bn options against 10.4M shares, Astrotech 234.4M against
+1.76M. Seventeen rows shipped an overhang above 100% (XXI at 1,344,649,800%, its
+own share count tagged as 1) before the ceiling went in; none do now, and the
+largest surviving figure is 90.1%.
+
+### 1.14 What the 2026-08-22 filing audit changed (engine v76-79)
+
+The first audit to read the *published statements* rather than compare two machine
+readings of the same XBRL. `make audit-filings` fetches each company's rendered
+balance sheet and income statement and checks the panel against the printed page.
+
+| filer | was | now | the printed page says |
+|---|---|---|---|
+| EML | no P/E at all | 18.87 | $5,405,522 / 6,264,521 sh = $0.86, not the $1.76 a later filing tagged |
+| ET | NCI 15,441M | 15,447M | "Noncontrolling interests 15,191" + "Redeemable 256" |
+| STWD | FY2025 profit 443,093K | 411,544K | "Net income attributable to Starwood Property Trust" |
+| TKO | FY2025 profit 546,290K | 195,403K | 546,290 less 350,887 of noncontrolling interests |
+| OVV | FY2025 revenue 8,663M | 8,908M | "Total Revenues" |
+| ARES | FY2025 revenue 4,756M | 5,601M | "Total revenues" |
+
+Two root causes, both the same shape — a ranking that put coverage above meaning:
+
+* **Net income** ranked candidates by (recency, series length, tag preference), so
+  `ProfitLoss` — the *group's* profit, minority holders included — won on having
+  more years than `NetIncomeLoss`. Scope now outranks depth; recency still settles
+  an abandoned series. 23 companies (2.9%) move.
+* **Revenue** ranked `RevenueFromContractWithCustomerExcludingAssessedTax` above
+  `Revenues`, and the two filers above err in opposite directions, so no ordering
+  fixes both. They are a total and its part, so between *those two* the larger is
+  the total. Never applied to the assessed-tax pair, where the larger would count
+  sales tax collected for the state as revenue. 10 companies (1.4%) move.
+
+**Known and not fixed.** Vivid Seats tags
+`RevenueFromContractWithCustomerExcludingAssessedTax` dimension-free at its
+MarketPlace segment alone; the consolidated total is $127.7M larger and exists only
+under a `BusinessSegments=Consolidated` axis. One company in 4,489 does this, so
+the engine reads a segment as the whole — a per-filer special case would be worse
+than the error.
+
+Vivid Seats also tags fiscal 2025 net income of +$806.1M beside a group loss of
+$721.5M; its statement says -$292.2M. Rebuilding the parent's figure as group minus
+minority fixes it and breaks TKO, which tags only the redeemable half of its
+noncontrolling interests without a dimension. Left alone deliberately.
+
+### 1.11 Settled debt → criterion 3 and the capitalisation figures (engine v70)
+
+`screens.enterprising.settled_debt()` is the single place the rollup-versus-parts
+reconciliation lives, and the row exports its answer as `debt` (41% of rows;
+`total_debt` alone is tagged by only 7%). Criterion 3 weighs it and the detail
+panel adds it to the market value of the common. `None` means unknown, never
+debt-free — folding it to zero printed AES, a utility, at $11B of pure market
+cap under a label promising its debt was included.
+
+### 1.12 Fiscal year ends → the past columns of the Ratios table (engine v71)
+
+`normalize.fiscal_year_ends()` reads the date each fiscal year actually closed on
+(annual balance sheets first, the annual EPS series as backup) and is the single
+source both `vintage_ttm_eps` and `sync._price_the_ratio_history` read, so their
+keys cannot drift.
+
+Before v71 both used a calendar `{year}-12-31`, which is the right date only for
+December filers:
+
+| | KO (Dec) | MSFT (Jun) |
+|---|---|---|
+| newest FY | 2025, closed 2025-12-31 | 2026, closed 2026-06-30 |
+| old cutoff | 2025-12-31 ✓ | 2026-12-31 — four months away |
+| newest P/E | 22.89 | *blank* → **23.26** |
+| FY2025 P/B | 9.27 (unchanged) | 10.28 → **10.84** |
+
+206 companies had no P/E in their newest column; 77 remain and all are correct —
+64 lost money that year, and MCHP/MNRO/CPRI closed a year positive whose *trailing*
+figure on the closing day was still negative, which is the no-look-ahead rule
+working. Every non-December filer was also silently pricing a mid-year balance
+sheet against the following December's market; that is now the close of the day the
+year ended.
+
+### 1.9 What is *calculated* from these
 
 | Output | Formula | Where settled |
 |---|---|---|
-| C1 P/E | price / TTM EPS, PASS < 10.0 | at export (`sync.apply_price`), mirrored in `web/src/screen.js` |
+| C1 P/E | price / TTM EPS, PASS < 10.0 | at export (`sync.apply_price`) only — the browser reads the settled status, it does not recompute |
 | C2 current ratio | CA / CL, PASS ≥ 1.50 | engine |
 | C3 debt load | total debt / (CA − CL), PASS ≤ 1.10 | engine |
 | C4 stability | min EPS of last 5 FY ≥ 0 | engine |
 | C5 dividend | pays now (yield shown when price sane) | engine + price |
-| C7 tangible valuation | price / TBVPS, PASS < 1.20 | at export, mirrored client-side |
+| C7 tangible valuation | price / TBVPS, PASS < 1.20 | at export only, same as C1 |
+| Past-year multiples | that year's book figures ÷ the close on the day the fiscal year ended, P/E over `ttm_eps_vintage` | `normalize.fiscal_year_ends` fixes the date for both sides (engine v71) |
 | P/E3, ch. 13 stats | 3-year smoothed averages, 5/10-year growth, max decline, 10-year positive years | `ch13.py` / `profiles.py` |
+| Award overhang | (options + restricted stock) ÷ shares, each kind refused above 100% | `normalize`, `web/src/capital.js` |
+| Total capitalisation | market value of common + settled debt | `web/src/capital.js`, withheld when either is unknown |
+| Working capital / debt | (CA − CL) / settled debt, "no debt" at zero | `web/src/capital.js` |
 | Defensive tests | size, financial position, stability 10y, dividend 20y, growth ≥ 33⅓%/decade, valuation ≤ 15 / 22.5 | `profiles.py` (windowed for post-2011 listings) |
 
 ---
@@ -277,7 +460,7 @@ Everything below is real extracted data. Primary filings: FY2025 10-K
 | Current assets | `us-gaap:AssetsCurrent` | $30,390M | same 10-Q |
 | Current liabilities | `us-gaap:LiabilitiesCurrent` | $22,378M | same 10-Q |
 | Goodwill | `us-gaap:Goodwill` | $15,411M | same 10-Q |
-| Intangibles | — | **MISSING** | see 3.3 — this is audit finding territory |
+| Intangibles | `us-gaap:IndefiniteLivedTrademarks` | $12,463M | landed at v38; §3.3 kept the pre-v38 reading until 2026-08-21 |
 | Noncontrolling interest | `us-gaap:MinorityInterest` | $2,101M | same 10-Q |
 | Long-term debt | `us-gaap:LongTermDebtAndCapitalLeaseObligations` | $39,065M | same 10-Q |
 | Short-term debt | `us-gaap:LongTermDebtAndCapitalLeaseObligationsCurrent` + `us-gaap:CommercialPaper` | $4,743M | summed parts, provenance names both tags |
@@ -305,7 +488,12 @@ Everything below is real extracted data. Primary filings: FY2025 10-K
 
 ### 3.3 Where the audit shows up in this very company
 
-- **Criterion 7 is INSUFFICIENT for KO** — `missing: intangibles`. KO files no
+- **Criterion 7 was INSUFFICIENT for KO until v38, and this section described that
+  state for twenty engine versions after it stopped being true.** The class-tag
+  fallback landed as release 2 below; KO now ships `intangibles` $12,463M,
+  TBVPS $1.34 and criterion 7 **FAIL at 67.5**. The prediction underneath was
+  correct and is kept because it is the reasoning that produced the fix — but it
+  is history, not the current reading. KO files no
   `IntangibleAssetsNetExcludingGoodwill` (or finite/indefinite rollup) at all;
   its trademarks live in the class tag **`IndefiniteLivedTrademarks`:
   $12,463M at 2026-04-03** — exactly the indefinite-lived class family in
@@ -374,6 +562,15 @@ output, and the KO cache. Verdict and consequences:
 
 ### 4.1 What the review confirmed
 
+- **8 of the 12 chain defects in §2.1 are now fixed** (audit of 2026-08-21;
+  defect 6 was fixed at v49, *before* the review below claimed to confirm it).
+  Still live: #1 in part (stale-zero selection — the SRI class), #3
+  (`LongTermNotesPayable` mis-ranked), #4 (derived liabilities subtract
+  redeemable NCI twice — 35 rows including CMCSA, ACN and ADM: `redeemable_nci`
+  is gated on `parent_only_derivation` where `temporary_equity` is gated on
+  `liabilities_derived`), and #12 (debt evidence has no recency bound). The
+  original review text follows, unedited, because what it found is why the
+  releases below exist.
 - **All 12 chain defects in §2.1** were independently confirmed against the
   current code (stale-zero selection, string-matched `exclude_ltd_current`,
   `LongTermNotesPayable` mis-rank, provenance-string `parent_only_derivation`,
@@ -410,10 +607,12 @@ without new evidence overturning the recorded counterexample.
 | 3b | **DONE — engine v40 (2026-08-19).** Every dashboard row carries `sources` (14 balance-sheet figures × tag · form · accession · period end · filed date) and `series_mix` (which tag served which years, only when a series switched tags — 3,159 companies disclose one, mostly the ASC 606 revenue migration). Detail panel gains a "Data provenance" section — every figure links to its exact EDGAR filing — and a scope-switch warning under the annual history. Verified rendering in a headless browser (zero console errors). Payload 25.8 → 33.7 MB raw (~5 MB gzipped). |
 | 3c | **DONE — engine v43 (2026-08-19).** (i) Windowed defensive tests now require **listing-age corroboration**: `sync listing-age` fetches each candidate's first-ever SEC filing date from the EDGAR submissions index (2,470 fetched); a record starting after 2011 earns a window only when the company itself first filed after 2011. ARCC (filed 2004) loses its unearned window — and so do LEVI/CFG, which filed as debt registrants years before their equity IPOs: their truncation is the dataset's. 1,251 → 1,045 windowed rows. Resolves §3.4 finding ①. (ii) **Preferred dividends** (`DividendsPreferredStock` family) now enter every NI/EPS arithmetic — implied share counts and the harness identity check; GTN's 2.2× mismatch is resolved, not just documented. (iii) Redeemable-NCI **Other** component read (ET $256M). Harness widened to 40 companies across 13 strata + 40 pins: **40/40 clean, PASS**; three tracked candidates remain (GS `UnsecuredLongTermDebt` $348B / `SubordinatedDebt` — bank cohort, pending fixtures; PLD in-place-lease intangibles). |
 | 4 | **DONE — engine v44 (2026-08-19).** (i) A dividend record can now **disprove** twenty years, not only fail to prove them: two or more years inside the window where the company has earnings and no dividend fact make an uninterrupted record impossible → FAIL (BCC pays since 2017 but filed through 2013–2016 without paying). Guards: the year must carry earnings (absence is silence, not non-payment) and fall after 2013 (before that a payer might not have tagged). Result: 3,744 FAIL / 342 PASS / 1,810 still incomplete. (ii) Debt gains a **secured + unsecured axis** — the two sides are disjoint, so their sum is a second representation of the whole and competes with the instrument sum instead of adding to it (GS: $348B unsecured + $11.6B secured, no instrument rollup at all; subordinated debt sits inside unsecured and is never stacked on top). GS long-term debt 11.6B → 359.5B. (iii) **Context notes** — cash conversion over three years, five-year share-count drift, interest cover — disclosure only, never a grade; 3,781 companies carry at least one (KO: 75% of net income arrives as cash). They also gave `earnings_quality` its first UI home: it had been computed since the first release and never rendered. Harness: 40/40 clean, all tracked candidates resolved. |
-| 4b | **DONE — engine v46 (2026-08-19).** **Derived EPS** for filers whose per-share element is dimension-only (Company Facts drops it) or years stale: `(net income − preferred dividends) ÷ that year's share count`, using the weighted average where filed and otherwise the count on that year's report cover, and only when the count is struck within 460 days of the year end. **216 companies' EPS series now reach the present** (KKR 2017→2025, PAA 2016→2025, PAGP 2014→2025, CQP, GGROU); the trailing figure is recomputed too whenever the income data is newer than the last tagged per-share period, since a stale TTM priced against today's quote is worse than none — 148 companies moved from unknown to a measured criterion-1 FAIL, 15 to PASS. Guard found in verification: `ProfitLoss` includes noncontrolling interests, so it derives EPS only where the equity pair shows no minority holders — Ares tags no `MinorityInterest` at all yet its equity including NCI is twice its parent equity, and would have read 2.60 against a genuine 3.00-odd. **ROIC surfaced**: the Davis-Funds owner-earnings measure has been computed since the first release and appeared nowhere — now a sortable table column and a Detail section showing every component, invested capital, both capex readings and the caveats (2,978 companies carry one, 774 at 10%+). |
+| 4b | **DONE — engine v46 (2026-08-19).** **Derived EPS** for filers whose per-share element is dimension-only (Company Facts drops it) or years stale: `(net income − preferred dividends) ÷ that year's share count`, using the weighted average where filed and otherwise the count on that year's report cover, and only when the count is struck within 460 days of the year end. **216 companies' EPS series reached the present** at v46 (KKR 2017→2025, PAA 2016→2025, PAGP 2014→2025, CQP, GGROU) — but the cover-count half of that fallback was **removed after v46** when it was measured producing errors of five, ten and a hundred and fifty times, and `_annual_share_counts` says so in its own docstring. What survives is the weighted-average path: PAA's series ends 2016 again and KKR reaches 2025 through v53's dimensioned reader, not through this release. The named companies are the claim's original evidence, not a current inventory; the trailing figure is recomputed too whenever the income data is newer than the last tagged per-share period, since a stale TTM priced against today's quote is worse than none — 148 companies moved from unknown to a measured criterion-1 FAIL, 15 to PASS. Guard found in verification: `ProfitLoss` includes noncontrolling interests, so it derives EPS only where the equity pair shows no minority holders — Ares tags no `MinorityInterest` at all yet its equity including NCI is twice its parent equity, and would have read 2.60 against a genuine 3.00-odd. **ROIC surfaced**: the Davis-Funds owner-earnings measure has been computed since the first release and appeared nowhere — now a sortable table column and a Detail section showing every component, invested capital, both capex readings and the caveats (2,978 companies carry one, 774 at 10%+). |
 | 4c | **DONE — engine v49 (2026-08-19).** Graham's Penn Central signals, and a standing integrity rule. **Untaxed profits**: a taxable company reporting profit for years while paying effectively no income tax now says so (689 companies) — Graham's reading was that the tax authorities did not believe the earnings; a partnership, investment company or REIT gets the structural explanation instead (69). **Peer efficiency**: operating margin against the median of the company's own industry, computed at export because no single filing can produce it (527 companies materially behind). **Data-integrity audit over all 5,907 companies**, not just the sample: it immediately found four classes of false data now fixed — a zero share count (every per-share figure divides by it), a negative "revenue" that is really a fund's investment loss (IAU, BUR), negative assets from a filer's sign error (OYCG), and iShares Gold Trust's **2013** revenue presented beside a 2026 balance sheet as the trailing twelve months. |
+| 4d | **DONE — engine v58 (2026-08-20).** Three questions the criteria cannot answer, all disclosure and none of them a grade. (i) **The shape of the ten-year record.** `ch13` now reports the *first* half of the record separately (`growth_early`) — the ten-year figure adds both halves and cannot say which one produced the result — plus the latest year against the three behind it, and names the two unambiguous shapes: **52 sprints** (a flat decade carried by its last three years: CB, DUK, CSCO, ABT — whose smoothed EPS went $2.01 in FY2013–15 → $1.96 in FY2018–20 → $4.87 in FY2023–25) and **394 marathons** (both halves up ≥ 10%, ten positive years, no fall worse than 40%: MSFT, GOOGL, JPM). A first half that *declined* is deliberately neither: the rebound after a loss year is a return to where the company already was (D: −33% then +591%). (ii) **Deferred tax — the company's own signed opinion of its future earning power.** 265 companies reserve more than half their deferred tax assets while reporting a profit (META: 15,895M of 28,090M, and gross − allowance reconciles to its net tag to the dollar); 194 report a tax charge ≥ 80% deferred (TMUS FY2025: 3,289M charged, 425M currently payable; DTE: 88M charged against a 270M current *refund*, confirmed by its own `CurrentIncomeTaxExpenseBenefit`). Two traps found in the data and guarded: an allowance larger than the assets it reserves against proves the two tags are not one pair (VAL reserves 3,292M against a "gross" 1,368M), and a gross tag gone stale is rebuilt from net + allowance at the same date (BIIB's stopped in 2021). (iii) **`make events`** — material 8-K item numbers from each company's own filing index, the only company events readable without opening a document: non-reliance (4.02), bankruptcy (1.03), debt acceleration (2.04), listing deficiency (3.01), material impairment (2.06), repeated auditor changes (4.01). Items 5.02 and 1.02 were measured against a 200-company sample and **dropped** — at 87% and 38% of filers their numbers cannot separate a fired CFO from a board election, or a lost customer from a refinanced credit line. 19,232 events across all 5,911 companies; **2,165 (36%) carry at least one note** — 1,451 listing deficiencies, 670 auditor-churn, **573 non-reliance**, 215 debt accelerations, 185 impairments, 52 bankruptcies — and 2,291 companies are scanned clean, which is an answer rather than a blank. Each company records how far back its own index could be read (Wells Fargo's thousand most recent filings reach back fourteen months), and no note claims a window wider than that. |
 | 4 | Quality/context layer (one-time gains, warrants, impairments) — warnings only, never adjustments to Graham grades. |
-| 5 | Inline-XBRL extension adapter — the only route to issuer-extension concepts (e.g. franchise rights) that Company Facts cannot expose. |
+| 4e | **DONE — engine v67 (2026-08-22).** The audit of 2026-08-21 and its repairs. Thirty of thirty-three findings fixed, each against the company that proved it: one split counted twice (Lam Research FY2022 0.3275 to 3.275), an 8-K read as a split (Essential Utilities 5.50 to its filed 2.20), a debt rollup smaller than its own parts (Pangaea 0.52x PASS to 3.75x FAIL), a lease book standing in for Ford's borrowings, a partnership's group profit over its own units (Westlake 2.29x PASS to 13.29x FAIL), a 52/53-week year losing its restatement (ATI FAIL to PASS), criterion 4 decided on windows that closed a decade ago (Hershey, Berkshire), earnings and share counts on different bases (SM Energy, NRC), Canadian filers priced in the wrong currency, ROIC divided by a balance sheet twelve years newer (J&J FY2014 13.1% to FY2025 22.0%), a 2012 special dividend priced as a 9.49% yield, yields above 100% shipped by the export the engine refuses to publish, preferred-only payouts passing criterion 5 (Boeing), and a current ratio built from two different balance-sheet dates. **The coverage harness sampled nobody**: `coverage.py` selected on `mcap`, which the payload does not carry, so thirteen strata drew zero companies and only the forty pins were ever tested — the parts-vs-rollup identity that catches Pangaea was already written and had never run. Fixed, and the first real run over 113 companies found 110 unclassified tag families and fifteen identity mismatches; all are now read, registered with a reason, or explained by the engine's own refusal. **New**: Graham's two profitability ratios (net margin, return on book value) and a ratio table showing every ratio at today's price and at each of the last five fiscal year ends, each column struck on its own year's report and its own year's price; per-company incorporation from the filing index; a "check the filing" record for what only prose can settle (927 rows). **The cover page is read** (`sources/cover.py`, `make cover`): `dei:Security12bTitle` and `dei:TradingSymbol` are text under a share-class axis, so Company Facts strips both, and between them they settle the question every per-share figure rests on — which security the ticker prices. 3,750 covers read, 4,709 registered classes, six depositary ratios above one. Where a ratio exists the figures are restated onto the traded security: the share count divided by it, earnings, book value and dividends multiplied, so both sides of every multiple describe one thing. Onconova's market capitalisation falls from $550.2B to $42.3B and its P/E becomes measurable at 67.0; Akari's from $1,099B to $0.55B. The note quotes the filer's own sentence, so the parse can be checked rather than trusted, and a cover that has been read closes the gap it answers — 927 down to 632. Seven documentation defects corrected, including a verdict precedence stated backwards and a client-side price mirror that four documents promised and no commit ever built. 307 pytest + 22 node. |
+| 5 | Inline-XBRL extension adapter — the only route to issuer-extension concepts (e.g. franchise rights) that Company Facts cannot expose, **and to the cover page**: `dei:Security12bTitle` carries the depositary ratio in prose ("each representing 10 Ordinary Shares") with the trading symbol attached to one share class, which is the only deterministic answer to "which security does this ticker price". 616 rows are waiting on it for the ratio and 183 for the class. |
 
 ### 4.4 Foreign-filer policy (clarified, not a conflict)
 

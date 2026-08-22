@@ -18,13 +18,16 @@ from ..models import (
 # is compared against the newest fundamentals — the screen stays clock-free.
 STALE_FOR_PRICING_DAYS = 450  # an annual-only filer legitimately lags ~15 months
 
+# an annual series more than this far behind the balance sheet is not "the past
+# five years": a 10-K filer lags at most about fifteen months
+STALE_ANNUAL_DAYS = 550
 PE_MAX = Decimal("10.0")
 CURRENT_RATIO_MIN = Decimal("1.50")
 DEBT_TO_NCA_MAX = Decimal("1.10")
 PRICE_TO_TBV_MAX = Decimal("1.20")
 
 _CENT = Decimal("0.01")
-_YIELD_IMPLAUSIBLE = Decimal("100")  # per cent
+YIELD_IMPLAUSIBLE = Decimal("100")  # per cent; the export pass applies it too
 
 
 def evaluate(snapshot: FinancialSnapshot, quote: Quote | None) -> ScreenResult:
@@ -86,10 +89,19 @@ def _stale_against(quote: Quote | None, asof) -> int | None:
 
 def _c1_earnings_valuation(s: FinancialSnapshot, q: Quote | None) -> CriterionResult:
     name, threshold = "Earnings valuation", "P/E < 10.0"
+    if s.basis_conflict:
+        return CriterionResult(1, name, Status.INSUFFICIENT_DATA, None, threshold,
+                               s.ttm_eps_inputs, note=s.basis_conflict)
     if q is None or s.ttm_eps is None:
-        missing = "price quote" if q is None else "TTM EPS"
-        return CriterionResult(1, name, Status.INSUFFICIENT_DATA, None, threshold, s.ttm_eps_inputs,
-                               note=f"{missing} unavailable")
+        # Every snapshot is evaluated with quote=None at derive time, so the
+        # "TTM EPS" arm used to be unreachable and 823 companies with a live price
+        # and no earnings figure — Berkshire, Visa, Exxon — read "price quote
+        # unavailable" directly beneath their own price. Both are named, in the
+        # format apply_price already knows how to rewrite for criterion 7.
+        missing = ([] if q is not None else ["price quote"]) + \
+                  ([] if s.ttm_eps is not None else ["TTM EPS"])
+        return CriterionResult(1, name, Status.INSUFFICIENT_DATA, None, threshold,
+                               s.ttm_eps_inputs, note="missing: " + ", ".join(missing))
     earnings_end = max((f.provenance.period_end for f in s.ttm_eps_inputs
                         if f.provenance.period_end), default=None)
     age = _stale_against(q, earnings_end)
@@ -124,6 +136,43 @@ def _c2_liquidity(s: FinancialSnapshot) -> CriterionResult:
     return CriterionResult(2, name, status, ratio, threshold, (s.current_assets, s.current_liabilities))
 
 
+def settled_debt(s: FinancialSnapshot) -> tuple[Decimal | None, tuple[Fact, ...], list[str]]:
+    """The company's borrowings as this screen reads them, with what is missing.
+
+    Criterion 3 tests this figure against net current assets, and the detail panel
+    adds it to the market value of the common to say what the whole enterprise
+    costs. They must be the same number: a company shown as debt-free beside a
+    criterion that failed it on debt would be the screen contradicting itself on
+    one page. Returns None where the evidence does not settle it, never zero.
+    """
+    if s.total_debt is not None:
+        # The rollup and the long+short parts are two representations of one
+        # quantity, and where they disagree the larger is the conservative reading
+        # — the rule v44 already applies to the secured/unsecured axis. A rollup
+        # can omit a whole borrowings line (CHS leaves $1.59bn of bank loans out of
+        # its combined tag) and the error direction here must stay toward FAIL.
+        parts = tuple(f for f in (s.long_term_debt, s.short_term_debt) if f is not None)
+        parts_total = sum((f.value for f in parts), Decimal(0))
+        # Newer first, larger second. Chevron's rollup is struck at 2026-06-30 while
+        # both its parts are from 2025-12-31, so taking the larger alone would price
+        # a six-month-old balance sheet; Constellation's rollup and parts share a
+        # date and the rollup is the one that omits the short bucket.
+        parts_end = max((f.provenance.period_end for f in parts
+                         if f.provenance.period_end is not None), default=None)
+        total_end = s.total_debt.provenance.period_end
+        if parts_end and total_end and parts_end != total_end:
+            debt = parts_total if parts_end > total_end else s.total_debt.value
+        else:
+            debt = max(s.total_debt.value, parts_total)
+        return debt, (s.total_debt,) + parts, []
+    named = {"long-term debt": s.long_term_debt, "short-term debt": s.short_term_debt}
+    inputs = tuple(f for f in named.values() if f is not None)
+    missing = [k for k, f in named.items() if f is None]
+    if missing and "debt" not in s.assumed_zero:
+        return None, inputs, missing
+    return sum((f.value for f in named.values() if f is not None), Decimal(0)), inputs, missing
+
+
 def _c3_debt(s: FinancialSnapshot) -> CriterionResult:
     name, threshold = "Debt", "Total Debt <= 1.10 x Net Current Assets"
     if _unclassified_balance_sheet(s):
@@ -138,22 +187,15 @@ def _c3_debt(s: FinancialSnapshot) -> CriterionResult:
     if s.current_assets.value - s.current_liabilities.value < 0:
         return CriterionResult(3, name, Status.FAIL, None, threshold, inputs,
                                note="non-positive net current assets")
-    if s.total_debt is not None:
-        debt = s.total_debt.value
-        inputs += (s.total_debt,)
-    else:
-        assumed = "debt" in s.assumed_zero
-        parts = {"long-term debt": s.long_term_debt, "short-term debt": s.short_term_debt}
-        missing = [k for k, f in parts.items() if f is None]
-        inputs += tuple(f for f in parts.values() if f is not None)
-        if missing and not assumed:
-            # §5.1: missing is not zero — an absent debt tag is unknown, not debt-free
-            return CriterionResult(3, name, Status.INSUFFICIENT_DATA, None, threshold, inputs,
-                                   note="missing: " + ", ".join(missing))
-        if missing:
-            notes.append("assumed 0 for " + ", ".join(missing)
-                         + " (no debt evidence in any filing; assume_absent_zero opt-in)")
-        debt = sum((f.value for f in parts.values() if f is not None), Decimal(0))
+    debt, debt_inputs, missing = settled_debt(s)
+    inputs += debt_inputs
+    if debt is None:
+        # §5.1: missing is not zero — an absent debt tag is unknown, not debt-free
+        return CriterionResult(3, name, Status.INSUFFICIENT_DATA, None, threshold, inputs,
+                               note="missing: " + ", ".join(missing))
+    if missing:
+        notes.append("assumed 0 for " + ", ".join(missing)
+                     + " (no debt evidence in any filing; assume_absent_zero opt-in)")
     nca = s.current_assets.value - s.current_liabilities.value
     status = Status.PASS if debt <= DEBT_TO_NCA_MAX * nca else Status.FAIL
     ratio = (debt / nca).quantize(_CENT) if nca > 0 else None
@@ -169,6 +211,19 @@ def _c4_earnings_stability(s: FinancialSnapshot) -> CriterionResult:
         return CriterionResult(4, name, Status.INSUFFICIENT_DATA, None, threshold, (),
                                note="no annual EPS available")
     latest = max(s.annual_eps)
+    # Criteria 1 and 7 both refuse a figure the balance sheet has outrun; this one
+    # had no such guard, so Hershey passed on FY2010-FY2014 beside a June 2026
+    # balance sheet, and Berkshire on a Class A figure from FY2011. The last five
+    # fiscal years are the test, not the last five on file.
+    newest_end = s.annual_eps[latest].provenance.period_end
+    if (s.balance_sheet_date and newest_end
+            and (s.balance_sheet_date - newest_end).days > STALE_ANNUAL_DAYS):
+        return CriterionResult(
+            4, name, Status.INSUFFICIENT_DATA, None, threshold,
+            (s.annual_eps[latest],),
+            note=f"newest annual EPS is FY{latest}, "
+                 f"{(s.balance_sheet_date - newest_end).days // 365} years before this "
+                 "balance sheet; the last five fiscal years cannot be measured")
     window = range(latest - 4, latest + 1)
     present = [y for y in window if y in s.annual_eps]
     # Chapter 15 says "no deficit". A zero year is not a deficit; a product that
@@ -207,7 +262,7 @@ def _c5_dividend(s: FinancialSnapshot, q: Quote | None) -> CriterionResult:
             # the payment describe different securities — a preferred-share ticker
             # mapped to the parent's facts, or a stub price against a real dividend.
             # The test is unaffected either way; only the figure is withheld.
-            if pct <= _YIELD_IMPLAUSIBLE:
+            if pct <= YIELD_IMPLAUSIBLE:
                 yield_pct = pct
             else:
                 note += f"; yield of {pct}% is not meaningful against this price"

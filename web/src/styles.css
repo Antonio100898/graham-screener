@@ -349,6 +349,13 @@ sup.unk { font-size: 9px; margin-left: 3px; font-weight: 800; cursor: help; }
 /* Clean company drawer: facts first, then the two Graham frameworks. */
 .clean-detail { width: min(720px, 96vw); }
 .detail-head { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; padding-right: 32px; }
+.detail-head-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* same "tracked" colour language as the toolbar chip and the row star */
+.track-btn { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--bg); color: var(--dim);
+  font-size: 11px; font-weight: 700; letter-spacing: .2px; line-height: 1; white-space: nowrap; }
+.track-btn:hover { color: var(--insuf); border-color: var(--insuf); }
+.track-btn.on { background: var(--insuf-bg); color: var(--insuf); border-color: var(--insuf); }
 .detail-head .sub { margin-top: 4px; }
 .snapshot-section { margin: 16px 0 20px; }
 .snapshot-section h3, .criteria-title h3 { margin: 0; color: var(--ink); font-size: 12px; text-transform: none; letter-spacing: 0; }
@@ -451,6 +458,25 @@ table.grid { font-size: 14px; }
 .criteria-note { font-size: 12px; }
 
 /* The requested numeric history remains compact but comfortably readable. */
+/* a row whose numbers depend on something only the document says */
+.verifymark { margin-left: 6px; font-size: 8.5px; font-weight: 800; letter-spacing: .3px;
+  text-transform: uppercase; color: var(--insuf); background: var(--insuf-bg);
+  border: 1px solid var(--insuf); border-radius: 3px; padding: 1px 4px; cursor: help;
+  white-space: nowrap; }
+.prose-gaps .note-kind { background: var(--insuf-bg); color: var(--insuf); }
+.prose-gaps em { font-style: normal; color: var(--dim); }
+
+.ratios-section { margin-top: 18px; }
+.ratios-section .annual-history-table td small { display: block; font-size: 9.5px; color: var(--dim); }
+.ratios-section th.current, .ratios .current { background: var(--soft); font-weight: 700; }
+
+.eps-curve { margin: 20px 0; }
+.eps-curve-svg { display: block; width: 100%; height: auto; margin-top: 8px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--soft); }
+.eps-grid { stroke: var(--line); stroke-width: 1; }
+.eps-zero { stroke: var(--dim); stroke-width: 1; stroke-dasharray: 3 3; opacity: .7; }
+.eps-axis { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
 .annual-history { margin-top: 24px; }
 .annual-history-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
 .annual-history-table { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }

@@ -1,11 +1,13 @@
-// Screen semantics shared by the table and the detail panel. Criteria 1 and 7 are
-// recomputed here against the live price, so a price refresh needs no backend call.
+// Screen semantics shared by the table and the detail panel. The criteria
+// themselves are settled once, at export, by sync.apply_price: nothing here
+// recomputes a status from a price. priceToPass() asks the opposite question —
+// what price would clear the tests — and is the only price arithmetic in the app.
 
 export const CRITERIA = {
   1: "Earnings valuation — P/E < 10",
   2: "Liquidity — current ratio ≥ 1.5",
   3: "Debt ≤ 1.1 × net current assets",
-  4: "EPS > 0 in each of the past 5 years",
+  4: "EPS >= 0 in each of the past 5 years",
   5: "Currently pays a dividend",
   7: "Price ≤ 1.2 × tangible book value",
 };
@@ -99,7 +101,9 @@ export function priceToPass(row) {
   const c1 = byN(row, 1);
   const c7 = byN(row, 7);
   if (c1.status === "FAIL" && row.ttm_eps > 0) limits.push(9.99 * row.ttm_eps);
-  if (c7.status === "FAIL" && row.tbvps > 0) limits.push(1.2 * row.tbvps);
+  // criterion 7 is strict too — price < 1.20 x tbvps — so 1.20 x itself fails,
+  // the same reason the line above uses 9.99 rather than 10
+  if (c7.status === "FAIL" && row.tbvps > 0) limits.push(1.1999 * row.tbvps);
   if (!limits.length) return null;
   // only meaningful when nothing else blocks it
   const other = row.criteria.filter((c) => c.status !== "PASS" && !PRICE_CRITERIA.has(c.n));

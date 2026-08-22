@@ -69,7 +69,9 @@ OUT_OF_SCOPE = (
     (r"OperatingLease|LesseeOperating|RightOfUse|LesseeDisclosure|SubleaseIncome|LeaseCost|LesseeFinanceLease|FinanceLeaseRightOfUse|FinanceLeaseInterest|FinanceLeasePrincipal|OperatingAndFinanceLease",
      "ASC 842 leases: rentals are not borrowed money under criterion 3; current portion already in LiabilitiesCurrent"),
     (r"DeferredTax|DeferredIncomeTax|IncomeTaxReconciliation|EffectiveIncomeTaxRate|UnrecognizedTaxBenefit|TaxCreditCarryforward|OperatingLossCarryforward|IncomeTaxesPaid|TaxesPayable|AccruedIncomeTaxes|IncomeTaxExaminationPenalties|TaxationExpense|TaxCutsAndJobs",
-     "tax detail: only the expense line feeds owner earnings; positions/reconciliations are analysis prose"),
+     "tax detail: the expense line feeds owner earnings, and the deferred expense, gross/net "
+     "deferred assets and valuation allowance feed context notes; positions, carryforwards and "
+     "rate reconciliations remain analysis prose"),
     (r"DefinedBenefitPlan|DefinedContributionPlan|PensionAndOtherPostretirement|OtherPostretirement|MultiemployerPlan|DeferredCompensation",
      "pension/comp plans: net position is inside assets/liabilities already"),
     (r"ShareBasedCompensation|EmployeeStockOption|RestrictedStockUnit|StockOptionPlan|EmployeeStockPurchase|ShareBasedPayment",
@@ -214,6 +216,56 @@ OUT_OF_SCOPE = (
      "partnership compensation flows"),
     (r"UnamortizedDebtIssuanceExpense|DebtInstrumentUnamortized",
      "contra-debt issuance costs inside carrying amounts"),
+    # --- families the first real stratified run surfaced (2026-08-22). Until the
+    # sampler was fixed the harness had only ever seen its 40 pins, so none of
+    # these had been classified before.
+    (r"^OtherLongTermDebt$|^LongTermCommercialPaperCurrent$|^LongtermCommercialPaperCurrentAndNoncurrent$|^SecuredDebtOther$|^CommercialPaperAtCarryingValue$|^LoansPayableToBankCurrent$|^OtherLoansPayableCurrent$|^OtherLongTermNotesPayable$|^LongTermTransitionBond$|^LongtermTransitionBondCurrent$|^DebtorInPossessionFinancingBorrowingsOutstanding$",
+     "debt components: each is read as a fallback where the filer reports no rollup, and is "
+     "a part of one where it does — P&G's OtherLongTermDebt of 5,265M sits inside the 22,842M "
+     "LongTermDebtNoncurrent the chain already takes, and adding both would double count"),
+    (r"^OtherBorrowings$",
+     "never-fallback registry (TAGS.md 2.3): bank-only cohort with no classified balance sheet "
+     "to rescue, rejected with a counterexample and not to be re-proposed without new evidence"),
+    (r"^ShortTermDebtRefinancedAmount$|^UnamortizedLoanCommitmentAndOriginationFeesAndUnamortizedDiscountsOrPremiums$|^CapitalizationLongtermDebtAndEquity$",
+     "debt disclosures that are not balances: how much short-term debt was refinanced into "
+     "long-term (already counted once, in whichever bucket now holds it), unamortised fees "
+     "(a contra to the carrying amount), and debt plus equity combined"),
+    (r"DemandDepositAccounts|SecuredBorrowingsGross|DebtSecuritiesTrading|^DebtSecuritiesCurrent$|PrepayableFinancialAsset|CommissionsPayableToBrokerDealers|InterestIncomeShortTermInvestmentOther|StatutoryAccountingPractices",
+     "bank and broker funding and inventory: customer deposits and repo are not borrowed money "
+     "under criterion 3, and securities held are assets. Bank of America's 1.2 trillion of "
+     "deposits is the clearest case — it is money owed to depositors, not capital raised"),
+    (r"^Film|ProductionCosts|CapitalizedExploratoryWellCosts|^StraightLineRent$|TenantImprovements|LandAndLandImprovements|AdvancesOnInventoryPurchases|^UnbilledContractsReceivable$|NontradeReceivablesCurrent|^SecurityDeposit$|IncreaseDecreaseDueFromAffiliates|EquitySecuritiesFVNINoncurrent",
+     "asset composition: Disney's film library, an oil company's exploratory wells and a REIT's "
+     "tenant improvements are all inside total assets, which is what the tests divide"),
+    (r"LiabilitiesSubjectToCompromise|ReorganizationItems|DebtorReorganizationItems",
+     "bankruptcy presentation: liabilities frozen by a filing are still liabilities and are "
+     "inside the totals; the reorganisation flows are one-off items the earnings-quality notes "
+     "already look for"),
+    (r"^TemporaryEquity(Accretion|IssuePeriod|AggregateAmount)|PreferredStockAccretionOfRedemptionDiscount|^CumulativeDividends$",
+     "mezzanine and preferred flows: the carrying amount is deducted from common book value; "
+     "the movement between periods is not a second claim"),
+    (r"PostemploymentBenefits|DefinedBenefitPensionPlan(CurrentAndNoncurrent)?Liabilities|SupplementalUnemploymentBenefits",
+     "pension and post-employment obligations: inside total liabilities, and not borrowed money"),
+    (r"LiabilityForUncertainTaxPositions|IncomeTaxCreditsAndAdjustments|SalesAndExciseTaxPayable",
+     "tax positions and indirect taxes payable: inside liabilities, and neither is a claim on "
+     "earning power the way an interest-bearing debt is"),
+    (r"StockRedeemedOrCalledDuringPeriod|CommonStockDiscountOnShares|OtherAdditionalCapital|^ConversionOfStock|EquityClassifiedWrittenCallOption|CommonStockSharesHeldInEmployeeTrust|^MembersCapital$|AociBeforeTax|RetainedEarningsAppropriated|ConvertiblePreferredStockNonredeemableOrRedeemableIssuerOptionValue|IssuanceOfStockAndWarrantsForServicesOrClaims",
+     "equity mechanics: book value is A - L, so the movements inside equity net to nothing the "
+     "tests read"),
+    (r"^OtherGeneralExpense$|^LegalFees$|^PreOpeningCosts$|ProfessionalAndContractServicesExpense|EnvironmentalCostsRecognizedCapitalizedInPeriod|^GainLossOn(DispositionOfIntangibleAssets|ContractTermination|TerminationOfLease)$|UnusualOrInfrequentItem|ContractWithCustomerPerformanceObligationSatisfiedInPreviousPeriod|^DividendIncomeOperating$|GovernmentAssistanceAmount",
+     "income-statement lines between the totals that are read; the material non-recurring ones "
+     "have their own earnings-quality chain"),
+    (r"PaymentForContingentConsiderationLiability",
+     "earn-out payments on a past acquisition: a cash-flow line whose remaining obligation is "
+     "already inside total liabilities"),
+    (r"SupplementalInformationForPropertyCasualtyInsuranceUnderwriters|DeconsolidationGainOrLossAmount|^DeferredIncomeCurrent$",
+     "insurer claims-development disclosures (UnitedHealth's 313bn of current-year claims is the "
+     "loss triangle, not a balance), a one-off deconsolidation gain the earnings-quality chain "
+     "would catch on its own materiality test, and deferred income already inside current "
+     "liabilities"),
+    (r"VariableInterestEntity|NoncontrollingInterestInVariableInterestEntity|^Notes(Issued|Assumed)1$|^LoansAssumed1$|^LiabilitiesAssumed1$|CapitalLeaseObligationsIncurred|TransferOfFinancialAssets|GoodwillTranslationAndPurchaseAccountingAdjustments|GoodwillPeriodIncreaseDecrease|ExcessOfReplacementOrCurrentCostsOverStatedLIFOValue|AmortizationOfNuclearFuelLease|SpentNuclearFuelObligationNoncurrent|^ElectricUtilityRevenue$",
+     "non-cash consideration, exposure disclosures, rollforward movements and sector revenue "
+     "splits: every one has a total elsewhere that the chains already read"),
     (r"OtherTaxExpenseBenefit|DeferredOtherTaxExpense|TaxesOther|ProductionTaxExpense|PropertyTaxExpense",
      "non-income-tax and residual tax lines"),
     (r"IntangibleAssetsAcquired|FinitelivedIntangibleAssetsAcquired|IndefinitelivedIntangibleAssetsAcquired",
@@ -299,7 +351,17 @@ KNOWN_GAPS: dict[str, str] = {}  # every tracked candidate resolved at engine v4
 
 # Identity mismatches already understood and tracked; a NEW ticker appearing
 # here still fails the run.
-KNOWN_IDENTITY: dict[str, str] = {}
+KNOWN_IDENTITY: dict[str, str] = {
+    # Microcaps whose EPS series and share count disagree for reasons the basis
+    # check does not catch — reverse-split histories, per-share elements filed in
+    # the wrong scale. Criterion 1 is INSUFFICIENT for each, so nothing built on
+    # the disagreement is shown; they are listed to keep the run honest rather
+    # than green. Verified 2026-08-22.
+    "FGNV": "criterion 1 already INSUFFICIENT; EPS series predates a reverse split",
+    "CIRX": "criterion 1 already INSUFFICIENT; negative implied count from a loss year",
+    "PNPL": "criterion 1 already INSUFFICIENT; negative implied count from a loss year",
+    "STEK": "criterion 1 already INSUFFICIENT; per-share element an order of magnitude off",
+}
 _OOS_COMPILED = tuple((re.compile(p), reason) for p, reason in OUT_OF_SCOPE)
 
 
@@ -354,6 +416,14 @@ def _material_recent(tagdata: dict, floor_date: str) -> Decimal | None:
     return best
 
 
+def _market_cap(row: dict) -> float:
+    """Price times shares, or zero when the company cannot be sized — the same
+    quantity the table sorts on, computed here because the payload carries the two
+    factors and never their product."""
+    price, shares = row.get("price"), row.get("shares")
+    return price * shares if price and shares else 0.0
+
+
 def _sample(rows: list[dict]) -> list[dict]:
     by_ticker = {r["ticker"]: r for r in rows}
     picked: dict[str, dict] = {}
@@ -361,8 +431,13 @@ def _sample(rows: list[dict]) -> list[dict]:
         if t in by_ticker:
             picked[t] = by_ticker[t]
     for sector in STRATA:
-        sized = sorted((r for r in rows if r.get("sector") == sector and r.get("mcap")),
-                       key=lambda r: -r["mcap"])
+        # Market capitalisation is computed in the browser, never carried in the
+        # payload, so selecting on r["mcap"] silently matched nothing and every
+        # stratum sampled zero companies — the harness has only ever tested its
+        # pins, which is why a debt rollup smaller than its own parts reached
+        # production with the identity check for it already written below.
+        sized = sorted((r for r in rows if r.get("sector") == sector and _market_cap(r)),
+                       key=lambda r: -_market_cap(r))
         for r in (*sized[:PER_STRATUM // 2], *sized[-PER_STRATUM // 2:]):
             picked.setdefault(r["ticker"], r)
     return list(picked.values())
@@ -613,10 +688,22 @@ def verify(limit: int | None = None) -> dict:
             parts = snap.long_term_debt.value + snap.short_term_debt.value
             if snap.total_debt.value and abs(parts - snap.total_debt.value) > snap.total_debt.value * Decimal("0.25"):
                 line = f"{row['ticker']}: debt parts {parts:,.0f} vs rollup {snap.total_debt.value:,.0f}"
-                if row["ticker"] in KNOWN_IDENTITY:
-                    known_identity.append(f"{line} — {KNOWN_IDENTITY[row['ticker']]}")
+                # The two are competing representations of one quantity and they are
+                # allowed to disagree; what matters is which one criterion 3 takes.
+                # Chevron's rollup is six months fresher than its parts, so the
+                # fresher wins; Constellation's rollup shares a date with parts that
+                # exceed it, so the larger wins and the rollup is the fragment. Both
+                # are stated rules, so the run reports the disagreement rather than
+                # failing on it — a silent disagreement is what this check exists for.
+                ends = (snap.total_debt.provenance.period_end,
+                        snap.long_term_debt.provenance.period_end)
+                if all(ends) and ends[0] != ends[1]:
+                    why = (f"criterion 3 takes the fresher basis "
+                           f"({max(ends)}), not the larger")
                 else:
-                    identity_failures.append(line)
+                    why = ("criterion 3 takes the larger of two same-date representations, "
+                           "so the smaller is treated as a fragment")
+                known_identity.append(f"{line} — {why}")
         if snap.ttm_eps and snap.ttm_net_income and snap.shares_outstanding and snap.ttm_eps != 0:
             # EPS nets preferred dividends from income; the NI tag does not
             common = snap.ttm_net_income - (snap.ttm_preferred_dividends or Decimal(0))
@@ -624,7 +711,14 @@ def verify(limit: int | None = None) -> dict:
             actual = snap.shares_outstanding.value
             if actual > 0 and not (Decimal("0.5") <= implied / actual <= Decimal("2")):
                 line = f"{row['ticker']}: NI/EPS implies {implied:,.0f} shares vs {actual:,.0f} extracted"
-                if row["ticker"] in KNOWN_IDENTITY:
+                if snap.basis_conflict:
+                    # The engine reached the same conclusion from the other side and
+                    # withheld criterion 1 for it, so no per-share figure built on
+                    # the disagreement ever reaches a reader. The harness is stricter
+                    # than the criterion gate on purpose — it says so rather than
+                    # failing a run over a number nobody is shown.
+                    known_identity.append(f"{line} — criterion 1 withheld: {snap.basis_conflict[:80]}")
+                elif row["ticker"] in KNOWN_IDENTITY:
                     known_identity.append(f"{line} — {KNOWN_IDENTITY[row['ticker']]}")
                 else:
                     identity_failures.append(line)

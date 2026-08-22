@@ -1,7 +1,7 @@
 PY := api/.venv/bin/python
 PIP := api/.venv/bin/pip
 
-.PHONY: install share bootstrap bulk metadata daily derive export dev api web build test clean status
+.PHONY: install share bootstrap bulk metadata daily derive events cover export dev api web build test clean status regress audit audit-filings
 
 install:                       ## set up both workspaces
 	python3 -m venv api/.venv
@@ -23,8 +23,23 @@ daily:                         ## catch up: refetch only companies that filed si
 derive:                        ## recompute snapshots after an engine change (no refetch)
 	cd api && .venv/bin/python -m screener.sync derive
 
+events:                        ## material 8-K items (restatements, delisting notices) per company
+	cd api && .venv/bin/python -m screener.sync events
+
+cover:                         ## read each filing's cover: which security the ticker prices
+	cd api && .venv/bin/python -m screener.sync cover
+
 export:                        ## write dashboard.json (adds live prices)
 	cd api && .venv/bin/python -m screener.sync export
+
+audit:                         ## check every displayed number against the filing it came from
+	cd api && .venv/bin/python -m screener.audit $(ARGS)
+
+audit-filings:                 ## ...and against the statements the company published (network)
+	cd api && .venv/bin/python -m screener.audit --filings $(ARGS)
+
+regress:                       ## diff every number against the shipped payload after an engine change
+	cd api && .venv/bin/python -m screener.regress $(ARGS)
 
 verify-coverage:               ## prove the sampled companies hide no unread material facts
 	cd api && .venv/bin/python -m screener.coverage

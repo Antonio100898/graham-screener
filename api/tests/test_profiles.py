@@ -9,6 +9,7 @@ from screener.sync import apply_price
 def screen_row():
     return {
         "sector": "Industrials",
+        "listed": "y",
         "price": 10.0,
         "ttm_eps": 1.5,
         "tbvps": 12.0,
@@ -265,3 +266,182 @@ def test_a_book_value_made_entirely_of_acquisitions_is_stated():
     row.update(goodwill=50, intangibles=50)      # 100 against 300 of equity
     assert not any("tangible book value is gone" in n
                    for n in enrich(row)["context_notes"] for n in [n["text"]])
+
+
+# --- which half of the record produced the growth ---
+
+def shaped_row(**ch13):
+    row = screen_row()
+    row["ch13"] = {"latest_fy": 2025, "avg_old": 1.0, "avg_middle": 1.0, "avg_recent": 3.0,
+                   "growth_early": 0.0, "growth_5y": 200.0, "growth_10y": 200.0,
+                   "max_decline": 0.0, "latest_vs_prior3": 80.0, "shape": "sprint"}
+    row["ch13"].update(ch13)
+    return row
+
+
+def test_a_decade_carried_by_its_last_three_years_says_so():
+    note = enrich(shaped_row())["context_notes"][-1]
+    assert note["kind"] == "Growth is recent"
+    assert "+0%" in note["text"] and "+200%" in note["text"]
+    assert "FY2013–FY2015" in note["text"] and "FY2023–FY2025" in note["text"]
+    assert "FY2025 alone came in +80%" in note["text"]
+
+
+def test_growth_in_both_halves_reads_as_a_steady_record():
+    note = enrich(shaped_row(shape="marathon", growth_early=40.0, growth_5y=45.0,
+                             avg_middle=1.4, avg_recent=2.03, max_decline=6.0))["context_notes"][-1]
+    assert note["kind"] == "Steady record"
+    assert "no pause" in note["text"] and "worst single-year fall 6%" in note["text"]
+
+
+def test_an_unclassified_record_says_nothing_about_its_shape():
+    assert enrich(shaped_row(shape=None))["context_notes"] == []
+
+
+# --- what the filing index proves happened ---
+
+def evented_row(events, events_from="2018-01-01"):
+    row = screen_row()
+    row.update(balance_sheet_date="2026-06-30", events_from=events_from,
+               filing_events=[{"filed": d, "item": i, "accn": f"a-{n}"}
+                              for n, (d, i) in enumerate(events)])
+    return row
+
+
+def kinds(row):
+    return [n["kind"] for n in enrich(row)["context_notes"]]
+
+
+def test_a_withdrawn_financial_statement_is_the_loudest_event():
+    note = enrich(evented_row([("2025-03-02", "4.02")]))["context_notes"][-1]
+    assert note["kind"] == "Non-reliance"
+    assert "2025-03-02" in note["text"] and "no longer be relied upon" in note["text"]
+
+
+def test_several_events_each_get_their_own_note():
+    row = evented_row([("2025-03-02", "4.02"), ("2024-09-01", "2.06"), ("2023-04-04", "1.03")])
+    assert kinds(row) == ["Non-reliance", "Bankruptcy", "Material impairment"]
+
+
+def test_a_transfer_of_listing_is_not_a_deficiency():
+    """Item 3.01 is 'Notice of Delisting or Failure to Satisfy a Continued Listing Rule
+    or Standard; Transfer of Listing'. Walmart, Palantir, Linde and Shopify all filed one
+    to move exchange, and the item number cannot tell that from a company in breach."""
+    assert kinds(evented_row([("2025-11-20", "3.01")])) == []
+
+
+def test_an_event_older_than_the_window_is_not_reported():
+    # five years back from the company's own newest balance sheet
+    assert kinds(evented_row([("2020-01-04", "4.02")])) == []
+    assert kinds(evented_row([("2021-08-04", "4.02")])) == ["Non-reliance"]
+
+
+def test_a_truncated_index_narrows_the_window_it_claims():
+    """A prolific filer's index holds only its last thousand filings."""
+    row = evented_row([("2026-01-04", "4.01"), ("2024-06-04", "4.01"),
+                       ("2022-06-04", "4.01")],
+                      events_from="2022-05-01")
+    note = enrich(row)["context_notes"][-1]
+    # the scan could not see back to 2021-07-01, so the note may not claim it
+    assert "since 2022-05-01" in note["text"]
+
+
+def test_one_auditor_transition_reported_twice_is_not_churn():
+    """T-Mobile filed item 4.01 three weeks apart for a single change, and Fastenal
+    197 days apart: the committee approves the handover in one filing, the outgoing
+    firm's dismissal takes effect in the next once it has finished the year in
+    progress. Both are one transition."""
+    assert kinds(evented_row([("2025-04-15", "4.01"), ("2025-05-06", "4.01")])) == []
+    assert kinds(evented_row([("2024-07-19", "4.01"), ("2025-02-06", "4.01")])) == []
+    # genuinely separate transitions are
+    row = evented_row([("2022-03-15", "4.01"), ("2023-08-16", "4.01"), ("2025-08-25", "4.01")])
+    note = enrich(row)["context_notes"][-1]
+    assert note["kind"] == "Auditor changes" and "3 changes" in note["text"]
+
+
+def test_a_company_with_no_scan_reports_no_events():
+    row = screen_row()
+    row["balance_sheet_date"] = "2026-06-30"
+    assert enrich(row)["context_notes"] == []
+
+
+def test_a_foreign_issuer_is_told_to_read_its_cover_page():
+    """A depositary receipt stands for several ordinary shares, and the ratio is prose
+    on the filing cover — no XBRL feed carries it. SEC codes every non-US jurisdiction
+    with a digit (E9 Cayman Islands, X0 United Kingdom), which is how the row knows."""
+    row = screen_row()
+    row["incorporation"] = "E9|Cayman Islands"
+    note = enrich(row)["context_notes"][-1]
+    assert note["kind"] == "Foreign listing" and "Cayman Islands" in note["text"]
+    assert "cover" in note["text"]
+
+
+def test_a_cover_count_and_a_statement_count_far_apart_name_both():
+    """Zai Lab's cover states 88.6M receipts while its statements count 1,122.4M
+    ordinary shares — the gap is the depositary ratio, and the note says so."""
+    row = screen_row()
+    row.update(incorporation="E9|Cayman Islands", shares=1_122_445_390, cover_shares=88_592_343)
+    text = enrich(row)["context_notes"][-1]["text"]
+    assert "88.6M" in text and "1,122.4M" in text and "12.7x apart" in text
+
+
+def test_a_domestic_filer_gets_no_depositary_warning():
+    row = screen_row()
+    row["incorporation"] = "DE|DE"
+    assert enrich(row)["context_notes"] == []
+
+
+def test_prose_gaps_name_the_question_the_figures_and_the_filing():
+    """A foreign issuer's depositary ratio is prose on the cover. The row records what
+    cannot be settled, which figures it would move, and where to read it — rather than
+    guessing at a ratio or silently shipping four wrong multiples."""
+    row = screen_row()
+    row.update(incorporation="E9|Cayman Islands", shares=1_122_445_390,
+               cover_shares=88_592_343, sources={"eps": {"accn": "0001704292-26-000015"}})
+    gap = enrich(row)["prose_gaps"][0]
+    assert "depositary receipt" in gap["what"] and "12.7x apart" in gap["what"]
+    assert "P/NCAV" in gap["affects"]
+    assert gap["accn"] == "0001704292-26-000015"
+
+
+def test_an_item_3_01_is_a_question_not_a_verdict():
+    """The item number covers a delisting notice and a routine transfer of listing
+    alike. It is no longer read as trouble; it is recorded as something to check."""
+    row = screen_row()
+    row.update(balance_sheet_date="2026-06-30", events_from="2021-01-01",
+               filing_events=[{"filed": "2025-11-20", "item": "3.01", "accn": "a-1"}])
+    gap = enrich(row)["prose_gaps"][0]
+    assert "transfer of listing" in gap["what"] and gap["accn"] == "a-1"
+
+
+def test_a_plain_domestic_filer_has_nothing_to_check():
+    row = screen_row()
+    row["incorporation"] = "DE|DE"
+    assert enrich(row)["prose_gaps"] == []
+
+
+def test_a_symbol_sec_no_longer_lists_is_marked_not_dropped():
+    """American Electric Power still files 10-Qs while its submissions index carries no
+    ticker and no exchange; Farmer Brothers filed a Form 15 in May. Both still carry a
+    Yahoo price here, and a price for a security nobody can buy is the one number this
+    screen must never present as ordinary — so the row says so instead of hiding it."""
+    row = screen_row()
+    row["listed"] = None
+    gap = enrich(row)["prose_gaps"][0]
+    assert "still tradable" in gap["what"] and "Form 25 or Form 15" in gap["where"]
+    assert "dividend yield" in gap["affects"]
+
+
+def test_a_cover_that_has_been_read_answers_the_question_instead_of_asking_it():
+    """Onconova's cover says "each representing 13 Ordinary Shares". Once that is read
+    the depositary gap is not a gap — the ratio has been applied to every per-share
+    figure — and the note quotes the filer's own sentence so the parse can be checked."""
+    row = screen_row()
+    row["receipt"] = {"title": "American Depositary Shares, each representing 13 Ordinary Shares",
+                      "ratio": "13", "accn": "0001628280-26-011946"}
+    row["incorporation"] = "E9|Cayman Islands"
+    enriched = enrich(row)
+    assert enriched["prose_gaps"] == []
+    note = next(n for n in enriched["context_notes"] if n["kind"] == "Depositary receipt")
+    assert "each representing 13 Ordinary Shares" in note["text"]
+    assert "divided by 13" in note["text"]

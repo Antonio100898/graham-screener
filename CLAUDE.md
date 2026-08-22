@@ -17,9 +17,13 @@ web/   React SPA (Vite, no runtime deps beyond React). One fetch of dashboard.js
 
 - **Criteria are numbered 1, 2, 3, 4, 5, 7.** There is no 6 (Graham's growth test
   is disclosed, never scored). Always look up by number (`byN`), never by position.
-- **Snapshots are stored price-free.** Criteria 1 and 7 are settled at export by
-  `sync.apply_price()`; the same arithmetic is mirrored in `web/src/screen.js` for
-  client-side price refresh. Change one → change both.
+- **Snapshots are stored price-free.** Criteria 1 and 7 are settled once, at
+  export, by `sync.apply_price()`. There is no client-side mirror: `web/src/screen.js`
+  reads the statuses the export already settled and never recomputes a criterion
+  from a price. Four documents claimed such a mirror existed until the audit of
+  2026-08-21; `priceToPass()` — "what price would clear the tests" — is the only
+  price arithmetic in the browser, and it is a different question. If a client-side
+  refresh is ever built, that is when the two-places rule starts to apply.
 - **Missing is never zero.** A figure with no evidence stays INSUFFICIENT;
   `?assume_absent_zero=true` is the only opt-out, and it is flagged in the response.
 - **Grade precedence** (pinned by `web/test/grade.test.mjs`): definitive non-price
@@ -30,6 +34,25 @@ web/   React SPA (Vite, no runtime deps beyond React). One fetch of dashboard.js
 - **Stale facts are missing facts.** Instant facts >400 days older than the
   balance sheet are dropped; fundamentals >450 days older than the quote withhold
   the price criteria.
+
+## Proving a change
+
+Unit tests pin synthetic fixtures; they cannot tell you what a change did to 5,892
+real companies. Two harnesses answer that, and both must be run after an engine
+change — every defect this project has shipped was found by a one-off script, and
+several of those scripts were themselves wrong.
+
+```sh
+make regress                   # every field of every row vs the shipped payload
+make audit                     # every displayed number vs the fact it names
+make audit-filings             # ...and vs the statement the company published
+```
+
+`regress` calls exactly what `derive` calls — sidecar, cover ratio, export-time
+enrichment — because omitting any of them invents differences. `audit` checks three
+things a recomputation cannot: that a value matches the filing its own provenance
+names, that computed figures are the arithmetic they claim, and that no figure is
+assembled from components struck at different balance-sheet dates.
 
 ## Commands
 

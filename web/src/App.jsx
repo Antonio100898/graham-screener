@@ -65,7 +65,9 @@ function Th({ id, sort, onSort, children, className = "" }) {
 
 // narrowest first: 30 companies beat 500 beat ~100 beat every Nasdaq listing
 const INDEX_RANK = { "DJIA": 0, "S&P 500": 1, "Nasdaq 100": 2, "Nasdaq Comp": 3 };
-const INDEX_SHORT = { "DJIA": "DJIA", "S&P 500": "S&P", "Nasdaq 100": "N100", "Nasdaq Comp": "NDQ" };
+// "Nasdaq Comp" is every Nasdaq listing, which the Exchange filter already says;
+// the badge is named for what it is rather than for an index it does not track
+const INDEX_SHORT = { "DJIA": "DJIA", "S&P 500": "S&P", "Nasdaq 100": "N100", "Nasdaq Comp": "Nasdaq-listed" };
 
 const saved = loadView();
 takeOverScrollRestoration();
@@ -135,7 +137,7 @@ export default function App() {
   }, []);
 
   const toggleTracked = async (row, e) => {
-    e.stopPropagation();          // the row click opens the detail panel
+    e?.stopPropagation();         // the row click opens the detail panel; the detail star has none
     const on = tracked.has(row.cik);
     setTracked((prev) => {        // optimistic: the list is local and cheap to revert
       const next = new Set(prev);
@@ -254,20 +256,24 @@ export default function App() {
     });
   }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
 
+  // Counted over the rows on screen, not over all 5,893: with the app's own
+  // defaults the "below NCAV" chip read 132 beside a table holding one of them,
+  // and "judged on all 6" read 4,393 against 896. A count that describes a
+  // universe the reader cannot see is not a count of anything they can act on.
   const positiveEpsCounts = useMemo(() => Object.fromEntries(
-    EPS_POSITIVE_FLOORS.map((floor) => [floor, rows.filter((r) => r.eps10?.positive >= floor).length])
-  ), [rows]);
-  const naCount = useMemo(() => rows.filter((r) => r.unjudged).length, [rows]);
-  const netNetCount = useMemo(() => rows.filter((r) => r.netNet).length, [rows]);
-  const noApplyCount = useMemo(() => rows.filter((r) => r.inapplicable).length, [rows]);
+    EPS_POSITIVE_FLOORS.map((floor) => [floor, view.filter((r) => r.eps10?.positive >= floor).length])
+  ), [view]);
+  const naCount = useMemo(() => view.filter((r) => r.unjudged).length, [view]);
+  const netNetCount = useMemo(() => view.filter((r) => r.netNet).length, [view]);
+  const noApplyCount = useMemo(() => view.filter((r) => r.inapplicable).length, [view]);
 
   const metCounts = useMemo(() => {
     const c = {};
-    rows.forEach((r) => {
+    view.forEach((r) => {
       for (let n = 1; n <= r.n_pass; n++) c[n] = (c[n] ?? 0) + 1;
     });
     return c;
-  }, [rows]);
+  }, [view]);
 
   const sectorCounts = useMemo(() => {
     const c = {};
@@ -476,6 +482,13 @@ export default function App() {
                     net-net
                   </span>
                 )}
+                {r.prose_gaps?.length > 0 && (
+                  <span className="verifymark"
+                        title={`Some data cannot be extracted and must be read in the filing:\n\n`
+                               + r.prose_gaps.map((g) => `• ${g.what}\n  affects ${g.affects}`).join("\n\n")}>
+                    check filing
+                  </span>
+                )}
               </td>
               <td className="name" data-label="Company">{r.name}</td>
               <td className="sector" data-label="Sector" title={r.industry ?? ""}>
@@ -533,7 +546,9 @@ export default function App() {
       )}
       {view.length > 300 && <p className="msg dim">First 300 shown — narrow the filter to see more.</p>}
 
-      {selected && <Detail row={selected} onClose={() => setSelected(null)} />}
+      {selected && <Detail row={selected} onClose={() => setSelected(null)}
+                           tracked={tracked.has(selected.cik)}
+                           onToggleTracked={() => toggleTracked(selected)} />}
     </div>
   );
 }

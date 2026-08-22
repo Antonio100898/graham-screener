@@ -4,6 +4,8 @@
     python -m screener.sync bulk                    download SEC's 1.4GB companyfacts.zip
     python -m screener.sync daily                   catch up via the daily index
     python -m screener.sync derive                  recompute snapshots after a code change
+    python -m screener.sync events                  material 8-K items from each filing index
+    python -m screener.sync cover                   what each filing's cover says the ticker is
     python -m screener.sync export                  write dashboard.json
     python -m screener.sync dera --from 2021q1      dimensioned + extension facts
     python -m screener.sync status
@@ -31,8 +33,8 @@ from . import ch13, pricestats, profiles, store
 from . import normalize
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
-                                   evaluate)
-from .sources import dera, indexes
+                                   YIELD_IMPLAUSIBLE, evaluate, settled_debt)
+from .sources import cover, dera, indexes
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError
 from .sources.prices import YahooPriceProvider
 
@@ -60,9 +62,15 @@ def _source(fact) -> dict | None:
         return None
 
     def one(p) -> dict:
-        return {"tag": p.tag, "form": p.form, "accn": p.accession,
-                "end": p.period_end.isoformat() if p.period_end else None,
-                "filed": p.filed.isoformat() if p.filed else None}
+        src = {"tag": p.tag, "form": p.form, "accn": p.accession,
+               "end": p.period_end.isoformat() if p.period_end else None,
+               "filed": p.filed.isoformat() if p.filed else None}
+        # The concept carries the caveat the tag cannot: "Dividends (aggregate —
+        # may include preferred and noncontrolling)" was built for 203 rows and
+        # then dropped here, so none of them ever showed it.
+        if "(" in p.concept:
+            src["concept"] = p.concept
+        return src
 
     def leaves(p) -> list:
         # a component can itself be a sum; the reader wants the filings, not the
@@ -94,11 +102,12 @@ def _series_mix(series: dict) -> dict | None:
 
 
 def _derive(cik: str, ticker: str, facts: dict, quote=None,
-            dimensioned: dict | None = None) -> tuple[str, dict | None]:
+            dimensioned: dict | None = None,
+            receipt: dict | None = None) -> tuple[str, dict | None]:
     """Snapshot + screen result, flattened for the dashboard."""
     try:
         snap = build_snapshot(ticker, cik, facts, assume_absent_zero=False,
-                              dimensioned=dimensioned)
+                              dimensioned=dimensioned, receipt=receipt)
     except UnsupportedFilerError:
         return "foreign", None
     except Exception as exc:  # a malformed filing must not stop a 4,000-company run
@@ -110,16 +119,29 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         "verdict": r.verdict.value,
         "n_pass": sum(1 for c in r.criteria if c.status.value == "PASS"),
         "ttm_eps": float(snap.ttm_eps) if snap.ttm_eps is not None else None,
+        # What the trailing figure actually is. The composite is FY + YTD - prior
+        # YTD, but where a quarter is missing or contradicts, the engine falls back
+        # to the audited year and said nothing: the panel labelled a figure eight
+        # months old "latest 12 months", and a P/E built on it looked current.
+        "ttm_basis": _ttm_basis(snap),
         "ttm_eps_vintage": {d: float(v) for d, v in snap.ttm_eps_vintage.items()},
         "balance_sheet_date": snap.balance_sheet_date.isoformat() if snap.balance_sheet_date else None,
         "annual_eps": {str(y): float(v) for y, v in r.annual_eps_series.items()},
         "annual_net_income": {str(y): float(f.value)
                               for y, f in sorted(snap.annual_net_income.items())},
+        # the panel divides income by EPS to cross-check the share count, and EPS
+        # nets preferred dividends while the income tag does not: Occidental's
+        # column read 3,509.6M implied shares against a reported 999.7M
+        "annual_preferred_dividends": {str(y): float(v) for y, v in
+                                       sorted(snap.annual_preferred_dividends.items())} or None,
         "ttm_net_income": float(snap.ttm_net_income) if snap.ttm_net_income is not None else None,
         "assumptions": list(r.assumptions),
         "earnings_quality": list(snap.earnings_quality),
         "context_notes": list(snap.context_notes),
         "tax_record": snap.tax_record,
+        # why the engine withheld the price criteria, when it did: apply_price must
+        # not settle a criterion that was refused for a reason a price cannot fix
+        "basis_conflict": snap.basis_conflict,
         # reported beside the verdict, never inside it — see models.EpsGrowth
         "eps_growth": {
             "base_fiscal_year": r.eps_growth.base_fiscal_year,
@@ -147,11 +169,29 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
                                     for y, f in sorted(snap.annual_operating_income.items())},
         "dividend_record": snap.dividend_record,
         "ch13": ch13.eps_stats({y: f.value for y, f in snap.annual_eps.items()}),
+        # profitability: never a criterion, the same way ROIC is not
+        "profitability": _profitability(snap),
+        # the same ratios at each of the last fiscal year ends, each struck on its
+        # own year's report. The price multiples are completed at export, where the
+        # price history lives; the vintage EPS series is their denominator.
+        "annual_ratios": normalize.annual_ratios(
+            facts.get("facts", {}).get("us-gaap", {}), snap.annual_net_income,
+            snap.annual_revenue, snap.annual_operating_income),
         "current_assets": float(snap.current_assets.value) if snap.current_assets else None,
         "current_liabilities": (float(snap.current_liabilities.value)
                                 if snap.current_liabilities else None),
         "long_term_debt": float(snap.long_term_debt.value) if snap.long_term_debt else None,
         "total_debt": float(snap.total_debt.value) if snap.total_debt else None,
+        # Employee options as a share of the count they will dilute. Absent for the
+        # filers that grant restricted stock instead, and absent is not zero.
+        "options": (float(snap.options_outstanding.value)
+                    if snap.options_outstanding else None),
+        "rsus": float(snap.rsus_outstanding.value) if snap.rsus_outstanding else None,
+        **_equity_awards(snap),
+        # What criterion 3 actually weighed, rollup and parts already reconciled.
+        # The panel adds it to the market value of the common to price the whole
+        # enterprise, and None here means unknown rather than debt-free.
+        "debt": (lambda d: float(d) if d is not None else None)(settled_debt(snap)[0]),
         "total_assets": float(snap.total_assets.value) if snap.total_assets else None,
         "total_liabilities": (float(snap.total_liabilities.value)
                               if snap.total_liabilities else None),
@@ -161,6 +201,11 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
                          max(f.provenance.period_end for f in snap.ttm_eps_inputs
                              if f.provenance.period_end).isoformat(),
         "shares": float(snap.shares_outstanding.value) if snap.shares_outstanding else None,
+        # what the cover of a named filing says this ticker is, when it was read
+        "receipt": receipt,
+        # the cover page's own count, kept only so a depositary ratio can be seen:
+        # a receipt count on the cover beside an ordinary count in the statements
+        "cover_shares": float(snap.cover_shares.value) if snap.cover_shares else None,
         "dividend_per_share": float(snap.dividend_per_share)
                               if snap.dividend_per_share is not None else None,
         "owner_earnings": _owner_earnings_row(snap),
@@ -177,6 +222,12 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # per-figure provenance: which tag, in which filing, dated when — the
         # reader can open the exact document behind every number
         "sources": {name: src for name, src in (
+            # the two headline flows, which had no provenance at all: a reader
+            # comparing the panel against a filing needs to know WHICH concept the
+            # profit is — Occidental and Rhinebeck tag only income available to the
+            # common, which their statements never print beside the consolidated line
+            ("net_income", _source(_newest(snap.annual_net_income))),
+            ("revenue", _source(_newest(snap.annual_revenue))),
             ("total_assets", _source(snap.total_assets)),
             ("total_liabilities", _source(snap.total_liabilities)),
             ("current_assets", _source(snap.current_assets)),
@@ -184,6 +235,8 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("long_term_debt", _source(snap.long_term_debt)),
             ("short_term_debt", _source(snap.short_term_debt)),
             ("total_debt", _source(snap.total_debt)),
+            ("options", _source(snap.options_outstanding)),
+            ("rsus", _source(snap.rsus_outstanding)),
             ("goodwill", _source(snap.goodwill)),
             ("intangibles", _source(snap.intangibles)),
             ("preferred_stock", _source(snap.preferred_stock)),
@@ -202,6 +255,81 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("revenue", _series_mix(snap.annual_revenue)),
         ) if mix is not None} or None,
     }
+
+
+# A margin needs a base worth taking a percentage of, and both figures must belong
+# to one fiscal year — the trailing composites for income and revenue can close on
+# different dates, and a ratio across two windows is not a margin.
+_MARGIN_FLOOR = Decimal("1000000")     # revenue below this makes the percentage noise
+_RETURN_ON_BOOK_LAG = 800              # a year's earnings over a balance sheet this much newer is not a return
+
+
+def _profitability(snap) -> dict | None:
+    """Graham's two profitability ratios: profit against sales, profit against book.
+
+    Chapter 13 compares four companies on exactly these — the margin says how much
+    of each dollar of sales the business keeps, and the return on book value says
+    what the shareholders' own capital earns. Neither decides anything here: the six
+    criteria are cheapness, stability and solvency, and a company earning two cents
+    on the dollar is not thereby disqualified. But it is a different business from
+    one earning twenty, and the screen was showing neither figure.
+
+    Return on book is deliberately absent where a fiscal year's earnings would have
+    to be divided by a balance sheet from a different era — the defect the audit
+    found in ROIC, where Johnson & Johnson's 2014 flows were being divided by a 2026
+    balance sheet and shown as a current return.
+    """
+    revenue, income = snap.annual_revenue, snap.annual_net_income
+    operating = snap.annual_operating_income
+    years = sorted(y for y in set(revenue) & set(income)
+                   if revenue[y].value >= _MARGIN_FLOOR)
+    if not years:
+        return None
+    latest = years[-1]
+    def pct(numerator, year):
+        return (float(numerator[year].value / revenue[year].value * 100)
+                if year in numerator else None)
+    series = {y: round(float(income[y].value / revenue[y].value * 100), 2) for y in years[-10:]}
+
+    equity = _common_equity(snap)
+    year_end = income[latest].provenance.period_end
+    stale = (snap.balance_sheet_date is None or year_end is None
+             or (snap.balance_sheet_date - year_end).days > _RETURN_ON_BOOK_LAG)
+    on_book = (round(float(income[latest].value / equity * 100), 2)
+               if equity and equity > 0 and not stale else None)
+    return {
+        "fiscal_year": latest,
+        "net": round(pct(income, latest), 2),
+        "operating": round(pct(operating, latest), 2) if latest in operating else None,
+        "on_book": on_book,
+        "revenue": float(revenue[latest].value),
+        "net_income": float(income[latest].value),
+        "book_value": float(equity) if equity else None,
+        # the direction matters more than the level: Graham's warning is a margin
+        # that erodes while the earnings still look adequate
+        "by_year": series,
+    }
+
+
+def _common_equity(snap):
+    """What the common shareholders own — the same deductions every per-share figure
+    on this page makes: preferred, the minority's share, and mezzanine."""
+    if snap.total_assets is None or snap.total_liabilities is None:
+        return None
+    other = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
+                                  snap.temporary_equity) if f)
+    return snap.total_assets.value - snap.total_liabilities.value - other
+
+
+def _ttm_basis(snap) -> str:
+    """The period behind the trailing EPS, named. One annual fact standing alone is
+    the audited year, not a trailing twelve months."""
+    inputs = snap.ttm_eps_inputs
+    if len(inputs) == 1:
+        p = inputs[0].provenance
+        if p.period_start and p.period_end and (p.period_end - p.period_start).days > 300:
+            return f"fiscal year to {p.period_end.isoformat()}"
+    return "latest 12 months"
 
 
 def _owner_earnings_row(snap) -> dict | None:
@@ -273,6 +401,8 @@ def _index_tickers(conn, edgar: EdgarClient) -> dict[str, tuple[str, str]]:
         out.setdefault(cik, (row["ticker"], row["title"]))
     for cik, (ticker, name) in out.items():
         store.upsert_company(conn, cik, ticker, name)
+    # ...and take the symbol back from whoever used to hold it
+    store.resolve_ticker_conflicts(conn, out)
     conn.commit()
     return out
 
@@ -409,6 +539,10 @@ def _dera_tags() -> tuple[frozenset[str], frozenset[str]]:
         + ("Assets", "Liabilities", "AssetsCurrent", "LiabilitiesCurrent",
            "CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding",
            "Goodwill", "IntangibleAssetsNetExcludingGoodwill")
+        # Preferred counts live on a share-class axis, so Company Facts returns
+        # nothing for them and a convertible preferred cannot be told from one
+        # that has already converted. Here the axis survives.
+        + normalize.PREFERRED_COUNT_TAGS
     )
     return wanted, per_share
 
@@ -469,6 +603,133 @@ def listing_age(conn, progress=_print_progress) -> None:
         if i % 100 == 0:
             conn.commit()
             progress("listing ages", i, len(todo))
+    conn.commit()
+    progress("done", len(todo), len(todo))
+
+
+def material_events(submissions: dict) -> tuple[list[dict], str | None]:
+    """Material 8-K items in a submissions index, and the oldest filing it shows.
+
+    Which items count is `profiles.EVENT_ITEMS`, beside the notes they become —
+    an item is stored only where something is prepared to say what it means.
+
+    The index holds the filer's most recent thousand filings. For nearly every
+    company that is its whole history, but a prolific one buries years under
+    Form 4s — Wells Fargo's thousand reach back fourteen months — so the scan
+    reports the date it could see back to. A window is only claimable when the
+    data covers it.
+    """
+    recent = (submissions.get("filings") or {}).get("recent") or {}
+    dates = recent.get("filingDate") or []
+    events = []
+    for form, filed, codes, accn in zip(recent.get("form") or [], dates,
+                                        recent.get("items") or [],
+                                        recent.get("accessionNumber") or []):
+        if not form.startswith("8-K"):
+            continue
+        for item in (codes or "").split(","):
+            if (item := item.strip()) in profiles.EVENT_ITEMS:
+                events.append({"filed": filed, "item": item, "accn": accn})
+    return events, min(dates) if dates else None
+
+
+def events(conn, progress=_print_progress) -> None:
+    """What each company's own filing index says happened to it.
+
+    Restatements, bankruptcy, delisting notices, accelerated debt and auditor
+    changes are reported as 8-K item numbers, which makes them the only company
+    events readable without opening a document. XBRL cannot express any of them:
+    a withdrawn financial statement is a statement about facts, not a fact.
+    """
+    edgar = EdgarClient()
+    store.migrate(conn)
+    ciks = store.dashboard_ciks(conn)
+    progress(f"scanning filing indexes for {len(ciks)} companies", 0, len(ciks))
+
+    def scan(cik: str):
+        """Fetch and read one index inside the worker: an index is megabytes and
+        what it yields is a handful of dates, so only the dates travel back."""
+        try:
+            d = edgar.submissions(cik)
+            return (cik, *material_events(d), d.get("stateOfIncorporation"),
+                    d.get("stateOfIncorporationDescription"))
+        except Exception:  # one unreadable index must not stop a 6,000-company scan
+            return cik, None, None, None, None
+
+    found = done = 0
+    # the SEC's ten-per-second cap is enforced inside the client, so a small pool
+    # spends the wait on network latency instead of adding to it
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for cik, seen, scanned_from, inc, inc_name in pool.map(scan, ciks):
+            done += 1
+            if seen is None:
+                continue
+            store.set_events(conn, cik, seen, scanned_from)
+            store.set_incorporation(conn, cik, inc, inc_name)
+            found += len(seen)
+            if done % 200 == 0:
+                conn.commit()
+                progress(f"scanning filing indexes — {found} events", done, len(ciks))
+    conn.commit()
+    progress("done", len(ciks), len(ciks))
+
+
+def cover_pages(conn, progress=_print_progress) -> None:
+    """Read the cover of each company's newest annual filing.
+
+    Two facts there decide what every per-share figure on this dashboard means,
+    and no XBRL feed carries either: which share class the ticker prices, and —
+    for a depositary receipt — how many ordinary shares one receipt stands for.
+    Onconova's cover says "each representing 13 Ordinary Shares" and its market
+    capitalisation was thirteen times too large without it.
+
+    Only companies whose figures the answer would change are fetched: a domestic
+    filer with one class of common has nothing here that the statements do not
+    already say.
+    """
+    edgar = EdgarClient()
+    store.migrate(conn)
+    # Every company, not only the ones whose data betrays a question. Onconova is
+    # the reason: both its share counts are ordinary, its incorporation field is
+    # empty, and nothing anywhere in its XBRL hints that the price belongs to a
+    # receipt worth thirteen of them. Targeting the detectable cases would have
+    # skipped precisely the case this exists for.
+    # the NEWEST filing, not the one that happened to supply the earnings: a filer
+    # whose per-share element is dimension-only has an EPS accession years old, and
+    # Hershey's was a 2015 cover that predates cover-page tagging entirely
+    def newest(row):
+        filings = [(s.get("filed"), s.get("accn"))
+                   for s in (row.get("sources") or {}).values() if s.get("accn")]
+        return max(filings)[1] if filings else None
+
+    todo = [(r["cik"], r["ticker"], newest(r)) for r in store.dashboard_rows(conn)]
+    todo = [(cik, ticker, accn) for cik, ticker, accn in todo if accn]
+    progress(f"reading cover pages for {len(todo)} companies", 0, len(todo))
+
+    def read(item):
+        cik, ticker, accn = item
+        for n in cover.COVER_REPORTS:
+            try:
+                url = cover.R_URL.format(cik=int(cik), accn=accn.replace("-", ""), n=n)
+                found = cover.securities(edgar._get_text(url))
+            except Exception:
+                continue
+            if found:
+                for security in found:
+                    security["ratio"] = cover.depositary_ratio(security["title"])
+                return cik, accn, found
+        return cik, accn, []
+
+    done = ratios = 0
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for cik, accn, found in pool.map(read, todo):
+            done += 1
+            if found:
+                store.set_cover(conn, cik, found, accn)
+                ratios += sum(1 for s in found if s["ratio"])
+            if done % 100 == 0:
+                conn.commit()
+                progress(f"reading cover pages — {ratios} depositary ratios", done, len(todo))
     conn.commit()
     progress("done", len(todo), len(todo))
 
@@ -537,6 +798,9 @@ def derive(conn, progress=_print_progress) -> None:
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
     stale = store.needs_recompute(conn)
+    # the cover ratio is transcribed once and applied on every recompute
+    covers = {(cik, s["symbol"]): s
+              for cik, found in store.covers_by_cik(conn).items() for s in found}
     progress(f"{len(stale)} snapshots predate engine v{store.ENGINE_VERSION}", 0, len(stale))
     for i, cik in enumerate(stale, 1):
         fp = _facts_path(edgar, cik)
@@ -544,13 +808,26 @@ def derive(conn, progress=_print_progress) -> None:
             continue
         ticker, name = tickers.get(cik, (None, None))
         status, data = _derive(cik, ticker or cik, json.loads(fp.read_text()),
-                               dimensioned=dera.load_sidecar(fp.parent, cik))
+                               dimensioned=dera.load_sidecar(fp.parent, cik),
+                               receipt=covers.get((cik, ticker)))
         store.put_snapshot(conn, cik, status, data)
         if i % 200 == 0:
             conn.commit()
             progress("recomputing snapshots", i, len(stale))
     conn.commit()
     progress("done")
+
+
+_DORMANT_DAYS = 200   # a filer silent this long has stopped, not merely gone stale
+
+
+def _span(days: int) -> str:
+    """A gap in words. `days // 365` printed "1 years" for everything from 451 to
+    723 days, most of which are nearer two."""
+    if days < 545:
+        return f"{round(days / 30.4)} months"
+    years = days / 365
+    return f"{years:.1f} years" if years < 10 else f"{round(years)} years"
 
 
 def _too_stale(asof: str | None, price_asof: str | None) -> int | None:
@@ -567,29 +844,39 @@ def apply_price(row: dict, price: float | None) -> dict:
     criteria are settled here — pure arithmetic over ttm_eps and tbvps, no I/O.
     The same rule runs client-side when the UI refreshes a price."""
     crit = {c["n"]: c for c in row["criteria"]}
-    if price is not None and price > 0:
+    if price is not None and price > 0 and not row.get("basis_conflict"):
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
         # Snapshots are intentionally price-free.  Once export has supplied a
         # live price, do not retain a stale "price quote" token in an otherwise
         # incomplete tangible-book explanation.
-        note = crit[7].get("note")
-        if isinstance(note, str) and note.startswith("missing: "):
-            missing = [item.strip() for item in note.removeprefix("missing: ").split(",")]
-            missing = [item for item in missing if item != "price quote"]
-            crit[7]["note"] = "missing: " + ", ".join(missing) if missing else None
+        for n in (1, 7):
+            note = crit[n].get("note")
+            if isinstance(note, str) and note.startswith("missing: "):
+                missing = [item.strip() for item in note.removeprefix("missing: ").split(",")]
+                missing = [item for item in missing if item != "price quote"]
+                crit[n]["note"] = "missing: " + ", ".join(missing) if missing else None
         pa = row.get("price_asof")
         # a dormant filer keeps its ticker; valuing today's price against its last
         # figures from years ago produces a confident, meaningless number
         stale_eps = _too_stale(row.get("earnings_asof"), pa)
         stale_bs = _too_stale(row.get("balance_sheet_date"), pa)
         if stale_eps:
+            # Whether the company stopped filing is a question the filing index
+            # answers, and the store already holds it: Brookfield filed a 10-Q nine
+            # days before this price and was being told it had gone quiet. Absent a
+            # filing date, the gap alone is stated and nothing is inferred from it.
+            filed = row.get("last_filing")
+            dormant = not filed or (date.fromisoformat(pa[:10])
+                                    - date.fromisoformat(filed[:10])).days > _DORMANT_DAYS
             crit[1].update(status="INSUFFICIENT_DATA", value=None,
-                           note=f"newest earnings are {stale_eps // 365} years older than this "
-                                "price; the company appears to have stopped filing")
+                           note=f"newest earnings are {_span(stale_eps)} older than this price"
+                                + ("; the company appears to have stopped filing" if dormant
+                                   else f", though it filed on {filed[:10]} — the earnings "
+                                        "element it uses has gone stale, not the company"))
             eps = None
         if stale_bs:
             crit[7].update(status="INSUFFICIENT_DATA", value=None,
-                           note=f"balance sheet is {stale_bs // 365} years older than this price")
+                           note=f"balance sheet is {_span(stale_bs)} older than this price")
             tbvps = None
         if eps is not None:
             if eps <= 0:
@@ -602,8 +889,20 @@ def apply_price(row: dict, price: float | None) -> dict:
                                value=pe, note=None)
         dps = row.get("dividend_per_share")
         if dps is not None and crit[5]["status"] == "PASS":
-            crit[5]["value"] = round(dps / price * 100, 2)
-            crit[5]["note"] = f"${dps:,.2f} per share over twelve months"
+            pct = round(dps / price * 100, 2)
+            # The engine refuses to publish a yield above par — it means the price
+            # and the payment describe different securities — and this pass used to
+            # publish it anyway, up to 2,240,506%.
+            if pct <= float(YIELD_IMPLAUSIBLE):
+                crit[5]["value"] = pct
+                # ...and the engine's own note is evidence, not decoration: appending
+                # keeps the aggregate-tag and unknown-payer disclosures it wrote.
+                paid = f"${dps:,.2f} per share over twelve months"
+                crit[5]["note"] = f"{crit[5]['note']}; {paid}" if crit[5].get("note") else paid
+            else:
+                crit[5]["value"] = None
+                crit[5]["note"] = ((crit[5].get("note") or "")
+                                   + f"; yield of {pct}% is not meaningful against this price").lstrip("; ")
         if tbvps is not None:
             if tbvps <= 0:
                 crit[7].update(status="FAIL", value=None, note="non-positive tangible book value")
@@ -622,6 +921,66 @@ def apply_price(row: dict, price: float | None) -> dict:
         else "PASS"
     )
     return row
+
+
+def _newest(series: dict) -> object | None:
+    """The latest year's fact in an annual series, for its provenance."""
+    return series[max(series)] if series else None
+
+
+def _equity_awards(snap) -> dict:
+    """Options and restricted stock together, and which of the two are in the figure.
+
+    They dilute the same shareholders and belong in one number, but a company that
+    tags only options has said nothing about its restricted stock — so the total
+    carries the basis it was struck on, the way a trailing P/E carries `ttm_basis`.
+    "options only" is a statement about the evidence, not about the company.
+    """
+    parts = {"options": snap.options_outstanding, "RSUs": snap.rsus_outstanding}
+    present = [k for k, f in parts.items() if f is not None]
+    if not present:
+        return {"equity_awards": None, "awards_basis": None}
+    total = sum((parts[k].value for k in present), Decimal(0))
+    basis = " + ".join(present) if len(present) > 1 else f"{present[0]} only"
+    return {"equity_awards": float(total), "awards_basis": basis}
+
+
+def _price_the_ratio_history(row: dict, closes) -> None:
+    """Turn each past year's book figures into the multiples the panel shows.
+
+    The price of that year comes from the stored weekly closes, and the earnings
+    denominator from `ttm_eps_vintage` — trailing EPS as it was knowable at that
+    year end, computed only from facts filed by then. Both sides are therefore
+    contemporaries: no ratio prices a 2022 balance sheet against today's quote,
+    and none of them knows what the company would report in February.
+
+    "That year end" is the company's own, not the calendar's. Microsoft's fiscal
+    2025 closed on 2025-06-30, and pricing it at the following December divided a
+    June balance sheet into a December market — its price/book read 10.28 where
+    the contemporaneous figure is 10.84. A June filer's newest year fared worse
+    still: the cutoff fell in a December that has not arrived, so no vintage EPS
+    existed for it and the P/E column was simply blank for 206 companies.
+    """
+    ratios = row.get("annual_ratios") or {}
+    if not ratios or not closes:
+        return
+    vintage = row.get("ttm_eps_vintage") or {}
+    by_date = sorted((d.isoformat() if hasattr(d, "isoformat") else str(d), c) for d, c in closes)
+    for year, values in ratios.items():
+        # the fiscal year end this row's figures were struck at; only a December
+        # filer's is the December the label suggests
+        cutoff = values.get("end") or f"{year}-12-31"
+        prior = [c for d, c in by_date if d <= cutoff]
+        if not prior:
+            continue
+        price = float(prior[-1])
+        values["price"] = round(price, 4)
+        eps = vintage.get(cutoff)
+        if eps and eps > 0:
+            values["pe"] = round(price / float(eps), 2)
+        for key, book in (("pb", "bvps"), ("ptbv", "tbvps"), ("pncav", "ncavps")):
+            if values.get(book, 0) > 0:
+                values[key] = round(price / values[book], 2)
 
 
 def _price_stats_row(row: dict, closes) -> dict | None:
@@ -765,8 +1124,15 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
     _mark_peer_efficiency(rows)
     for row in rows:
         row.update(profiles.enrich(row))
+    for row in rows:
+        _price_the_ratio_history(row, closes_by_cik.get(row["cik"]) or [])
     for row in rows:  # engine-internal series with no reader in the payload
         row.pop("ttm_eps_vintage", None)
+        # the event scan is read by the notes above; the raw item codes would be
+        # a second, unrendered copy of what those notes already say
+        row.pop("filing_events", None)
+        row.pop("events_from", None)
+        row.pop("last_filing", None)   # read by apply_price, not by the panel
     payload = {"generated": store._now(), "engine_version": store.ENGINE_VERSION, "rows": rows}
     DASHBOARD_JSON.write_text(json.dumps(payload, separators=(",", ":")))
     store.set_state(conn, "last_export", store._now())
@@ -777,7 +1143,8 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
-                                        "derive", "export", "listing-age", "dera", "status"])
+                                        "derive", "export", "listing-age", "events",
+                                        "cover", "dera", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
@@ -796,6 +1163,10 @@ def main(argv=None) -> int:
         derive(conn)
     elif args.command == "listing-age":
         listing_age(conn)
+    elif args.command == "events":
+        events(conn)
+    elif args.command == "cover":
+        cover_pages(conn)
     elif args.command == "dera":
         dera_sync(conn, args.start)
     elif args.command == "export":

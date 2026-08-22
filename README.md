@@ -30,6 +30,7 @@ From the dashboard toolbar or the command line — same jobs either way:
 | `make bulk` | first full load: SEC's 1.4 GB archive, every US filer |
 | `make metadata` | sector, exchange, filer size from SEC's submissions archive |
 | `make daily` | refetch only companies that filed since the last run |
+| `make events` | material 8-K items — restatements, delisting notices, auditor changes |
 | `make export` | live quotes + 5y weekly closes, rebuild `dashboard.json` |
 | `make derive` | recompute snapshots after an engine change — no refetching |
 

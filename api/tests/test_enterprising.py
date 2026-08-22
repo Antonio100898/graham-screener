@@ -267,3 +267,31 @@ def test_negative_net_current_assets_fail_c3_even_with_debt_parts_missing():
     c = crit(r)[3]
     assert c.status == Status.FAIL
     assert "non-positive net current assets" in (c.note or "")
+
+
+def test_a_total_debt_rollup_smaller_than_its_own_parts_does_not_decide_criterion_3():
+    """PANL tags LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities on one
+    current line ($38.5M) while its own noncurrent debt is $235.6M in the same 10-Q
+    (0001628280-26-055365). A rollup smaller than the components it is supposed to contain
+    is not a total, and preferring it turned a 3.75x debt load into a 0.52x PASS."""
+    s = snap(current_assets=F("AssetsCurrent", 265944000),
+             current_liabilities=F("LiabilitiesCurrent", 192184000),
+             total_debt=F("LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+                          38521000),
+             long_term_debt=F("LongTermDebtAndCapitalLeaseObligations", 235638000),
+             short_term_debt=F("LongTermDebtCurrent", 41155000))
+    c3 = next(c for c in evaluate(s, None).criteria if c.criterion == 3)
+    assert c3.status is Status.FAIL
+    assert c3.value == Decimal("3.75")
+
+
+def test_a_rollup_larger_than_the_parts_still_wins():
+    """PKOH's combined tag is $652.6M against $22.6M of separately tagged parts: the parts
+    are the fragment there, and taking the larger keeps the criterion on the real figure."""
+    s = snap(current_assets=F("AssetsCurrent", 1000000000),
+             current_liabilities=F("LiabilitiesCurrent", 300000000),
+             total_debt=F("DebtAndCapitalLeaseObligations", 652600000),
+             long_term_debt=F("LongTermDebtNoncurrent", 15300000),
+             short_term_debt=F("LongTermDebtCurrent", 7300000))
+    c3 = next(c for c in evaluate(s, None).criteria if c.criterion == 3)
+    assert c3.value == Decimal("0.93") and c3.status is Status.PASS

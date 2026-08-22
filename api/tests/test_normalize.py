@@ -1014,14 +1014,21 @@ def test_stale_zero_on_priority_debt_tag_loses_to_newer_fact():
     assert "LongTermDebt" in s.long_term_debt.provenance.tag
 
 
-def test_equal_period_ends_keep_chain_priority_for_debt():
-    # counterexample: same period end on both tags -> the chain's ranking decides
+def test_at_one_date_the_larger_debt_figure_is_the_whole_one():
+    """Chain order used to break the tie, which let a footnote fragment outrank the
+    balance-sheet line: Carriage Services shipped 14.4M where its own LongTermDebt
+    reads 526,016,000 at the same date and LongTermDebtNoncurrent 5,411,000 is a
+    note (10-Q 0001016281-26-000055). Preferring the larger is safe because the
+    plain tag suppresses its own current twin from the short bucket."""
     gaap = dict(GAAP)
     gaap["LongTermDebtNoncurrent"] = tagdata("USD", [inst("2026-03-31", 30e9, accn="q126")])
     gaap["LongTermDebt"] = tagdata("USD", [inst("2026-03-31", 33e9, accn="q126")])
     s = build(gaap)
-    assert float(s.long_term_debt.value) == 30e9
-    assert s.long_term_debt.provenance.tag == "us-gaap:LongTermDebtNoncurrent"
+    assert float(s.long_term_debt.value) == 33e9
+    # ...and the plain tag's own current twin must not be counted a second time
+    assert "LongTermDebtCurrent" not in (
+        s.short_term_debt.provenance.tag if s.short_term_debt else "")
+    assert s.long_term_debt.provenance.tag == "us-gaap:LongTermDebt"
 
 
 def test_parent_only_liabilities_derivation_skips_nci():
@@ -1539,7 +1546,7 @@ def test_one_time_gain_is_disclosed_with_flipped_wording():
     gaap["GainLossOnInvestments"] = tagdata("USD", [
         dur("2026-01-01", "2026-03-31", 300e6, form="10-Q", accn="q126", filed="2026-05-05")])
     s = build(gaap)
-    note = next(n for n in s.earnings_quality if "investment gain" in n.lower())
+    note = next(n["text"] for n in s.earnings_quality if "investment gain" in n["text"].lower())
     assert "added to" in note  # positive gain BOOSTS income — opposite of a charge
 
 
@@ -1552,13 +1559,13 @@ def test_impairment_rollup_note_only_without_a_specific_line_gis_style():
         dur("2026-01-01", "2026-03-31", 302.9e6, form="10-Q", accn="q126", filed="2026-05-05")])
     gaap["GoodwillAndIntangibleAssetImpairment"] = tagdata("USD", [
         dur("2026-01-01", "2026-03-31", 1750e6, form="10-Q", accn="q126", filed="2026-05-05")])
-    notes = build(gaap).earnings_quality
+    notes = [n["text"] for n in build(gaap).earnings_quality]
     assert not any("rollup" in n or "Goodwill and intangible" in n for n in notes)
 
     gaap = dict(base)
     gaap["GoodwillAndIntangibleAssetImpairment"] = tagdata("USD", [
         dur("2026-01-01", "2026-03-31", 1750e6, form="10-Q", accn="q126", filed="2026-05-05")])
-    notes = build(gaap).earnings_quality
+    notes = [n["text"] for n in build(gaap).earnings_quality]
     assert any("goodwill and intangible impairment" in n.lower() for n in notes)
 
 
@@ -1568,7 +1575,7 @@ def test_warrant_remeasurement_note_claims_no_direction():
         tagdata("USD", [dur("2026-01-01", "2026-03-31", 1e9, form="10-Q", accn="q126", filed="2026-05-05")])
     gaap["FairValueAdjustmentOfWarrants"] = tagdata("USD", [
         dur("2026-01-01", "2026-03-31", 200e6, form="10-Q", accn="q126", filed="2026-05-05")])
-    note = next(n for n in build(gaap).earnings_quality if "warrant" in n.lower())
+    note = next(n["text"] for n in build(gaap).earnings_quality if "warrant" in n["text"].lower())
     assert "cannot settle" in note
     assert "added to" not in note and "reduced" not in note
 
@@ -2099,3 +2106,686 @@ def test_a_small_warrant_overhang_says_nothing():
     gaap["ClassOfWarrantOrRightNumberOfSecuritiesCalledByWarrantsOrRights"] = tagdata(
         "shares", [inst("2026-03-31", 100e6, accn="q126")])   # 1% of the count
     assert not any("Warrants call for" in n for n in texts(build(gaap)))
+
+
+# --- the deferred tax footnote: the company's own opinion of its earning power ---
+
+def annual_10k(tag, values, gaap):
+    """One fiscal-year duration series, as a 10-K states it."""
+    gaap[tag] = tagdata("USD", [
+        dur(f"{y}-01-01", f"{y}-12-31", v, accn=f"k{y}", filed=f"{y + 1}-02-15")
+        for y, v in values.items()])
+    return gaap
+
+
+def deferred_tax_gaap(**tags):
+    """Base facts with a profitable FY2025, plus whatever the footnote says."""
+    gaap = dict(GAAP)
+    annual_10k("NetIncomeLoss", {2024: 800e6, 2025: 1000e6}, gaap)
+    for tag, entries in tags.items():
+        gaap[tag] = tagdata("USD", entries)
+    return gaap
+
+
+def k25(end, val):
+    return inst(end, val, form="10-K", accn="k25", filed="2026-02-15")
+
+
+def test_a_full_valuation_allowance_beside_profits_is_disclosed():
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[k25("2025-12-31", 60e9)],
+        DeferredTaxAssetsValuationAllowance=[k25("2025-12-31", 45e9)],
+    )
+    note = next(n for n in texts(build(gaap)) if "valuation allowance" in n)
+    assert "75%" in note and "1,000M" in note
+
+
+def test_coca_colas_allowance_is_a_seventh_of_its_deferred_assets():
+    """KO reserves 388M against 5,514M at 2025-12-31 — the ordinary case, and
+    the counterexample that keeps the note from firing on every filer."""
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[k25("2025-12-31", 5514e6)],
+        DeferredTaxAssetsValuationAllowance=[k25("2025-12-31", 388e6)],
+    )
+    assert not any("valuation allowance" in n for n in texts(build(gaap)))
+
+
+def test_valaris_reserves_more_than_the_gross_tag_admits_to():
+    """VAL tags a 1,368M 'gross' deferred tax asset and a 3,292M allowance
+    against it. An allowance cannot exceed what it reserves against, so the two
+    tags are not describing one thing and neither is reported."""
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[k25("2025-12-31", 1368e6)],
+        DeferredTaxAssetsValuationAllowance=[k25("2025-12-31", 3292e6)],
+    )
+    assert not any("valuation allowance" in n for n in texts(build(gaap)))
+
+
+def test_the_net_tag_rebuilds_a_base_the_gross_tag_cannot_supply():
+    """Biogen's gross tag stopped in 2021 while its allowance is current. Net
+    plus allowance is the same balance sheet's own arithmetic."""
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[inst("2021-06-30", 945e6, form="10-K", accn="k21",
+                                     filed="2021-08-01")],
+        DeferredTaxAssetsNet=[k25("2025-12-31", 30e9)],
+        DeferredTaxAssetsValuationAllowance=[k25("2025-12-31", 40e9)],
+    )
+    note = next(n for n in texts(build(gaap)) if "valuation allowance" in n)
+    assert "70,000M" in note and "57%" in note
+
+
+def test_allowance_and_base_must_share_a_balance_sheet_date():
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[k25("2025-12-31", 60e9)],
+        DeferredTaxAssetsValuationAllowance=[
+            inst("2025-09-30", 45e9, form="10-Q", accn="q325", filed="2025-11-01")],
+    )
+    assert not any("valuation allowance" in n for n in texts(build(gaap)))
+
+
+def test_a_loss_making_filer_gets_no_allowance_note():
+    """A company with no profits is expected to reserve its tax assets; the
+    contradiction only exists when it is earning money and still reserving."""
+    gaap = deferred_tax_gaap(
+        DeferredTaxAssetsGross=[k25("2025-12-31", 60e9)],
+        DeferredTaxAssetsValuationAllowance=[k25("2025-12-31", 45e9)],
+    )
+    annual_10k("NetIncomeLoss", {2024: -500e6, 2025: -900e6}, gaap)
+    assert not any("valuation allowance" in n for n in texts(build(gaap)))
+
+
+def test_a_tax_charge_that_was_not_paid_is_disclosed():
+    """Service Corp's FY2025 charge of 191M against 171M reported: the current
+    half was a refund."""
+    gaap = deferred_tax_gaap()
+    annual_10k("IncomeTaxExpenseBenefit", {2025: 170.9e6}, gaap)
+    annual_10k("DeferredIncomeTaxExpenseBenefit", {2025: 191.5e6}, gaap)
+    note = next(n for n in texts(build(gaap)) if "deferred" in n and "income tax charge" in n)
+    assert "112%" in note and "21M refund" in note
+
+
+def test_an_ordinary_deferred_share_says_nothing():
+    """KO's FY2025: 517M deferred inside a 2,861M charge."""
+    gaap = deferred_tax_gaap()
+    annual_10k("IncomeTaxExpenseBenefit", {2025: 2861e6}, gaap)
+    annual_10k("DeferredIncomeTaxExpenseBenefit", {2025: 517e6}, gaap)
+    assert not any("income tax charge" in n for n in texts(build(gaap)))
+
+
+def test_a_tax_footnote_older_than_the_earnings_record_is_not_reported():
+    gaap = deferred_tax_gaap()
+    annual_10k("IncomeTaxExpenseBenefit", {2021: 100e6}, gaap)
+    annual_10k("DeferredIncomeTaxExpenseBenefit", {2021: 95e6}, gaap)
+    assert not any("income tax charge" in n for n in texts(build(gaap)))
+
+
+def test_a_deferred_amount_immaterial_to_earnings_says_nothing():
+    gaap = deferred_tax_gaap()
+    annual_10k("IncomeTaxExpenseBenefit", {2025: 10e6}, gaap)
+    annual_10k("DeferredIncomeTaxExpenseBenefit", {2025: 9e6}, gaap)   # 0.9% of net income
+    assert not any("income tax charge" in n for n in texts(build(gaap)))
+
+
+# --- splits: one corporate action, one factor, corroborated by the share count ---
+
+def _yr(year, val, filed, accn):
+    return dur(f"{year}-01-01", f"{year}-12-31", val, accn=accn, filed=filed)
+
+
+def _shares(year, val, filed, accn):
+    return dur(f"{year}-01-01", f"{year}-12-31", val, accn=accn, filed=filed)
+
+
+def test_one_split_restated_past_three_quarters_is_still_one_split():
+    """Lam Research's 10:1 of October 2024 reaches Company Facts one comparative at a
+    time — 2024-10-28, 2025-01-31, 2025-04-25, then the FY2025 10-K of 2025-08-11, 287
+    days after the run began. Anchoring the run to its first filing rather than its
+    latest observation books a second 10:1, and FY2022 — which no filing ever restated,
+    because it had fallen out of the comparative window — came out divided by 100."""
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        _yr(2022, 32.75, "2024-08-29", "k24"), _yr(2023, 33.21, "2024-08-29", "k24"),
+        _yr(2023, 3.32, "2025-08-11", "k25"), _yr(2024, 2.90, "2025-08-11", "k25"),
+        dur("2022-09-26", "2022-12-25", 12.00, form="10-Q", accn="qa", filed="2023-01-25"),
+        dur("2022-09-26", "2022-12-25", 1.20, form="10-Q", accn="qa2", filed="2024-10-28"),
+        dur("2022-12-26", "2023-03-26", 13.00, form="10-Q", accn="qb", filed="2023-04-26"),
+        dur("2022-12-26", "2023-03-26", 1.30, form="10-Q", accn="qb2", filed="2025-01-31"),
+        dur("2023-03-27", "2023-06-25", 14.00, form="10-Q", accn="qc", filed="2023-07-26"),
+        dur("2023-03-27", "2023-06-25", 1.40, form="10-Q", accn="qc2", filed="2025-04-25"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        _shares(2023, 132e6, "2024-08-29", "k24"), _shares(2023, 1320e6, "2025-08-11", "k25"),
+    ])
+    s = build(gaap)
+    assert round(float(s.annual_eps[2022].value), 4) == 3.275   # 32.75 / 10, never / 100
+    assert float(s.annual_eps[2023].value) == 3.32
+
+
+def test_a_cent_level_revision_is_not_a_split():
+    """Idaho Copper restated a -0.02 quarter to -0.01. The ratio lands on a split
+    candidate, but a one-cent move on a two-cent figure is rounding, and the engine
+    rescaled the company's whole pre-2021 record by a third."""
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        _yr(2013, -0.11, "2015-03-30", "k14"),
+        dur("2020-01-01", "2020-03-31", -0.02, form="10-Q", accn="qa", filed="2020-05-10"),
+        dur("2020-01-01", "2020-03-31", -0.01, form="10-Q", accn="qa2", filed="2021-05-10"),
+        _yr(2024, -0.03, "2025-03-30", "k24"),
+    ])
+    assert float(build(gaap).annual_eps[2013].value) == -0.11
+
+
+def test_another_registrants_statements_are_not_a_split():
+    """Essential Utilities' own 10-K reports FY2024 diluted EPS of 2.17 on 274.4M shares.
+    An 8-K filed under the same CIK carries a different entity's audited statements: 5.39
+    on 195M shares. The earnings ratio lands within 0.7% of a 1-for-2.5 reverse split; the
+    share counts moved 1.41x and refute it outright."""
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        _yr(2024, 2.17, "2026-02-26", "k25"), _yr(2025, 2.20, "2026-02-26", "k25"),
+        _yr(2024, 5.39, "2026-03-25", "8k"), _yr(2025, 5.69, "2026-03-25", "8k"),
+    ])
+    gaap["EarningsPerShareDiluted"]["units"]["USD/shares"][2]["form"] = "8-K"
+    gaap["EarningsPerShareDiluted"]["units"]["USD/shares"][3]["form"] = "8-K"
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        _shares(2024, 274421000, "2026-02-26", "k25"),
+        dict(_shares(2024, 195000000, "2026-03-25", "8k"), form="8-K"),
+    ])
+    s = build(gaap)
+    assert float(s.annual_eps[2025].value) == 2.20   # not 5.50
+    assert float(s.annual_eps[2024].value) == 2.17
+
+
+def test_a_partnership_never_divides_the_whole_groups_profit_by_its_own_units():
+    """Westlake Chemical Partners consolidates an OpCo whose sponsor owns two thirds of
+    it. The corporate equity pair the guard reads does not exist for a partnership: WLKP
+    files PartnersCapital 253.7M inside 769.4M including the minority. FY2019 ProfitLoss
+    is 332,895k against 60,981k attributable to unitholders on 34,488,058 units, and the
+    10-K reports $1.77 a unit (accn 0001604665-22-000009), not the $9.65 that shipped."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["ProfitLoss"] = tagdata("USD", [
+        dur("2019-01-01", "2019-12-31", 332_895_000, accn="k21", filed="2022-03-02")])
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2019-01-01", "2019-12-31", 60_981_000, accn="k21", filed="2022-03-02")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2019-01-01", "2019-12-31", 34_488_058, accn="k21", filed="2022-03-02")])
+    gaap["PartnersCapital"] = tagdata("USD", [inst("2026-03-31", 253_713_000, accn="q126")])
+    gaap["PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest"] = tagdata(
+        "USD", [inst("2026-03-31", 769_413_000, accn="q126")])
+    eps = build(gaap).annual_eps[2019]
+    assert round(float(eps.value), 2) == 1.77
+
+
+def test_a_canadian_filers_earnings_are_not_read_as_dollars():
+    """Enbridge, Canadian Pacific and Imperial Oil tag earnings per share only in
+    CAD/shares. Taking whatever unit came first divided a New York price by a Canadian
+    figure and understated every P/E by the exchange rate."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    gaap["EarningsPerShareDiluted"] = tagdata("CAD/shares", [
+        dur("2025-01-01", "2025-12-31", 3.22, accn="k25", filed="2026-02-15")])
+    s = build(gaap)
+    assert s.annual_eps == {} and s.ttm_eps is None
+
+
+def test_a_lease_book_does_not_stand_in_for_a_companys_borrowings():
+    """Ford's noncurrent debt element went stale in 2020, leaving a $754M finance
+    lease as the only fresh long-term figure and criterion 3 passing at 0.09x. Its
+    interest bill is $1,254M — 166% of the lease principal, which no lease produces."""
+    gaap = dict(GAAP)
+    gaap["FinanceLeaseLiabilityNoncurrent"] = tagdata("USD", [
+        inst("2025-12-31", 754e6, form="10-K", accn="k25", filed="2026-02-11")])
+    gaap["InterestExpense"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 1254e6, accn="k25", filed="2026-02-11")])
+    assert build(gaap).long_term_debt is None
+
+
+def test_a_debt_free_filers_lease_is_still_its_debt():
+    """Vertex, Incyte, MongoDB and Plexus all carry a lease-only bucket and no
+    borrowings; their interest is a fraction of the principal and the figure stands."""
+    gaap = dict(GAAP)
+    gaap["FinanceLeaseLiabilityNoncurrent"] = tagdata("USD", [
+        inst("2025-12-31", 106.7e6, form="10-K", accn="k25", filed="2026-02-11")])
+    gaap["InterestExpense"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 13.3e6, accn="k25", filed="2026-02-11")])
+    ltd = build(gaap).long_term_debt
+    assert ltd is not None and float(ltd.value) == 106700000.0
+
+
+def test_the_cover_names_which_share_class_the_ticker_is():
+    """Hershey reports earnings per share for its Common Stock and its Class B in the
+    same filing. Company Facts drops both because they are dimensioned, and the
+    ambiguity rule refuses both because there are two — so its series stopped in 2014
+    and criterion 4 was decided on a decade-old window. The cover of its own filing
+    names the one the symbol registers: "Common Stock, one dollar par value"."""
+    facts = facts_doc({k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"})
+    dimensioned = {"facts": {"us-gaap": {"EarningsPerShareDiluted": {"units": {"USD/shares": [
+        dict(dur("2025-01-01", "2025-12-31", 4.34, accn="k25", filed="2026-02-15"),
+             segments="ClassOfStock=CommonStock"),
+        dict(dur("2025-01-01", "2025-12-31", 4.05, accn="k25", filed="2026-02-15"),
+             segments="ClassOfStock=CommonClassB"),
+    ]}}}}}
+    blind = build_snapshot("HSY", "0000047111", facts, dimensioned=dimensioned)
+    assert 2025 not in blind.annual_eps, "two classes and no cover: the refusal must stand"
+
+    told = build_snapshot("HSY", "0000047111", facts, dimensioned=dimensioned,
+                          receipt={"title": "Common Stock, one dollar par value"})
+    assert float(told.annual_eps[2025].value) == 4.34
+
+    # a cover naming a class that matches neither member changes nothing
+    other = build_snapshot("HSY", "0000047111", facts, dimensioned=dimensioned,
+                           receipt={"title": "Class C Capital Stock"})
+    assert 2025 not in other.annual_eps
+
+
+def test_a_convertible_preferred_is_disclosed_and_not_added_to_the_count():
+    """Graham counts shares "including the conversion of preferred" (table 18.6), but the
+    tag carries conversions already done as well as conversions still to come, and the
+    preferred count that separates them is filed under a class axis. So the overhang is
+    stated and the denominator left alone — Structure Therapeutics' 67.0M sit inside its
+    71.2M common already, and adding them would have restated every per-share figure."""
+    gaap = dict(GAAP)
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [inst("2026-03-31", 20e9, accn="q126")])
+    gaap["PreferredStockLiquidationPreferenceValue"] = tagdata("USD", [
+        inst("2026-03-31", 5e9, accn="q126")])
+    gaap["ConvertiblePreferredStockSharesIssuedUponConversion"] = tagdata("shares", [
+        inst("2026-03-31", 4e9, accn="q126")])
+    s = build(gaap)
+    assert float(s.shares_outstanding.value) == 20e9          # untouched
+    assert float(s.preferred_stock.value) == 5e9              # still a senior claim
+    note = next(n for n in s.context_notes if n["kind"] == "Convertible preferred")
+    assert "4,000.0M shares" in note["text"] and "20,000.0M common" in note["text"]
+    assert "capitalisation note" in note["text"]              # names the document to read
+
+
+def test_a_small_conversion_right_is_not_worth_a_note():
+    """The same 5% floor the warrant note uses: an overhang that cannot move a
+    per-share figure meaningfully is noise on the page, not a disclosure."""
+    gaap = dict(GAAP)
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [inst("2026-03-31", 20e9, accn="q126")])
+    gaap["ConvertiblePreferredStockSharesIssuedUponConversion"] = tagdata("shares", [
+        inst("2026-03-31", 1e8, accn="q126")])          # 0.5%
+    s = build(gaap)
+    assert not any(n["kind"] == "Convertible preferred" for n in s.context_notes)
+
+
+JUNE_FILER = {
+    # a Microsoft-shaped calendar: fiscal 2025 closes 2025-06-30, its 10-K lands
+    # in August, and fiscal 2026 closes a year later
+    "EarningsPerShareDiluted": tagdata("USD/shares", [
+        dur("2023-07-01", "2024-06-30", 11.0, accn="k24", filed="2024-08-01"),
+        dur("2024-07-01", "2025-06-30", 13.0, accn="k25", filed="2025-08-01"),
+        dur("2025-07-01", "2026-06-30", 15.0, accn="k26", filed="2026-08-01"),
+        # the quarters a reader standing on 2026-06-30 could already see
+        dur("2025-07-01", "2025-09-30", 3.5, form="10-Q", accn="q126", filed="2025-10-25"),
+        dur("2024-07-01", "2024-09-30", 3.0, form="10-Q", accn="q125", filed="2024-10-25"),
+    ]),
+    "Assets": tagdata("USD", [
+        inst("2024-06-30", 460e9, form="10-K", accn="k24", filed="2024-08-01"),
+        inst("2025-06-30", 500e9, form="10-K", accn="k25", filed="2025-08-01"),
+        inst("2026-06-30", 560e9, form="10-K", accn="k26", filed="2026-08-01"),
+    ]),
+}
+
+
+def test_fiscal_years_end_when_the_company_says_they_do():
+    """Microsoft's fiscal 2026 closed 2026-06-30. Reading it as 2026-12-31 asked the
+    price history for a December that has not arrived, so the newest P/E column was
+    blank for 206 companies, and every older column divided a June balance sheet
+    into the following December's market."""
+    from screener.normalize import fiscal_year_ends
+    ends = fiscal_year_ends(JUNE_FILER)
+    assert ends[2025] == "2025-06-30"
+    assert ends[2026] == "2026-06-30"
+
+
+def test_vintage_earnings_are_cut_at_those_same_ends():
+    """One helper feeds both series, so the keys cannot drift apart — and the newest
+    fiscal year now HAS a figure, which is what the blank column was missing."""
+    from screener.normalize import vintage_ttm_eps
+    v = {d: float(x) for d, x in vintage_ttm_eps(JUNE_FILER).items()}
+    assert "2026-06-30" in v          # the year the December cutoff could not reach
+    # no look-ahead: the FY2026 10-K was filed in August, so a reader on 2026-06-30
+    # had only the trailing four quarters through Q1 — 13.0 + 3.5 - 3.0
+    assert v["2026-06-30"] == 13.5
+    assert not any(d.endswith("-12-31") for d in v)
+
+
+def _dimensioned(entries):
+    return {"facts": {"us-gaap": {"PreferredStockSharesOutstanding": tagdata("shares", entries)}}}
+
+
+CONVERTING = dict(GAAP) | {
+    "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 20e9, accn="q126")]),
+    "ConvertiblePreferredStockSharesIssuedUponConversion": tagdata("shares", [
+        inst("2026-03-31", 4e9, accn="q126")]),
+}
+
+
+def test_a_preferred_that_already_converted_raises_no_warning():
+    """Company Facts drops the preferred count because it is filed on a share-class
+    axis; the DERA datasets keep the axis. Structure Therapeutics' 67.0M is its IPO
+    conversion, already inside the common count — nothing to disclose."""
+    s = build_snapshot("TEST", "0000000001", facts_doc(CONVERTING),
+                       dimensioned=_dimensioned([
+                           inst("2026-03-31", 0, form="10-K", accn="k25")
+                           | {"segments": "ClassOfStock=SeriesAConvertiblePreferred;"}]))
+    assert not any(n["kind"] == "Convertible preferred" for n in s.context_notes)
+
+
+def test_a_live_preferred_is_named_with_what_is_outstanding():
+    """Every class is summed rather than chosen: whether the conversion is still
+    ahead of the company does not depend on which series it sits in."""
+    s = build_snapshot("TEST", "0000000001", facts_doc(CONVERTING),
+                       dimensioned=_dimensioned([
+                           inst("2026-03-31", 30000, form="10-K", accn="k25")
+                           | {"segments": "ClassOfStock=SeriesA;"},
+                           inst("2026-03-31", 1333, form="10-K", accn="k25")
+                           | {"segments": "ClassOfStock=SeriesB;"}]))
+    note = next(n for n in s.context_notes if n["kind"] == "Convertible preferred")
+    assert "31,333 preferred shares are still outstanding" in note["text"]
+
+
+def test_a_total_beside_its_own_classes_is_not_added_to_them():
+    """A filer that tags both the rollup and the parts would otherwise double."""
+    s = build_snapshot("TEST", "0000000001", facts_doc(CONVERTING),
+                       dimensioned=_dimensioned([
+                           inst("2026-03-31", 31333, form="10-K", accn="k25"),
+                           inst("2026-03-31", 30000, form="10-K", accn="k25")
+                           | {"segments": "ClassOfStock=SeriesA;"},
+                           inst("2026-03-31", 1333, form="10-K", accn="k25")
+                           | {"segments": "ClassOfStock=SeriesB;"}]))
+    note = next(n for n in s.context_notes if n["kind"] == "Convertible preferred")
+    assert "31,333 preferred shares are still outstanding" in note["text"]
+
+
+def test_no_preferred_count_on_file_says_so_rather_than_guessing():
+    """The filers DERA does not reach keep the weaker note, not a wrong answer."""
+    s = build(CONVERTING)
+    note = next(n for n in s.context_notes if n["kind"] == "Convertible preferred")
+    assert "no preferred count is on file" in note["text"]
+
+
+def test_options_outstanding_are_read_against_the_count_they_dilute():
+    """A share count says who owns the company today; the option pool says how much
+    of it is already promised to someone else."""
+    gaap = dict(GAAP) | {
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 100e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber":
+            tagdata("shares", [inst("2026-03-31", 6e6, accn="q126")]),
+    }
+    s = build(gaap)
+    assert float(s.options_outstanding.value) == 6e6
+
+
+def test_a_filer_that_grants_no_options_reports_none_rather_than_zero():
+    """Apple, Microsoft and Nvidia tag no option count in Company Facts or in the
+    quarterly datasets — they grant restricted stock. §5.1: that is silence about
+    options, and a panel showing 0% would be asserting something no filing says."""
+    s = build(GAAP)
+    assert s.options_outstanding is None
+
+
+def test_restricted_stock_joins_the_options_in_one_overhang():
+    """Both promise shares to employees and dilute the same holders, so they are one
+    figure. What differs is that an option needs a rising price to be worth anything
+    and a restricted share does not."""
+    gaap = dict(GAAP) | {
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 100e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber":
+            tagdata("shares", [inst("2026-03-31", 6e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardEquityInstrumentsOtherThanOptionsNonvestedNumber":
+            tagdata("shares", [inst("2026-03-31", 3e6, accn="q126")]),
+    }
+    s = build(gaap)
+    assert float(s.options_outstanding.value) == 6e6
+    assert float(s.rsus_outstanding.value) == 3e6
+
+
+def test_each_award_kind_is_judged_against_the_share_count_on_its_own():
+    """A mis-tagged options figure must not take a sound RSU figure down with it."""
+    gaap = dict(GAAP) | {
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 10e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber":
+            tagdata("shares", [inst("2026-03-31", 3.2e9, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardEquityInstrumentsOtherThanOptionsNonvestedNumber":
+            tagdata("shares", [inst("2026-03-31", 1e6, accn="q126")]),
+    }
+    s = build(gaap)
+    assert s.options_outstanding is None
+    assert float(s.rsus_outstanding.value) == 1e6
+
+
+def test_an_option_pool_bigger_than_the_company_is_a_tagging_error():
+    """Greenlane's pool reads 235,000 one quarter and 235,000,000 the next, and
+    Zerocarbon reports 3.2bn options against 10.4M shares. A company cannot have
+    granted away more than all of itself, so the figure is withheld rather than
+    shipped as a 31,000% overhang."""
+    gaap = dict(GAAP) | {
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 10e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber":
+            tagdata("shares", [inst("2026-03-31", 3.2e9, accn="q126")]),
+    }
+    assert build(gaap).options_outstanding is None
+
+
+def test_a_pool_that_fits_inside_the_count_is_kept():
+    """The guard is a ceiling on the absurd, not a haircut on real dilution: at the
+    99th percentile a genuine overhang is still 72%."""
+    gaap = dict(GAAP) | {
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-03-31", 10e6, accn="q126")]),
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardOptionsOutstandingNumber":
+            tagdata("shares", [inst("2026-03-31", 7.2e6, accn="q126")]),
+    }
+    assert float(build(gaap).options_outstanding.value) == 7.2e6
+
+
+def test_an_eps_its_own_filing_contradicts_is_replaced():
+    """The Eastern Company's 2022 10-K tags $1.76 against fiscal 2020 while leaving
+    that year's income and share count untouched at $5,405,522 on 6,264,521 shares —
+    $0.86. A per-share figure moving while the two numbers it is made of stand still
+    is a mis-tag wearing a restatement's clothes, and it withheld Eastern's P/E."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2019-12-29", "2021-01-02", 0.86, accn="k20", filed="2021-03-16"),
+            dur("2019-12-29", "2021-01-02", 1.76, accn="k21", filed="2022-03-17"),
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2019-12-29", "2021-01-02", 5405522, accn="k20", filed="2021-03-16"),
+            dur("2019-12-29", "2021-01-02", 5405522, accn="k21", filed="2022-03-17"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2019-12-29", "2021-01-02", 6264521, accn="k20", filed="2021-03-16"),
+            dur("2019-12-29", "2021-01-02", 6264521, accn="k21", filed="2022-03-17"),
+        ]),
+    }
+    from screener.normalize import _annual_eps
+    assert float(_annual_eps(gaap)[2020].value) == 0.86
+
+
+def test_a_real_restatement_moves_the_income_with_it_and_is_kept():
+    """Gyre's fiscal 2022 went from -$8.2M on 31.5M shares to +$4.3M on 75.7M after a
+    reverse merger. Both inputs moved, so the newer per-share figure supersedes the
+    older one and must survive — the check only fires when they stand still."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2022-01-01", "2022-12-31", -0.26, accn="k22", filed="2023-03-30"),
+            dur("2022-01-01", "2022-12-31", 0.03, accn="k23", filed="2024-03-27"),
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2022-01-01", "2022-12-31", -8242000, accn="k22", filed="2023-03-30"),
+            dur("2022-01-01", "2022-12-31", 4314000, accn="k23", filed="2024-03-27"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2022-01-01", "2022-12-31", 31545723, accn="k22", filed="2023-03-30"),
+            dur("2022-01-01", "2022-12-31", 75686406, accn="k23", filed="2024-03-27"),
+        ]),
+    }
+    from screener.normalize import _annual_eps
+    assert float(_annual_eps(gaap)[2022].value) == 0.03
+
+
+def test_a_preferred_dividend_is_not_a_contradiction():
+    """Markel's fiscal 2020 EPS of $55.63 divides to $59.03 on its own net income,
+    and the $47M gap is its preferred dividend — earnings per share is struck on
+    income available to the common. The same abstention `_basis_conflict` makes."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2020-01-01", "2020-12-31", 55.63, accn="k20", filed="2021-02-19")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2020-01-01", "2020-12-31", 816030000, accn="k20", filed="2021-02-19")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2020-01-01", "2020-12-31", 13823000, accn="k20", filed="2021-02-19")]),
+        "PreferredStockDividendsAndOtherAdjustments": tagdata("USD", [
+            dur("2020-01-01", "2020-12-31", 47060000, accn="k20", filed="2021-02-19")]),
+    }
+    from screener.normalize import _annual_eps
+    assert float(_annual_eps(gaap)[2020].value) == 55.63
+
+
+def test_an_abandoned_tag_does_not_outrank_the_element_that_replaced_it():
+    """Energy Transfer moved its redeemable minority interest to the `Other` element
+    after 2025-12-31 and left the old one on file. Reading the old one first put
+    $250M into a June balance sheet whose printed page says $256M, and the
+    difference came straight off common equity. Newer wins."""
+    gaap = dict(GAAP) | {
+        "MinorityInterest": tagdata("USD", [
+            inst("2026-06-30", 15191e6, accn="q226", filed="2026-08-06")]),
+        # abandoned mid-history, still within the staleness window
+        "RedeemableNoncontrollingInterestEquityCarryingAmount": tagdata("USD", [
+            inst("2025-12-31", 250e6, form="10-K", accn="k25", filed="2026-02-19")]),
+        "RedeemableNoncontrollingInterestEquityOtherCarryingAmount": tagdata("USD", [
+            inst("2026-06-30", 256e6, accn="q226", filed="2026-08-06")]),
+    }
+    s = build(gaap)
+    assert float(s.noncontrolling_interest.value) == 15191e6 + 256e6
+    assert s.noncontrolling_interest.provenance.period_end.isoformat() == "2026-06-30"
+
+
+def test_a_total_still_wins_over_its_own_components_at_one_date():
+    """A rollup is the whole; the components on file may be a fragment of it. Only
+    a newer date displaces it — UDR tags a component equal to its own total."""
+    gaap = dict(GAAP) | {
+        "MinorityInterest": tagdata("USD", [
+            inst("2026-06-30", 100e6, accn="q226", filed="2026-08-06")]),
+        "RedeemableNoncontrollingInterestEquityCarryingAmount": tagdata("USD", [
+            inst("2026-06-30", 80e6, accn="q226", filed="2026-08-06")]),
+        "RedeemableNoncontrollingInterestEquityCommonCarryingAmount": tagdata("USD", [
+            inst("2026-06-30", 30e6, accn="q226", filed="2026-08-06")]),
+    }
+    s = build(gaap)
+    assert float(s.noncontrolling_interest.value) == 180e6      # total, not the part
+
+
+def test_the_parents_own_profit_outranks_a_longer_group_series():
+    """Starwood Property Trust files fourteen years of NetIncomeLoss — $411.5M, what
+    its printed income statement calls "Net income attributable to Starwood Property
+    Trust" — beside sixteen years of ProfitLoss, the group's $443.1M including the
+    minority holders. Ranking by depth let two extra years of history swap one for
+    the other, and every margin and per-share figure then divided profit the
+    shareholders do not own."""
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 411.5e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2012, 2026)]),
+        "ProfitLoss": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 443.1e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2010, 2026)]),
+    }
+    from screener.normalize import _annual_net_income
+    series = _annual_net_income(gaap)
+    assert float(series[2025].value) == 411.5e6
+    assert "NetIncomeLoss" in series[2025].provenance.tag
+
+
+def test_a_dead_parent_series_still_yields_to_a_live_group_one():
+    """Advanced Energy's NetIncomeLoss stops while ProfitLoss runs on. Recency is
+    still decided first: a figure of the right scope that stopped years ago is
+    worse than a live one of the wrong scope, which is at least disclosed."""
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 100e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2015, 2024)]),
+        "ProfitLoss": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 120e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2015, 2026)]),
+    }
+    from screener.normalize import _annual_net_income
+    assert float(_annual_net_income(gaap)[2025].value) == 120e6
+
+
+def test_revenue_takes_the_total_over_its_own_contract_component():
+    """Ovintiv files $8,663M of contract revenue beside $8,908M of `Revenues`, and
+    its income statement prints the second as "Total Revenues" — the difference is
+    revenue that did not come from a contract with a customer."""
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 8663e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+        "Revenues": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 8908e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 8908e6
+
+
+def test_and_the_other_way_round_when_the_umbrella_tag_is_the_narrow_one():
+    """Ares files the reverse: $5,601M of contract revenue against a $4,756M
+    `Revenues` covering less than its own statement's "Total revenues". Whichever
+    element holds the bigger figure is the total; the other is a piece of it."""
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 5601482e3, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+        "Revenues": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 4755618e3, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 5601482e3
+
+
+def test_sales_tax_collected_for_the_state_is_never_revenue():
+    """The comparison is only ever between a total and its own part. The assessed-tax
+    pair does not stand in that relation, and taking the larger of THOSE would count
+    sales taxes collected for the state as the company's own revenue."""
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 1000e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+        "RevenueFromContractWithCustomerIncludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 1080e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 1000e6
+
+
+def test_a_brokers_top_line_is_revenue_net_of_interest_expense():
+    """Interactive Brokers reports $7,782M of gross interest income against $6,205M
+    of revenue net of interest expense — the figure its own income statement totals
+    to. The component is the larger of the two, so no comparison by size can rank
+    them; the concepts do it."""
+    gaap = {
+        "InterestIncomeOperating": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 7782e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2018, 2026)]),
+        "RevenuesNetOfInterestExpense": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 6205e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    series = _annual_revenue(gaap)
+    assert float(series[2025].value) == 6205e6
+
+
+def test_interest_income_still_stands_where_there_is_no_net_line():
+    """A filer that reports interest income and nothing wider keeps it: the rule
+    replaces a component with its own total, never with nothing."""
+    gaap = {
+        "InterestIncomeOperating": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 500e6, accn=f"k{y}", filed=f"{y+1}-02-15")
+            for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 500e6

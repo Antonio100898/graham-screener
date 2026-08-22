@@ -7,6 +7,7 @@ profile to which a company belongs and (b) the evidence currently available.
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .ch13 import _avg3
@@ -20,6 +21,8 @@ _MIN_WINDOW_YEARS = 5
 # By this year every dividend payer tagged its payments, so a filing year with
 # earnings and no dividend fact is a year the company did not pay.
 _DIVIDEND_TAGGING_RELIABLE = 2013
+# a margin that has given up this much of itself is the business getting harder
+_MARGIN_DECLINE = 0.33
 
 PROFILE_OPERATING = "OPERATING"
 PROFILE_UTILITY = "UTILITY"
@@ -167,6 +170,88 @@ def _enterprising(row: dict, profile: str) -> dict:
     return result
 
 
+def margin_note(row: dict) -> str | None:
+    """A margin that has given up a third of itself over the record."""
+    m = row.get("profitability") or {}
+    series = {int(y): v for y, v in (m.get("by_year") or {}).items()}
+    if len(series) < 6:
+        return None
+    latest = max(series)
+    earlier = max(y for y in series if y <= latest - 5)
+    then, now = series[earlier], series[latest]
+    if then < 2 or now >= then * (1 - _MARGIN_DECLINE):
+        return None
+    return (f"Net margin has fallen from {then:.1f}% of sales in FY{earlier} to {now:.1f}% in "
+            f"FY{latest}. Graham counts profitability as net profit against sales, and a margin "
+            "eroding while the earnings still look adequate is the business getting harder, not "
+            "the accounting changing.")
+
+
+def depositary_note(row: dict) -> str | None:
+    """What the cover said, once it has been read.
+
+    The sentence is quoted rather than summarised: a ratio parsed out of prose is
+    only as good as the parse, and showing the filer's own words lets a reader
+    check it at a glance instead of trusting it.
+    """
+    receipt = row.get("receipt") or {}
+    if receipt.get("title") is None:
+        return None
+    where = receipt.get("accn") or "the latest annual filing"
+    if not receipt["title"]:
+        return (f"The cover of {where} names this symbol and tags no class title, so there is no "
+                "depositary ratio or second class to read there: the share count in the "
+                "statements is the one the price belongs to.")
+    if not receipt.get("ratio"):
+        return (f"The cover of {where} registers this symbol as \u201c{receipt['title']}\u201d — "
+                "one class, no depositary ratio, so the share count in the statements is the "
+                "one the price belongs to.")
+    return (f"The cover of {where} registers this symbol as \u201c{receipt['title']}\u201d. Every "
+            f"per-share figure here is therefore stated per receipt: the share count is the "
+            f"ordinary count divided by {receipt['ratio']}, and earnings, book value and "
+            "dividends are multiplied by it, so the price and the figures it is compared "
+            "against describe one security.")
+
+
+def foreign_listing_note(row: dict) -> str | None:
+    """A foreign issuer's US listing may be a depositary receipt, and the ratio
+    between the receipt and the ordinary shares is not in any data this screener
+    reads.
+
+    One ADS stands for a fixed number of ordinary shares — thirteen for Onconova,
+    two thousand for Akari. The price on this page is per receipt, because that is
+    what trades; the share count comes from the financial statements, which count
+    ordinary shares. Market capitalisation, P/E, P/B and P/NCAV all divide the two
+    together, so all four are wrong by the ratio wherever a receipt is what you buy.
+
+    The ratio is stated in prose on the filing cover — "each American Depositary
+    Share represents thirteen ordinary shares" — and prose is exactly what an XBRL
+    feed does not carry. So this says what to go and read, rather than guessing.
+    """
+    if row.get("receipt"):
+        return None          # the cover has been read; depositary_note says what it said
+    code, _, name = (row.get("incorporation") or "").partition("|")
+    # SEC codes US states with two letters and every foreign jurisdiction with a
+    # digit: E9 Cayman Islands, X0 United Kingdom, F4 Canada.
+    if not code or not any(ch.isdigit() for ch in code):
+        return None
+    where = name or code
+    shares, cover = row.get("shares"), row.get("cover_shares")
+    if shares and cover and max(shares, cover) / min(shares, cover) > 1.5:
+        return (f"Incorporated in {where}. Its cover page states {cover / 1e6:,.1f}M shares "
+                f"while its statements count {shares / 1e6:,.1f}M — "
+                f"{max(shares, cover) / min(shares, cover):.1f}x apart, which is what a "
+                "depositary ratio looks like. Every per-share figure here divides by the "
+                "larger count while the price belongs to the smaller security. Read the ratio "
+                "off the cover of the latest 10-K before trusting the market cap, P/E, P/B or "
+                "P/NCAV.")
+    return (f"Incorporated in {where}. If its US listing is a depositary receipt, one ADS "
+            "stands for several ordinary shares, and the market cap, P/E, P/B and P/NCAV on "
+            "this page divide by the ordinary count while the price is per receipt. The ratio "
+            "is prose on the filing cover and no XBRL feed carries it — check it there before "
+            "using any of the four.")
+
+
 def acquisition_book_note(row: dict) -> str | None:
     """Whether the company's book value is anything more than what it paid for
     other companies.
@@ -230,6 +315,152 @@ def tax_note(row: dict) -> str | None:
     return (f"{untaxed} of {profitable} profitable years in {window} carried effectively no income "
             "tax. Penn Central reported profits and paid no tax for eleven years before it failed: "
             "earnings the tax authorities do not recognise deserve the same scepticism here.")
+
+
+def earnings_shape_note(row: dict) -> dict | None:
+    """Which half of a ten-year record produced its growth.
+
+    Graham compares smoothed three-year levels about five and ten years apart
+    precisely so that one good year cannot carry the comparison. The ten-year
+    figure still cannot say *when* the growth happened, and the difference
+    matters: a business that grew through both halves has been tested twice,
+    while one whose decade went nowhere until its last three years is priced on
+    the part of its history nothing has tested yet.
+    """
+    ch13 = row.get("ch13") or {}
+    shape, last = ch13.get("shape"), ch13.get("latest_fy")
+    if shape is None or last is None:
+        return None
+    early, late = ch13["growth_early"], ch13["growth_5y"]
+    levels = (f"${ch13['avg_old']:,.2f} in FY{last - 12}–FY{last - 10}, "
+              f"${ch13['avg_middle']:,.2f} in FY{last - 7}–FY{last - 5}, "
+              f"${ch13['avg_recent']:,.2f} in FY{last - 2}–FY{last}")
+    if shape == "sprint":
+        jump = ch13.get("latest_vs_prior3")
+        latest = (f" FY{last} alone came in {jump:+.0f}% above the three years before it."
+                  if jump is not None and jump >= 50 else "")
+        return {"kind": "Growth is recent", "text": (
+            f"Smoothed earnings ran {levels}: {early:+.0f}% over the first half of the record "
+            f"and {late:+.0f}% over the second. Whatever this business is now, it became so "
+            f"recently — the ten-year growth Graham asks for is carried entirely by its last "
+            f"three years.{latest}")}
+    return {"kind": "Steady record", "text": (
+        f"Smoothed earnings ran {levels}: {early:+.0f}% over the first half of the record and "
+        f"{late:+.0f}% over the second, positive in all ten years, worst single-year fall "
+        f"{ch13['max_decline']:.0f}%. Graham's stability test asks only for no deficit; this "
+        "record also shows no pause.")}
+
+
+# How far back a note about reported events may speak. Bounded by the company's
+# own newest balance sheet rather than by the clock, so the same stored data
+# always produces the same note.
+_EVENT_WINDOW_YEARS = 5
+# Two 8-Ks are often one auditor transition reported twice: the committee approves
+# the change in one, and the outgoing firm's dismissal takes effect in another once
+# it has finished the year it was already auditing. Fastenal's pair sit 197 days
+# apart and name the same KPMG-to-Deloitte handover; MOG-A, MELI and RNR have the
+# same shape at 110, 109 and 185 days. A full year is the bound, because a filer
+# that genuinely changed auditor twice inside twelve months is the thing being
+# looked for and would still be caught.
+_ONE_TRANSITION_DAYS = 365
+
+
+def _event_window_start(row: dict) -> str | None:
+    """The earliest date a note may claim to cover: five years back, or the start
+    of what the filing index could show, whichever is later. A prolific filer's
+    index holds only its last thousand filings, and a window the data does not
+    cover must not be claimed."""
+    bs = row.get("balance_sheet_date")
+    if not bs:
+        return None
+    try:
+        start = date.fromisoformat(bs) - timedelta(days=365 * _EVENT_WINDOW_YEARS)
+    except ValueError:
+        return None
+    scanned = row.get("events_from")
+    return max(start.isoformat(), scanned) if scanned else start.isoformat()
+
+
+def _dates(dates: list[str]) -> str:
+    if len(dates) > 3:
+        return f"{', '.join(dates[:3])} and {len(dates) - 3} more"
+    if len(dates) == 1:
+        return dates[0]
+    return f"{', '.join(dates[:-1])} and {dates[-1]}"
+
+
+# One 8-K item number, what it means, and why a Graham reader wants it beside
+# the tests. Ordered by how much the event undermines the figures above it.
+#
+# These are the only item numbers the engine reads at all, and the list is
+# short on purpose: an item number is evidence only where the form fixes its
+# meaning. Measured against a 200-company sample, item 5.02 (departure or
+# appointment of officers and directors) fires for 87% of companies and cannot
+# tell a dismissal from an AGM election, and item 1.02 (termination of a
+# material agreement) fires for 38% and cannot tell a lost customer from a
+# refinanced credit line. Item 3.01 was read until the audit of 2026-08-21 and is
+# not any more: it covers "Notice of Delisting or Failure to Satisfy a Continued
+# Listing Rule or Standard; Transfer of Listing", and the code alone cannot tell
+# Walmart, Palantir, Linde and Shopify moving exchange from a company in breach —
+# 1,451 companies carried the note, and those four are not in trouble. Neither is
+# read: a guess about which kind of event a code stands for is not evidence.
+_EVENT_NOTES = (
+    ("4.02", "Non-reliance",
+     "financial statements the company had already published should no longer be relied upon. "
+     "Every figure on this page is built from filed statements, and this filer has withdrawn "
+     "some of its own."),
+    ("1.03", "Bankruptcy",
+     "bankruptcy or receivership. The balance-sheet tests here measure a going concern's "
+     "cushion, which is not what a court supervises."),
+    ("2.04", "Debt acceleration",
+     "an event that accelerated or increased a direct financial obligation. Criterion 3 weighs "
+     "debt against net current assets as though it comes due on schedule."),
+    ("2.06", "Material impairment",
+     "an impairment the company judged material enough to report between statements, rather "
+     "than wait for the next one."),
+)
+# the one item whose meaning is a count rather than an occurrence
+_AUDITOR_ITEM = "4.01"
+# what the scan stores, so that nothing can be noted here without being kept
+EVENT_ITEMS = frozenset({item for item, *_ in _EVENT_NOTES} | {_AUDITOR_ITEM})
+
+
+def _transitions(dates: list[str]) -> list[str]:
+    """Event dates with repeat filings about one transition collapsed into it."""
+    kept: list[str] = []
+    for d in sorted(dates):
+        if not kept or (date.fromisoformat(d)
+                        - date.fromisoformat(kept[-1])).days > _ONE_TRANSITION_DAYS:
+            kept.append(d)
+    return kept
+
+
+def filing_event_notes(row: dict) -> list[dict]:
+    """What the company's own filing index proves happened to it.
+
+    An 8-K item number is fixed by the form: a filer cannot report a withdrawn
+    financial statement under any code but 4.02. So these are read without ever
+    opening the document — the code is the evidence, and a summary of the filing
+    would be a guess. Items whose number cannot distinguish trouble from routine
+    (officer changes, terminated agreements) are not read at all.
+    """
+    since = _event_window_start(row)
+    if since is None:
+        return []
+    by_item: dict[str, list[str]] = {}
+    for event in row.get("filing_events") or ():
+        if event["filed"] >= since:
+            by_item.setdefault(event["item"], []).append(event["filed"])
+    notes = [{"kind": kind, "text": f"Item {item} filed {_dates(dates)}: {meaning}"}
+             for item, kind, meaning in _EVENT_NOTES
+             if (dates := sorted(by_item.get(item, ())))]
+    # one change of auditor is ordinary; a succession of them is the disclosure
+    if len(changes := _transitions(by_item.get(_AUDITOR_ITEM, ()))) >= 2:
+        notes.append({"kind": "Auditor changes", "text": (
+            f"{len(changes)} changes of certifying accountant since {since} "
+            f"(item {_AUDITOR_ITEM}, {_dates(changes)}). The audited figures behind every test on this "
+            "page were signed by a succession of firms, none of them for long.")})
+    return notes
 
 
 def _no_dividend_years_inside_the_window(row: dict, record: dict) -> bool:
@@ -315,7 +546,11 @@ def _defensive(row: dict, profile: str) -> dict:
     ch13 = row.get("ch13") or {}
     growth10 = _number(ch13.get("growth_10y"))
     if growth10 is not None:
-        growth = _status(growth10 >= Decimal("33.3333333333"))
+        # Product policy, the same one the valuation test states below: the
+        # comparison is made at the precision the interface publishes. ch13 rounds
+        # growth to one decimal, so a record that grew exactly 33 1/3 % arrives as
+        # 33.3 and must not fail a threshold carried to ten.
+        growth = _status(growth10 >= Decimal("33.3"))
     else:
         growth = "INSUFFICIENT_DATA"
         if short_history:
@@ -400,6 +635,105 @@ def _defensive(row: dict, profile: str) -> dict:
     return result
 
 
+def prose_gaps(row: dict) -> list[dict]:
+    """What this company's filings settle and its XBRL does not.
+
+    Every other figure on this page comes from a tagged fact with an accession
+    behind it. These are the places where the answer exists only as a sentence in
+    a document — a cover page, the body of an 8-K — so instead of guessing, the
+    screen states the question, names the figures it would change, and points at
+    the filing to read. A number that might be wrong is worse than a number marked
+    unverifiable, and the reader is the one who can open the document.
+    """
+    gaps: list[dict] = []
+    latest_filing = ((row.get("sources") or {}).get("eps") or {}).get("accn")
+    code, _, name = (row.get("incorporation") or "").partition("|")
+    foreign = bool(code) and any(ch.isdigit() for ch in code)
+    shares, cover = row.get("shares"), row.get("cover_shares")
+    split = bool(shares and cover and max(shares, cover) / min(shares, cover) > 1.5)
+
+    # Whether a tagged conversion is still to come or already inside the count is
+    # the one question a cover page cannot settle, so it is asked before the
+    # receipt shortcut below rather than after it.
+    conversion = next((n for n in (row.get("context_notes") or ())
+                       if n.get("kind") == "Convertible preferred"), None)
+    if conversion:
+        # The share-class axis in the quarterly datasets settles whether any preferred
+        # is left; what it cannot settle is what the conversion figure counts.
+        live = "still outstanding" in conversion["text"]
+        gaps.append({
+            "what": ("How many common shares the outstanding preferred actually becomes — "
+                     "the tagged figure may be that total or a ceiling nobody reaches"
+                     if live else
+                     "Whether the convertible preferred has already converted — its shares "
+                     "then sit inside the common count — or still stands ahead of the "
+                     "common with the right to convert"),
+            "affects": "The share count, and with it EPS, book value per share, market cap "
+                       "and every criterion struck per share",
+            "where": ("The capitalisation note of the latest annual report, which states the "
+                      "conversion ratio" if live else
+                      "The capitalisation note and the equity statement of the latest annual "
+                      "report; the preferred is filed under a share-class axis, which is why "
+                      "the count cannot answer this"),
+            "accn": latest_filing,
+        })
+
+    # A cover that has been read answers both questions below — the class the
+    # symbol belongs to is named, and any ratio has already been applied here.
+    if row.get("receipt"):
+        return gaps
+
+    if foreign:
+        gaps.append({
+            "what": "Whether the listed security is a depositary receipt, and how many "
+                    "ordinary shares one receipt stands for"
+                    + (f" — the cover count and the statement count are "
+                       f"{max(shares, cover) / min(shares, cover):.1f}x apart, which is what "
+                       "a ratio looks like" if split else ""),
+            "affects": "Market cap, P/E, P/B, P/NCAV — all four divide by the share count "
+                       "while the price belongs to the receipt",
+            "where": f"Cover page of the latest 10-K, \u201cTitle of each class\u201d "
+                     f"(incorporated in {name or code})",
+            "accn": latest_filing,
+        })
+    elif split:
+        gaps.append({
+            "what": "Which share class the ticker represents: the cover page states "
+                    f"{cover / 1e6:,.1f}M shares and the statements count {shares / 1e6:,.1f}M",
+            "affects": "Market cap and every per-share figure",
+            "where": "Cover page of the latest 10-K",
+            "accn": latest_filing,
+        })
+
+    if row.get("listed") != "y":
+        gaps.append({
+            "what": "Whether this symbol is still tradable. SEC's ticker file no longer "
+                    "assigns it to this company — the equity may have been delisted, "
+                    "deregistered or moved to a successor entity, while the company goes on "
+                    "filing",
+            "affects": "The price, and therefore P/E, P/TBV, P/NCAV, market cap and the "
+                       "dividend yield — all of them rest on a quote that may belong to "
+                       "another security or to none",
+            "where": "The company's filing index — a Form 25 or Form 15 settles it",
+            "accn": None,
+        })
+
+    since = _event_window_start(row)
+    for event in (row.get("filing_events") or ()):
+        if event["item"] == "3.01" and (since is None or event["filed"] >= since):
+            gaps.append({
+                "what": "Whether the item 3.01 filed on " + event["filed"] + " is a listing "
+                        "deficiency or a routine transfer of listing between exchanges — the "
+                        "item number covers both and only the document says which",
+                "affects": "Nothing computed; it decides whether the company is in breach of "
+                           "a listing rule",
+                "where": "The 8-K itself",
+                "accn": event["accn"],
+            })
+            break
+    return gaps
+
+
 def enrich(row: dict) -> dict:
     """Add compact, JSON-safe applicability and alignment fields to one dashboard row."""
     profile = profile_for(row.get("sector"))
@@ -407,11 +741,22 @@ def enrich(row: dict) -> dict:
     notes = list(row.get("context_notes") or ())
     for kind, builder in (("Income tax", tax_note),
                           ("Peer efficiency", peer_efficiency_note),
+                          ("Margin", margin_note),
+                          ("Foreign listing", foreign_listing_note),
+                          ("Depositary receipt", depositary_note),
                           ("Acquisition-only book", acquisition_book_note)):
         if (note := builder(row)) is not None:
             notes.append({"kind": kind, "text": note})
+    # these two decide their own kind: the shape of the record names it, and one
+    # filing index can prove several different things at once
+    if (shape := earnings_shape_note(row)) is not None:
+        notes.append(shape)
+    notes.extend(filing_event_notes(row))
     return {
         "graham_profile": profile,
+        # what the reader must open a filing to settle; rendered in the panel and
+        # marked on the table row, so a missing answer is visible before it is needed
+        "prose_gaps": prose_gaps(row),
         "graham_profile_meta": PROFILE_META[profile],
         "context_notes": notes,
         "alignment": {

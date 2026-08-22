@@ -16,7 +16,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 57  # a stock split is not dilution; a lease book must matter to the company
+ENGINE_VERSION = 81  # revenue and net income carry provenance, like every other figure
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
@@ -35,7 +35,10 @@ CREATE TABLE IF NOT EXISTS company (
     sector        TEXT,   -- coarse, investor-facing grouping of the SIC code
     exchange      TEXT,
     filer_size    TEXT,
-    first_filed   TEXT    -- the company's first-ever SEC filing date; gates windowed tests
+    first_filed   TEXT,   -- the company's first-ever SEC filing date; gates windowed tests
+    events_from   TEXT,   -- oldest filing the event scan could see; the window it may claim
+    incorporation TEXT,   -- SEC's state-or-country code; a digit in it means non-US
+    listed        TEXT    -- 'y' while SEC's ticker file still assigns this symbol here
 );
 CREATE INDEX IF NOT EXISTS company_ticker ON company(ticker);
 CREATE INDEX IF NOT EXISTS company_industry ON company(industry);
@@ -65,6 +68,31 @@ CREATE TABLE IF NOT EXISTS price_history (
     series     TEXT NOT NULL   -- [[iso date, close], ...] oldest first
 );
 
+-- 8-K item codes: the events the filing index itself proves happened. The
+-- document is never read, so only codes whose meaning is fixed by the form are
+-- kept — an item number is evidence, a summary of the filing would be a guess.
+CREATE TABLE IF NOT EXISTS filing_event (
+    cik   TEXT NOT NULL,
+    filed TEXT NOT NULL,   -- ISO date the 8-K was filed
+    item  TEXT NOT NULL,   -- item number, e.g. "4.02"
+    accn  TEXT NOT NULL,
+    PRIMARY KEY (cik, accn, item)
+);
+CREATE INDEX IF NOT EXISTS filing_event_cik ON filing_event(cik);
+
+-- What a filing's cover page says the ticker is. Company Facts cannot express it:
+-- the elements are text and sit under a share-class axis, so both are stripped.
+-- The ratio is the number that makes a depositary receipt's market cap right.
+CREATE TABLE IF NOT EXISTS security_cover (
+    cik    TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    accn   TEXT NOT NULL,   -- the filing the sentence was read from
+    title  TEXT NOT NULL,   -- verbatim, so a reader can check the parse
+    ratio  TEXT,            -- underlying shares per receipt; NULL when not a receipt
+    read_at TEXT NOT NULL,
+    PRIMARY KEY (cik, symbol)
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -72,7 +100,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
 """
 
 
-REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "price_history"})
+REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "price_history",
+                             "filing_event", "security_cover"})
 
 
 def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -97,7 +126,8 @@ def migrate(conn) -> None:
     """One-off repairs and column additions, run by sync jobs — never by a reader."""
     conn.executescript(SCHEMA)   # creates tables added after the first run
     have = {r["name"] for r in conn.execute("PRAGMA table_info(company)")}
-    for col in ("sic", "industry", "sector", "exchange", "filer_size", "first_filed"):
+    for col in ("sic", "industry", "sector", "exchange", "filer_size", "first_filed",
+                "events_from", "incorporation", "listed"):
         if col not in have:
             conn.execute(f"ALTER TABLE company ADD COLUMN {col} TEXT")
     conn.execute("UPDATE company SET last_filing = NULL WHERE last_filing = ''")
@@ -205,28 +235,149 @@ def set_state(conn, key: str, value: str) -> None:
     )
 
 
+# SEC's ticker file suffixes a preferred series with -P and an optional series
+# letter (OAK-PA, ETI-P). A share class is suffixed with the class letter alone
+# (BRK-B, BF-B) and is genuinely the common, so the P is what distinguishes them.
+_PREFERRED_TICKER = "(ticker GLOB '*-P' OR ticker GLOB '*-P[A-Z]')"
+
+
 def dashboard_rows(conn) -> list[dict]:
     rows = conn.execute(
-        """SELECT c.ticker, c.name, c.industry, c.sector, c.exchange, c.filer_size,
-                  c.first_filed, s.data
+        """SELECT c.cik, c.ticker, c.name, c.industry, c.sector, c.exchange, c.filer_size,
+                  c.first_filed, c.events_from, c.last_filing, c.incorporation, c.listed,
+                  s.data
            FROM snapshot s JOIN company c USING (cik)
            WHERE s.status = 'ok' AND s.data IS NOT NULL
              -- an unlisted filer has no ticker, no price, and cannot be bought
-             AND c.ticker IS NOT NULL"""
+             AND c.ticker IS NOT NULL
+             -- ...and a preferred series is not the common: its price belongs to a
+             -- security with its own claim, while every figure derived here — the
+             -- earnings, the book value, the share count — is the common's. OAK-PA
+             -- was priced at a P/E of 8.06 on Oaktree's numbers.
+             AND NOT """ + _PREFERRED_TICKER + """"""
     ).fetchall()
+    events = events_by_cik(conn)
     out = []
     for r in rows:
         d = json.loads(r["data"])
         d["ticker"] = r["ticker"] or d.get("ticker")
         d.update(name=r["name"], industry=r["industry"], sector=r["sector"],
                  exchange=r["exchange"], filer_size=r["filer_size"],
-                 first_filed=r["first_filed"])
+                 first_filed=r["first_filed"], last_filing=r["last_filing"],
+                 incorporation=r["incorporation"], listed=r["listed"],
+                 # what the filing index proved, and how far back it could see:
+                 # a company with no events and no scan are different answers
+                 filing_events=events.get(r["cik"], []), events_from=r["events_from"])
         out.append(d)
     return out
 
 
+def set_cover(conn, cik: str, securities: list[dict], accn: str) -> None:
+    """Every registered class a filing's cover names, with the symbol attached."""
+    conn.execute("DELETE FROM security_cover WHERE cik = ?", (cik,))
+    conn.executemany(
+        """INSERT OR REPLACE INTO security_cover (cik, symbol, accn, title, ratio, read_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [(cik, s["symbol"], accn, s["title"],
+          str(s["ratio"]) if s.get("ratio") is not None else None, _now())
+         for s in securities],
+    )
+
+
+def cover_for(conn, cik: str, ticker: str) -> dict | None:
+    """The cover row for the security this ticker actually prices."""
+    row = conn.execute(
+        "SELECT symbol, accn, title, ratio FROM security_cover WHERE cik = ? AND symbol = ?",
+        (cik, ticker),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def covers_by_cik(conn) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for r in conn.execute("SELECT cik, symbol, accn, title, ratio FROM security_cover"):
+        out.setdefault(r["cik"], []).append(dict(r))
+    return out
+
+
+def resolve_ticker_conflicts(conn, mapping: dict[str, tuple[str, str]]) -> int:
+    """One symbol, one company: whichever CIK SEC's map names today.
+
+    `upsert_company` can only ever add a ticker — `COALESCE(excluded.ticker,
+    company.ticker)` never clears one — so when a company reorganises and the
+    symbol moves to a successor CIK, the predecessor keeps it forever and the
+    dashboard shows the ticker twice. ATAI rendered at $1.77B and $2.72B at the
+    same price, one row per entity, because the table keys on CIK while the price
+    joins on ticker. Every case is a real succession: Gold Resource filed a Form 15
+    while Goldgroup filed the 8-K12B that succeeded it.
+
+    The predecessor keeps its facts, its snapshot and its history — it loses only
+    the claim to a symbol somebody else now trades under, which is what makes it
+    an unlisted filer and drops it out of the dashboard.
+    """
+    freed = conn.executemany(
+        "UPDATE company SET ticker = NULL WHERE ticker = ? AND cik <> ?",
+        [(ticker, cik) for cik, (ticker, _) in mapping.items() if ticker],
+    ).rowcount
+    # ...and record who the file still lists, which is a different question from
+    # who still files. American Electric Power files 10-Qs and its submissions
+    # index carries no ticker and no exchange at all; Farmer Brothers filed a Form
+    # 15 in May. Both still show a price here, and a price for a security nobody
+    # can buy is the one number this screen must never present as ordinary.
+    conn.execute("UPDATE company SET listed = NULL WHERE listed IS NOT NULL")
+    conn.executemany("UPDATE company SET listed = 'y' WHERE cik = ? AND ticker = ?",
+                     [(cik, ticker) for cik, (ticker, _) in mapping.items() if ticker])
+    return max(freed, 0)
+
+
+def dashboard_ciks(conn) -> list[str]:
+    """Just the identities behind the dashboard — for jobs that fetch per company
+    and have no use for the snapshots themselves."""
+    return [r["cik"] for r in conn.execute(
+        """SELECT cik FROM snapshot JOIN company USING (cik)
+           WHERE status = 'ok' AND data IS NOT NULL AND ticker IS NOT NULL
+             AND NOT """ + _PREFERRED_TICKER)]
+
+
 def set_first_filed(conn, cik: str, first_filed: str) -> None:
     conn.execute("UPDATE company SET first_filed = ? WHERE cik = ?", (first_filed, cik))
+
+
+def set_incorporation(conn, cik: str, code: str | None, description: str | None) -> None:
+    """Where the filer is incorporated, as SEC's own index states it. US states are
+    two letters; every non-US jurisdiction carries a digit (E9 Cayman, X0 United
+    Kingdom), which is the only reliable way this dataset can tell a foreign issuer
+    from a domestic one."""
+    if not code:
+        return
+    conn.execute("UPDATE company SET incorporation = ? WHERE cik = ?",
+                 (f"{code}|{description or code}", cik))
+
+
+def set_events(conn, cik: str, events: list[dict], scanned_from: str | None) -> None:
+    """Replace this company's event record wholesale.
+
+    A rescan reads one index that is itself the whole truth about the window it
+    covers, so merging would keep events an amended index no longer shows — and
+    would leave `events_from` describing a scan that no longer explains the rows.
+    """
+    conn.execute("DELETE FROM filing_event WHERE cik = ?", (cik,))
+    conn.executemany(
+        "INSERT OR IGNORE INTO filing_event (cik, filed, item, accn) VALUES (?, ?, ?, ?)",
+        [(cik, e["filed"], e["item"], e["accn"]) for e in events],
+    )
+    conn.execute("UPDATE company SET events_from = ? WHERE cik = ?", (scanned_from, cik))
+
+
+def events_by_cik(conn) -> dict[str, list[dict]]:
+    """Every stored event, grouped — one query for the whole export."""
+    out: dict[str, list[dict]] = {}
+    for r in conn.execute(
+        "SELECT cik, filed, item, accn FROM filing_event ORDER BY cik, filed"
+    ):
+        out.setdefault(r["cik"], []).append(
+            {"filed": r["filed"], "item": r["item"], "accn": r["accn"]})
+    return out
 
 
 def set_metadata(conn, cik: str, sic, industry, exchange, filer_size, ticker=None, name=None) -> None:
@@ -297,6 +448,9 @@ def stats(conn) -> dict:
                AND (facts_synced IS NULL OR substr(facts_synced,1,10) < last_filing)"""),
         "last_daily_index": get_state(conn, "last_daily_index"),
         "price_histories": q("SELECT COUNT(*) FROM price_history"),
+        "companies_scanned_for_events": q(
+            "SELECT COUNT(*) FROM company WHERE events_from IS NOT NULL"),
+        "filing_events": q("SELECT COUNT(*) FROM filing_event"),
         "engine_version": ENGINE_VERSION,
         # freshness for the UI: when filings were last fetched, when the newest
         # snapshot was computed, when prices/dashboard were last rebuilt
