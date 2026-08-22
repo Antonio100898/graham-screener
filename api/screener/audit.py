@@ -377,6 +377,13 @@ def _read_statement(row: dict, edgar, kind: str):
     document = edgar._get_text(statements.REPORT_URL.format(cik=cik, accn=bare, file=file))
     printed, headings = statements.lines(document), statements.columns(document)
     tagged = statements.elements(document)
+    # A rendered header sometimes carries more dates than the table has columns —
+    # Great Elm's income statement heads four and states three, the extra one
+    # repeating a year from a subtitle — and every column then reads one place off.
+    # The rows are the authority on how many columns there are.
+    width = max((len(v) for _, v in printed), default=0)
+    if width and len(headings) > width:
+        headings = headings[-width:]
     if not printed:
         return (None, {}), None, None, f"{file} held no numbered rows"
     wanted = date.fromisoformat(end) if end else None
@@ -412,6 +419,12 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     for field, phrases, identity in PRINTED:
         shown = row.get(field)
         if shown is None:
+            continue
+        # the same abstention the sourced check makes: where one tag carries both
+        # goodwill and intangibles, the engine puts all of it in the second and
+        # zeroes the first, and says so. Comparing the zero against the combined
+        # line it names is comparing a bookkeeping choice against a figure.
+        if "contained in" in ((sources.get(field) or {}).get("concept") or ""):
             continue
         # each figure against the column of ITS OWN balance-sheet date: a filer may
         # carry one line from a later filing than another, and Fervent's current
@@ -577,6 +590,15 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
             # says nothing useful about a per-share figure, which it would exclude
             # outright for containing the words "per share"
             exact = _by_element(tagged, (concepts.get(field) or {}).get("tag"), [column])
+            if not exact and tagged and _absent_concept(tagged, (concepts.get(field) or {}).get("tag")):
+                # The statement does not state this concept. New Mountain Finance is
+                # a business development company and the panel carries its net
+                # investment income per share, while its statement prints earnings
+                # per share, which includes realised and unrealised gains. Two
+                # different questions about the same year.
+                out.append(("FILING?", f"FY{year} {field}", shown, None,
+                            "the statement tags no such concept"))
+                continue
             options = exact or statements.all_matching(
                 printed, *phrases, column=column,
                 only_the_parent=(field != "eps"), money_only=(field == "eps"))
@@ -714,6 +736,83 @@ def _agrees(shown: float, printed_value: float, label: str) -> bool:
             <= FILING_TOLERANCE * max(abs(shown), abs(printed_value), 1e-9))
 
 
+# What owner earnings is built from, and the concept each component is tagged with
+# on the cash flow statement. Operating profit comes from the income statement and
+# income tax from the same, so only these two are read here.
+CASH_FLOW = {
+    "+ depreciation & amortisation": (
+        "us-gaap_DepreciationDepletionAndAmortization",
+        "us-gaap_DepreciationAmortizationAndAccretionNet",
+        "us-gaap_DepreciationAndAmortization",
+        "us-gaap_DepreciationDepletionAndAmortizationExcludingAmortizationOfDeferredFinancingFeesAndDebtDiscounts"),
+    "- capital expenditure": (
+        "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
+        "us-gaap_PaymentsToAcquireProductiveAssets",
+        "us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment"),
+}
+
+
+def against_cash_flow(row: dict, edgar) -> list[tuple]:
+    """The owner-earnings components against the statement they were taken from.
+
+    Owner earnings is the one figure on the panel assembled from three statements
+    at once — operating profit and tax from the income statement, depreciation and
+    capital expenditure from the cash flow — and it had never been checked against
+    any of them.
+    """
+    earnings = row.get("owner_earnings") or {}
+    components = dict(earnings.get("components") or [])
+    if not components:
+        return []
+    try:
+        (printed, tagged), _, headings, why = _read_statement(row, edgar, "cash_flow")
+    except Exception:
+        return []
+    if printed is None:
+        return [("FILING?", "owner earnings", None, None, why)]
+    # the column for the year the figure was struck in, which is not always one the
+    # filing prints: Berkshire's per-share provenance points at a 2017 report, and
+    # its owner earnings are a recent year's
+    year = str(earnings.get("fiscal_year"))
+    # by the date the panel says that year ended, not by the calendar year the date
+    # falls in: Walmart's fiscal 2025 ends 2026-01-31, and matching on the year
+    # alone read its cash flow a year out
+    ends = {str(y): v.get("end") for y, v in (row.get("annual_ratios") or {}).items()
+            if isinstance(v, dict)}
+    wanted = ends.get(year)
+    columns = [i for i, heading in enumerate(headings) if heading.isoformat() == wanted]
+    if not columns:
+        return [("FILING?", "owner earnings", None, None,
+                 f"FY{year} is not among this statement's columns")]
+
+    out = []
+    for name, concepts in CASH_FLOW.items():
+        shown = components.get(name)
+        if shown is None:
+            continue
+        values = [v for concept in concepts if concept in tagged
+                  for col in columns if col < len(tagged[concept])
+                  for v in (float(tagged[concept][col]),)]
+        if not values:
+            out.append(("FILING?", f"owner earnings {name}", shown, None,
+                        "the statement tags no such concept"))
+            continue
+        # capital expenditure is a payment, so its sign is the filer's convention
+        if any(abs(abs(shown) - abs(v)) <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)
+               for v in values):
+            out.append(("FILING-OK", f"owner earnings {name}", shown, shown, None))
+        else:
+            # A filer may tag several depreciation concepts of overlapping scope and
+            # print one of them: Vistra states $1,986M of depreciation, depletion and
+            # amortisation and $2,950M with accretion added, and accretion is not
+            # depreciation. XPO's cash flow line includes $58M of intangible
+            # amortisation the panel's element excludes. A choice of definition, and
+            # the panel's is the narrower and more conservative one.
+            out.append(("FILING?", f"owner earnings {name}", shown, values[0],
+                        "the statement adds back a wider depreciation concept"))
+    return out
+
+
 def _one_moment(row: dict, facts: dict) -> list[tuple]:
     """Components struck at an older date THAN THE FILER HAS SINCE PUBLISHED.
 
@@ -783,6 +882,16 @@ def _derived_series(row: dict) -> list[tuple]:
             # year, though it is also not the deficit criterion 4 tests for
             check("ch13.ten_year_positive", stats.get("ten_year_positive"),
                   sum(1 for v in window if v > 0), "how many of those earned something")
+
+    earnings = row.get("owner_earnings") or {}
+    parts = [v for _, v in (earnings.get("components") or [])]
+    if parts and earnings.get("owner_earnings") is not None:
+        check("owner_earnings", earnings["owner_earnings"], sum(parts),
+              "its own components, added")
+    if earnings.get("roic") is not None and earnings.get("invested_capital"):
+        check("roic", earnings["roic"],
+              earnings["owner_earnings"] / earnings["invested_capital"] * 100,
+              "owner earnings over invested capital")
 
     for year, cell in (row.get("annual_ratios") or {}).items():
         if not isinstance(cell, dict):
@@ -880,7 +989,8 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                           "a newer value exists: " + ", ".join(stale)))
         if edgar is not None:
             for line in (against_filing(row, edgar, facts)
-                         + against_income(row, edgar, facts)):
+                         + against_income(row, edgar, facts)
+                         + against_cash_flow(row, edgar)):
                 bucket = {"FILING": "filing_bad", "FILING-OK": "filing_ok"}.get(
                     line[0], "filing_unknown")
                 totals[bucket] += 1

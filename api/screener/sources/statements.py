@@ -38,6 +38,8 @@ STATEMENTS = {
     # Small filers combine the income statement with comprehensive income and title
     # it accordingly; Creatd's is "Consolidated Statements of Comprehensive Loss".
     # Ranked last, so a filer publishing both keeps the pure one.
+    "cash_flow": ("statements of cash flows", "statement of cash flows",
+                  "statements of cash flow", "cash flows"),
     "income": ("statements of operations", "statement of operations",
                "statements of income", "statement of income", "statements of earnings",
                "statement of earnings", "results of operations",
@@ -46,6 +48,9 @@ STATEMENTS = {
 # A "(Parenthetical)" report carries the share counts and par values that sit in
 # the margin of the statement, not the statement itself.
 PARENTHETICAL = "parenthetical"
+# ...except when it is the thing being read: the share counts and par values live
+# in the margin of the balance sheet, on its parenthetical companion.
+STATEMENTS_PARENTHETICAL = ("balance sheet", "financial position")
 
 _UNITS = {"thousands": Decimal("1e3"), "millions": Decimal("1e6"), "billions": Decimal("1e9")}
 # The money scale is the one attached to the dollar sign. CoStar's header reads
