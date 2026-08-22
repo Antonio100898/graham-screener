@@ -1352,6 +1352,39 @@ _INSIDE_NET_OF_INTEREST = ("InterestIncomeOperating", "InterestAndDividendIncome
                            "InterestIncomeExpenseNet")
 
 
+# Sales tax collected for the state is at most a tenth or so of a sale, so the two
+# assessed-tax elements describe one quantity twice and cannot be far apart.
+_ASSESSED_TAX_MAX = Decimal("1.25")
+
+
+def _without_incoherent_assessed_tax(candidates):
+    """Drop the including-tax element where it cannot be the excluding one plus tax.
+
+    Thirty filers tag a pair that no rate of sales tax explains — Precision Optics
+    at 2.2x, Lifestance at 462x, SS Innovations at exactly 1000x, which is a units
+    error wearing a revenue tag. The two elements are then measuring different
+    things and the wider one is not revenue.
+
+    Dropping it matters beyond the choice itself: the sub-scope guard below anchors
+    on the LARGEST candidate, so one inflated element pushes every honest one under
+    the threshold and out of contention. Precision Optics' own `Revenues` of $24.0M
+    — the "Net sales" its income statement prints — was being discarded as a scrap
+    beside a $53.5M figure the company never earned.
+    """
+    kept = dict(candidates)
+    including = kept.get("RevenueFromContractWithCustomerIncludingAssessedTax")
+    excluding = kept.get("RevenueFromContractWithCustomerExcludingAssessedTax")
+    if including and excluding:
+        shared = set(including) & set(excluding)
+        if shared:
+            year = max(shared)
+            base = excluding[year].value
+            if base > 0 and including[year].value / base > _ASSESSED_TAX_MAX:
+                return [(t, s) for t, s in candidates
+                        if t != "RevenueFromContractWithCustomerIncludingAssessedTax"]
+    return candidates
+
+
 def _wider_top_line(pool, tag: str, series: dict[int, Fact]):
     """Between a total and its own part, the total is the larger of the two.
 
@@ -1406,6 +1439,7 @@ def _annual_revenue(gaap: dict) -> dict[int, Fact]:
         for tag in REVENUE_TAGS
         if (series := _annual_series(gaap, tag, unit=("USD",)))
     ]
+    candidates = _without_incoherent_assessed_tax(candidates)
     if not candidates:
         return {}
     order = {tag: i for i, tag in enumerate(REVENUE_TAGS)}

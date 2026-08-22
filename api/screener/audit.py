@@ -567,6 +567,16 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 totals["unchecked"] += 1
                 lines.append(("UNCHECKED", field, shown, None, "no provenance recorded"))
                 continue
+            # A figure read on a share-class axis cannot be found in Company Facts,
+            # which drops every dimension: BCSS files 1,500,000 weighted shares
+            # without one and 10,000,000 for the class its ticker names, so looking
+            # up the bare tag finds a real number that is not this one.
+            if source.get("segments"):
+                totals["unchecked"] += 1
+                lines.append(("UNCHECKED", field, shown, None,
+                              f"filed under {source['segments'].rstrip(';')}, "
+                              "which the dimension-free API does not carry"))
+                continue
             ns, _, bare = (source.get("tag") or "").partition(":")
             ratio = _ratio(row) if field in ("shares", "cover_shares") else 1
             candidates = [v / ratio for v in

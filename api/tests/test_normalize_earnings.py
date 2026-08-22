@@ -869,3 +869,37 @@ def test_interest_income_still_stands_where_there_is_no_net_line():
     }
     from screener.normalize import _annual_revenue
     assert float(_annual_revenue(gaap)[2025].value) == 500e6
+
+
+def test_sales_tax_cannot_be_larger_than_the_sale():
+    """Thirty filers tag an assessed-tax pair no rate of tax explains — Precision
+    Optics at 2.2x, SS Innovations at exactly 1000x, which is a units error wearing
+    a revenue tag. The wider element is then not revenue.
+
+    Dropping it matters beyond the choice: the sub-scope guard anchors on the
+    LARGEST candidate, so one inflated element pushes every honest one below the
+    threshold. Precision Optics' own $24.2M was being discarded as a scrap beside a
+    $53.5M figure it never earned."""
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 24.246e6, accn=f"k{y}") for y in range(2020, 2026)]),
+        "RevenueFromContractWithCustomerIncludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 53.492e6, accn=f"k{y}") for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 24.246e6
+
+
+def test_a_real_sales_tax_leaves_the_pair_whole_and_the_chain_decides():
+    """The check is a ceiling on the absurd, not a rule against the element. With a
+    genuine 7% tax both elements stay, and the chain's own ordering then prefers the
+    excluding one — which is right on its own terms: sales tax collected for the
+    state was never the company's revenue."""
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 100e6, accn=f"k{y}") for y in range(2020, 2026)]),
+        "RevenueFromContractWithCustomerIncludingAssessedTax": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 107e6, accn=f"k{y}") for y in range(2020, 2026)]),
+    }
+    from screener.normalize import _annual_revenue
+    assert float(_annual_revenue(gaap)[2025].value) == 100e6   # excluding the tax

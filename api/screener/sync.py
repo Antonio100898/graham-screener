@@ -65,6 +65,12 @@ def _source(fact) -> dict | None:
         src = {"tag": p.tag, "form": p.form, "accn": p.accession,
                "end": p.period_end.isoformat() if p.period_end else None,
                "filed": p.filed.isoformat() if p.filed else None}
+        # A fact read on a share-class axis is not the one that tag holds without a
+        # dimension: BCSS files 1,500,000 weighted shares dimension-free and
+        # 10,000,000 for the class its ticker names. Provenance that omits the axis
+        # points at a filing where the figure is a different number.
+        if p.segments:
+            src["segments"] = p.segments
         # The concept carries the caveat the tag cannot: "Dividends (aggregate —
         # may include preferred and noncontrolling)" was built for 203 rows and
         # then dropped here, so none of them ever showed it.
