@@ -32,6 +32,7 @@ import re
 from datetime import date
 from pathlib import Path
 
+from .normalize import _is_financial_form
 from .sources import statements
 from .sources.edgar import EdgarClient
 from .sync import DASHBOARD_JSON
@@ -281,6 +282,24 @@ PRINTED_INCOME = (
 FILING_TOLERANCE = 0.01     # the printed figure is rounded to the header's scale
 
 
+def _only_the_scale_differs(shown: float, printed: float) -> bool:
+    """Whether the two are the same number under a different declared scale.
+
+    A rendered statement states its own units in its header, and a small filer
+    often leaves a template's "$ in Millions" above figures reported in whole
+    dollars: ABVC heads its balance sheet that way and then prints cash of
+    "$ 31,944", which at millions would be $31.9 trillion. The tagged values carry
+    no such ambiguity, so where the panel and the page differ by exactly a
+    thousand, a million or a billion it is the header that is wrong and the figure
+    that agrees.
+    """
+    if not shown or not printed:
+        return False
+    ratio = abs(printed) / abs(shown)
+    return any(abs(ratio - power) <= 0.01 * power or abs(ratio - 1 / power) <= 0.01 / power
+               for power in (1e3, 1e6, 1e9))
+
+
 def _read_statement(row: dict, edgar, kind: str):
     """The published statement's rows and the column the panel's date belongs to.
 
@@ -372,6 +391,10 @@ def against_filing(row: dict, edgar) -> list[tuple]:
                  <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)]
         if agree:
             out.append(("FILING-OK", field, shown, agree[0], note))
+        elif any(_only_the_scale_differs(shown, v) for v in scaled):
+            out.append(("FILING?", field, shown, scaled[0],
+                        "the same figure under the scale the statement's header "
+                        "declares, which its own numbers contradict"))
         else:
             out.append(("FILING", field, shown, scaled[0], note))
     return out
@@ -525,7 +548,12 @@ def _one_moment(row: dict, facts: dict) -> list[tuple]:
             entries = [e for units in
                        (facts.get("facts", {}).get(ns or "us-gaap", {}).get(bare) or {})
                        .get("units", {}).values() for e in units]
-            newer = [e for e in entries if "start" not in e and e.get("end", "") > end]
+            # only forms the engine itself reads. Cycurion's line of credit has a
+            # newer figure, but it stands in an S-1 — a registration statement, not
+            # a periodic report — and the engine deliberately reads neither, so its
+            # 10-K figure is not superseded by anything it was ever going to see.
+            newer = [e for e in entries if "start" not in e and e.get("end", "") > end
+                     and _is_financial_form(e.get("form", ""))]
             if newer:
                 out.append((name, parent, [f"{bare} stands at {max(e['end'] for e in newer)}"]))
     return out

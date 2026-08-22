@@ -2969,6 +2969,16 @@ def _tax_record(gaap: dict, fresh: date | None) -> dict | None:
 _CLASS_AXES = frozenset(("ClassOfStock", "StatementClassOfStock", "EquityClassOfStock"))
 
 
+# Where a rendered cover cell ends and the next one begins. The reader takes the
+# cell's text and the renderer sometimes runs two together, so 126 of 5,791 stored
+# titles trail into "Security Exchange Name NYSE" or "Document Information [Line
+# Items]" — decoration that drowns the two or three words naming the class.
+_CELL_RAN_ON = re.compile(
+    r"\s*(?:Security Exchange Name|Document Information|Entity Incorporation"
+    r"|Trading Symbol|No Trading Symbol|\[Line Items\]|\[Member\]|Title of \w+ class)",
+    re.I)
+
+
 def _class_member(title: str) -> frozenset[str]:
     """The words that identify a share class, from either side of the question.
 
@@ -2977,7 +2987,11 @@ def _class_member(title: str) -> frozenset[str]:
     "CommonClassA". Reduced to word sets the two are comparable, and the par value
     and other decoration fall away.
     """
-    words = re.findall(r"[A-Z]?[a-z]+", re.sub(r"[^A-Za-z ]", " ", title))
+    title = _CELL_RAN_ON.split(title, 1)[0]
+    # a lone capital is a word here: "Class A" and "Class B" differ by exactly one
+    # letter, and a pattern needing a lowercase tail dropped it, leaving the two
+    # classes identical and every dual-class cover unmatchable
+    words = re.findall(r"[A-Z][a-z]*|[a-z]+", re.sub(r"[^A-Za-z ]", " ", title))
     return frozenset(w.lower() for w in words if w.lower() not in
                      {"stock", "shares", "share", "par", "value", "per", "the", "of", "and",
                       "one", "dollar", "no", "common"}) or frozenset({"common"})
@@ -3006,6 +3020,26 @@ def _dimensioned_class(dimensioned: dict, registered: str | None) -> str | None:
     return matched[0] if len(matched) == 1 else None
 
 
+def _a_different_class(segments: str, chosen: str | None) -> bool:
+    """Whether this fact belongs to a share class the ticker is not.
+
+    One class reported for a period reads as unambiguous, and usually is. But a
+    blank-cheque company files a weighted share count for its founders' Class B and
+    none at all for the Class A its ticker prices, and taking the only class on
+    offer then counts the wrong shareholders: BCSS's cover registers "Units, each
+    consisting of one Class A ordinary share", and the panel showed the 10,000,000
+    founder shares rather than the public stock.
+
+    Only ever refuses — where the cover names no class, the single-class reading
+    stands as before.
+    """
+    if not chosen:
+        return False
+    member = next((p.split("=", 1)[1] for p in (segments or "").split(";")
+                   if p and p.split("=", 1)[0] in _CLASS_AXES), None)
+    return member is not None and member != chosen
+
+
 def _unambiguous_dimensioned(dimensioned: dict | None, registered: str | None = None) -> dict:
     """The dimensioned facts that can only mean one thing, shaped like the facts
     Company Facts returns so the ordinary chains can read them.
@@ -3031,6 +3065,7 @@ def _unambiguous_dimensioned(dimensioned: dict | None, registered: str | None = 
                 by_period.setdefault((e.get("start"), e.get("end")), []).append(e)
             keep = [e for group in by_period.values()
                     if len({g["segments"] for g in group}) == 1
+                    and not _a_different_class(group[0]["segments"], chosen)
                     for e in group]
             if not keep and chosen:
                 # several classes, and the cover says which one the ticker is

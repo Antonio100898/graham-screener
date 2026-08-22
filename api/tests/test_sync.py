@@ -636,3 +636,34 @@ def test_a_pure_operations_statement_outranks_a_combined_one():
       <Report><HtmlFileName>R3.htm</HtmlFileName><ShortName>Consolidated Statements of Comprehensive Income</ShortName><MenuCategory>Statements</MenuCategory></Report>
     </Reports>"""
     assert statements.find(summary, "income") == "R2.htm"
+
+
+def test_a_registration_statement_does_not_supersede_a_periodic_report():
+    """Cycurion's line of credit has a newer figure than the one on the panel, but it
+    stands in an S-1 — a registration statement, not a quarterly or annual report —
+    and the engine reads neither. A figure cannot be stale against something the
+    engine was never going to see."""
+    from screener.audit import _one_moment
+    facts = {"facts": {"us-gaap": {"LineOfCredit": {"units": {"USD": [
+        {"end": "2025-12-31", "val": 2933396, "accn": "k25", "form": "10-K"},
+        {"end": "2026-03-31", "val": 2700000, "accn": "s1", "form": "S-1"},
+    ]}}}}}
+    row = {"sources": {"long_term_debt": {
+        "end": "2026-06-30",
+        "components": [{"tag": "us-gaap:LineOfCredit", "end": "2025-12-31"}]}}}
+    assert _one_moment(row, facts) == []
+
+    # ...but a 10-Q carrying the same period does supersede it
+    facts["facts"]["us-gaap"]["LineOfCredit"]["units"]["USD"][1]["form"] = "10-Q"
+    assert len(_one_moment(row, facts)) == 1
+
+
+def test_a_declared_scale_the_statement_contradicts_is_not_a_wrong_figure():
+    """ABVC heads its balance sheet "$ in Millions" and then prints cash of
+    "$ 31,944", which at millions would be $31.9 trillion. The tagged values carry
+    no such ambiguity, so a difference of exactly a million is the header being
+    wrong, not the panel."""
+    from screener.audit import _only_the_scale_differs
+    assert _only_the_scale_differs(19_400_715, 19_400_715_000_000) is True
+    assert _only_the_scale_differs(24_246_000, 24_049_000) is False    # a real difference
+    assert _only_the_scale_differs(0, 5) is False

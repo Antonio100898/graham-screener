@@ -499,3 +499,28 @@ def test_a_pool_that_fits_inside_the_count_is_kept():
             tagdata("shares", [inst("2026-03-31", 7.2e6, accn="q126")]),
     }
     assert float(build(gaap).options_outstanding.value) == 7.2e6
+
+
+def test_a_cover_title_stops_where_its_cell_does():
+    """The reader takes a rendered cell's text and the renderer sometimes runs two
+    together, so 126 of 5,791 stored titles trail into "Security Exchange Name NYSE"
+    or "Document Information [Line Items]". That decoration drowns the two or three
+    words naming the class, and the class then cannot be matched at all."""
+    from screener.normalize import _class_member
+    clean = _class_member("Class A Common Stock")
+    assert _class_member("Class A Common Stock Security Exchange Name NYSE") == clean
+    assert _class_member("Class A Common Stock [Member] Document Information [Line Items]") == clean
+    assert _class_member("Class B Common Stock") != clean
+
+
+def test_the_only_class_on_file_is_refused_when_it_is_not_the_ticker_s():
+    """One class reported for a period reads as unambiguous, and usually is. But a
+    blank-cheque company files a weighted share count for its founders' Class B and
+    none for the Class A its ticker prices, and taking the only class on offer counts
+    the wrong shareholders. Refuses only — where the cover names no class the
+    single-class reading stands."""
+    from screener.normalize import _a_different_class
+    assert _a_different_class("ClassOfStock=CommonClassB;", "CommonClassA") is True
+    assert _a_different_class("ClassOfStock=CommonClassA;", "CommonClassA") is False
+    assert _a_different_class("ClassOfStock=CommonClassB;", None) is False   # nothing to contradict
+    assert _a_different_class("", "CommonClassA") is False                   # not class-dimensioned

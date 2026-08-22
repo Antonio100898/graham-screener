@@ -16,7 +16,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 82  # sales tax cannot exceed the sale, and a class axis belongs in the provenance
+ENGINE_VERSION = 83  # Class A and Class B differ by a letter, and the matcher was dropping it
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
