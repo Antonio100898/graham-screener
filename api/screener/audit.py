@@ -210,12 +210,26 @@ def _identities(row: dict) -> list[tuple]:
     if row.get("options") is not None and row.get("rsus") is not None:
         check("equity_awards", row.get("equity_awards"), row["options"] + row["rsus"],
               "options + restricted stock")
-    # the debt criterion 3 weighed: the rollup where it is fresher and larger,
-    # otherwise the two buckets
+    # The debt criterion 3 weighed. A newer representation wins because mixing
+    # dates is not conservative, it is incoherent; only representations struck
+    # on the same date are reconciled by taking the larger.
     lt, st, total = row.get("long_term_debt"), row.get("short_term_debt"), row.get("total_debt")
     parts = sum(v for v in (lt, st) if v is not None)
     if row.get("debt") is not None and (total is not None or lt is not None or st is not None):
-        expected = max(total, parts) if total is not None else parts
+        sources = row.get("sources") or {}
+        total_end = (sources.get("total_debt") or {}).get("end")
+        part_ends = [
+            (sources.get(name) or {}).get("end")
+            for name, value in (("long_term_debt", lt), ("short_term_debt", st))
+            if value is not None and (sources.get(name) or {}).get("end")
+        ]
+        parts_end = max(part_ends, default=None)
+        if total is None:
+            expected = parts
+        elif total_end and parts_end and total_end != parts_end:
+            expected = parts if parts_end > total_end else total
+        else:
+            expected = max(total, parts)
         check("debt", row["debt"], expected, "max(total-debt tag, long + short) at one date")
     return out
 
@@ -869,7 +883,12 @@ def _rounding_slack(numerator: float, denominator: float) -> float:
     """
     if not denominator:
         return 0.0
-    return abs(numerator / denominator) * (0.00005 / abs(denominator))
+    # Both inputs are serialized to four decimals. Normally the numerator term
+    # is microscopic; for MVCO's $0.0011 historical price it is almost one cent
+    # on the displayed multiple and cannot be ignored.
+    numerator_error = 0.00005 / abs(denominator)
+    denominator_error = abs(numerator / denominator) * (0.00005 / abs(denominator))
+    return numerator_error + denominator_error
 
 
 def _derived_series(row: dict) -> list[tuple]:

@@ -2,7 +2,8 @@
 import json
 
 from screener import store
-from screener.sync import apply_price, material_events
+from screener.sync import apply_price, material_events, _restate_historical_ratios
+from decimal import Decimal
 
 
 def row(ttm=5.0, tbvps=10.0, others="PASS"):
@@ -14,6 +15,14 @@ def row(ttm=5.0, tbvps=10.0, others="PASS"):
             {"n": 7, "status": "INSUFFICIENT_DATA", "value": None, "note": "no price"},
         ],
     }
+
+
+def test_receipt_rebases_historical_per_share_books_only():
+    ratios = {2025: {"bvps": 4.0, "tbvps": 3.0, "ncavps": 1.0,
+                     "return_on_book": 12.0, "award_pct": 5.0}}
+    _restate_historical_ratios(ratios, Decimal("3"))
+    assert ratios[2025] == {"bvps": 12.0, "tbvps": 9.0, "ncavps": 3.0,
+                            "return_on_book": 12.0, "award_pct": 5.0}
 
 
 def test_price_settles_valuation_criteria():
@@ -43,6 +52,20 @@ def test_missing_price_leaves_criteria_unknown():
     r = apply_price(row(), price=None)
     assert r["verdict"] == "INDETERMINATE"
     assert all(c["status"] == "INSUFFICIENT_DATA" for c in r["criteria"] if c["n"] in (1, 7))
+
+
+def test_unlisted_security_refuses_a_quote_for_its_old_symbol():
+    r = row(ttm=5.0, tbvps=40.0)
+    r.update(listed=None, price=40.0, price_asof="2026-08-23T12:00:00+00:00")
+
+    out = apply_price(r, price=40.0)
+
+    by_n = {c["n"]: c for c in out["criteria"]}
+    assert "price" not in out
+    assert "price_asof" not in out
+    assert by_n[1]["status"] == "INSUFFICIENT_DATA" and by_n[1]["value"] is None
+    assert by_n[7]["status"] == "INSUFFICIENT_DATA" and by_n[7]["value"] is None
+    assert out["verdict"] == "INDETERMINATE"
 
 
 def test_negative_eps_fails_rather_than_unknown():
@@ -404,18 +427,22 @@ def test_an_award_total_says_which_kinds_it_contains():
     assert _equity_awards(Neither()) == {"equity_awards": None, "awards_basis": None}
 
 
-def test_the_regression_harness_ignores_what_a_recomputation_cannot_know():
+def test_the_regression_harness_ignores_only_live_inputs_it_cannot_reproduce():
     """The harness exists because three hand-written comparison scripts were wrong
     before it — they left out the dimensioned sidecar, the cover ratio, or the
     export-time enrichment, and each reported healthy companies as broken. So the
     fields a recomputation cannot reproduce are named in one place rather than
-    rediscovered every time."""
-    from screener.regress import PRICE_SETTLED, VOLATILE, _flat, _moved
+    rediscovered every time. Price-settled results are reproducible from the exact
+    shipped quote and must not be carried over from the baseline."""
+    from screener.regress import VOLATILE, _flat, _moved
 
-    assert "criteria" in PRICE_SETTLED and "n_pass" in PRICE_SETTLED
     assert "price" in VOLATILE and "ttm_eps_vintage" in VOLATILE
     # nested figures are attributed to their own field, not to the whole object
-    assert _flat({"annual_eps": {"2020": 1.76}, "price": 9}) == {"annual_eps.2020": 1.76}
+    assert _flat({"annual_eps": {"2020": 1.76}, "price": 9,
+                  "criteria": [{"n": 1, "status": "PASS"}]}) == {
+        "annual_eps.2020": 1.76,
+        "criteria": '[{"n": 1, "status": "PASS"}]',
+    }
     # a rounded last decimal is not a change; a sign flip is
     assert not _moved(1.7600, 1.76001)
     assert _moved(0.64, -0.64)

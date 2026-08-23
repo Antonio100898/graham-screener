@@ -84,6 +84,10 @@ NET_INCOME_TAGS = (
 # Chemical Partners' sponsor takes 82.7% of the consolidated profit, and dividing
 # the group figure by the public units reported $9.65 a unit against a filed $1.77.
 PARENT_INCOME_TAGS = NET_INCOME_TAGS[:2]
+COMMON_INCOME_TAGS = (
+    "NetIncomeLossAvailableToCommonStockholdersDiluted",
+    "NetIncomeLossAvailableToCommonStockholdersBasic",
+)
 # ...and where only the group figure carries a trailing window, the minority's own
 # line is what has to come out of it.
 NCI_INCOME_TAGS = (
@@ -206,8 +210,11 @@ _IMPAIRMENT_SPECIFICS = frozenset(("GoodwillImpairmentLoss", "ImpairmentOfIntang
 # silently flatter the P/E test the same way one-time charges depress it.
 GAIN_TAGS = (
     ("GainLossOnInvestments", "investment gain/loss"),
+    ("GainOnSaleOfInvestments", "investment sale gain"),
     ("UnrealizedGainLossOnInvestments", "unrealized investment gain/loss"),
     ("GainLossOnSaleOfPropertyPlantEquipment", "property disposal gain/loss"),
+    ("GainLossOnSaleOfProperty", "property disposal gain/loss"),
+    ("GainOrLossOnSaleOfStockInSubsidiary", "subsidiary stock sale gain/loss"),
     ("GainLossOnDispositionOfAssets1", "asset disposition gain/loss"),
 )
 # Warrant remeasurement has no reliable sign convention in the wild (AMZN vs
@@ -686,6 +693,8 @@ def build_snapshot(
                                      annual_preferred_dividends,
                                      _has_minority_interest(gaap, fresh, nci), shares)
 
+    vintage = vintage_ttm_eps(gaap)
+
     # A depositary receipt is priced per receipt while the statements count the
     # ordinary shares behind it; the cover names the ratio and nothing else can.
     if receipt and receipt.get("ratio"):
@@ -693,11 +702,11 @@ def build_snapshot(
         if ratio > 1:
             parts = {"shares": shares, "annual_eps": annual_eps, "ttm_eps": ttm_eps,
                      "dividend_per_share": dividend_per_share,
-                     "ttm_preferred_dividends": ttm_preferred_dividends}
+                     "ttm_eps_inputs": ttm_inputs, "ttm_eps_vintage": vintage}
             _restate_onto_receipt(parts, ratio, receipt.get("accn", ""))
             shares, annual_eps = parts["shares"], parts["annual_eps"]
             ttm_eps, dividend_per_share = parts["ttm_eps"], parts["dividend_per_share"]
-            ttm_preferred_dividends = parts["ttm_preferred_dividends"]
+            ttm_inputs, vintage = parts["ttm_eps_inputs"], parts["ttm_eps_vintage"]
 
     return FinancialSnapshot(
         cik=cik,
@@ -707,7 +716,7 @@ def build_snapshot(
         ttm_net_income=ttm_net_income,
         ttm_eps=ttm_eps,
         ttm_eps_inputs=ttm_inputs,
-        ttm_eps_vintage=vintage_ttm_eps(gaap),
+        ttm_eps_vintage=vintage,
         annual_revenue=annual_revenue,
         ttm_revenue=ttm_revenue,
         annual_operating_income=_annual_operating_income(gaap),
@@ -2762,6 +2771,8 @@ _DERIVED_EPS_SHARE_LAG = 460  # a cover count this close to the year end counts 
 
 
 _BASIS_TOLERANCE = Decimal("1.5")   # how far EPS x shares may sit from the filer's own income
+_SHARE_SCALE_TOLERANCE = Decimal("0.05")
+_SHARE_SCALE_FACTORS = (Decimal("1000"), Decimal("1000000"))
 
 
 def _restate_onto_receipt(snapshot_parts: dict, ratio: Decimal, accn: str) -> None:
@@ -2792,10 +2803,16 @@ def _restate_onto_receipt(snapshot_parts: dict, ratio: Decimal, accn: str) -> No
     for key in ("annual_eps",):
         snapshot_parts[key] = {y: restated(f, ratio, per_receipt)
                                for y, f in (snapshot_parts.get(key) or {}).items()}
-    for key in ("ttm_eps", "dividend_per_share", "ttm_preferred_dividends"):
+    snapshot_parts["ttm_eps_inputs"] = tuple(
+        restated(f, ratio, per_receipt) for f in snapshot_parts.get("ttm_eps_inputs", ()))
+    snapshot_parts["ttm_eps_vintage"] = {
+        end: value * ratio
+        for end, value in (snapshot_parts.get("ttm_eps_vintage") or {}).items()
+    }
+    for key in ("ttm_eps", "dividend_per_share"):
         value = snapshot_parts.get(key)
         if value is not None:
-            snapshot_parts[key] = value * ratio if key != "shares" else value
+            snapshot_parts[key] = value * ratio
 
 
 def _basis_conflict(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
@@ -2823,7 +2840,7 @@ def _basis_conflict(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
     """
     if has_nci:
         return None
-    counts = _annual_share_counts(gaap, dei)
+    counts = _annual_share_counts(gaap, dei, annual_eps, annual_ni, preferred)
     for year in sorted(set(annual_eps) & set(annual_ni) & set(counts), reverse=True):
         eps, ni, count = annual_eps[year], annual_ni[year], counts[year]
         if eps.value == 0 or count.value <= 0 or year in preferred:
@@ -2880,7 +2897,10 @@ def _has_minority_interest(gaap: dict, fresh: date | None, nci: Fact | None) -> 
     return False
 
 
-def _annual_share_counts(gaap: dict, dei: dict) -> dict[int, Fact]:
+def _annual_share_counts(gaap: dict, dei: dict,
+                         annual_eps: dict[int, Fact] | None = None,
+                         annual_ni: dict[int, Fact] | None = None,
+                         annual_preferred: dict[int, Fact] | None = None) -> dict[int, Fact]:
     """The share count a filer itself divided by for a given year.
 
     Only the weighted average serves. The count on a report cover looked like a
@@ -2891,8 +2911,56 @@ def _annual_share_counts(gaap: dict, dei: dict) -> dict[int, Fact]:
     income belongs to all of them. Both failures are silent and both read as a
     bargain, so the stand-in is gone: a year without its own weighted average
     keeps no derived figure.
+
+    A second, independently provable defect is repaired here. Some filings label
+    their statement "shares in thousands" or "shares in millions" but expose the
+    table value under the plain XBRL `shares` unit. McDonald's consequently reaches
+    Company Facts as 716.4 shares even though the statement means 716.4 million.
+    Only an exact thousand/million factor is accepted, only within one accession,
+    and only when EPS x the rescaled count reconciles to that filing's income
+    within five per cent. A share-class, split or ADR mismatch has no reason to
+    land on that exact scale and remains blocked by `_basis_conflict`.
     """
-    return _annual_union(gaap, _WEIGHTED_SHARE_TAGS, unit=("shares",))
+    counts = _annual_union(gaap, _WEIGHTED_SHARE_TAGS, unit=("shares",))
+    if not counts or not annual_eps or not annual_ni:
+        return counts
+
+    preferred = annual_preferred or _annual_union(gaap, PREFERRED_DIVIDEND_TAGS)
+    direct_common = _annual_dollar_series(gaap, COMMON_INCOME_TAGS)
+    out = dict(counts)
+    for year in set(counts) & set(annual_eps) & set(annual_ni):
+        count, eps = counts[year], annual_eps[year]
+        if count.value <= 0 or eps.value == 0 or "ContinuingOperations" in eps.provenance.tag:
+            continue
+        income = direct_common.get(year) or annual_ni[year]
+        adjustment = None if year in direct_common else preferred.get(year)
+        evidence = (count, eps, income) + ((adjustment,) if adjustment else ())
+        if len({f.provenance.accession for f in evidence}) != 1:
+            continue
+        ends = {f.provenance.period_end for f in evidence if f.provenance.period_end}
+        if len(ends) != 1:
+            continue
+        common = income.value - (adjustment.value if adjustment else Decimal(0))
+        implied = common / eps.value
+        if implied <= 0:
+            continue
+        factor = next((candidate for candidate in _SHARE_SCALE_FACTORS
+                       if abs(count.value * candidate - implied) / abs(implied)
+                       <= _SHARE_SCALE_TOLERANCE), None)
+        if factor is None:
+            continue
+        p = count.provenance
+        out[year] = Fact(
+            value=count.value * factor,
+            provenance=Provenance(
+                concept=f"{p.concept} (scaled {factor:g}x: reconciled to EPS and income)",
+                tag=p.tag, fiscal_year=p.fiscal_year, form=p.form,
+                accession=p.accession, filed=p.filed, period_end=p.period_end,
+                period_start=p.period_start,
+                components=tuple(f.provenance for f in evidence), segments=p.segments,
+            ),
+        )
+    return dict(sorted(out.items()))
 
 
 def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
@@ -2908,7 +2976,7 @@ def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
     and makes the price look cheap. It serves only where the balance sheet shows
     no minority interest to inflate it (ARES would have read 2.60 against a
     genuine 3.00-odd; a co-op with no NCI is unaffected)."""
-    counts = _annual_share_counts(gaap, dei)
+    counts = _annual_share_counts(gaap, dei, annual_eps, annual_ni, annual_preferred)
     # Where the group figure would be divided by the parent's own count, the
     # parent-attributable series takes its place — refusing the year outright
     # would leave a partnership with no per-unit figure at all when its own
@@ -3194,7 +3262,8 @@ def _note(kind: str, text: str) -> dict:
 
 
 def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[int, Fact],
-                  annual_operating: dict[int, Fact], years: int = 6) -> dict[int, dict]:
+                  annual_operating: dict[int, Fact], years: int = 6,
+                  annual_eps: dict[int, Fact] | None = None) -> dict[int, dict]:
     """Graham's comparison ratios as they stood at each fiscal year end.
 
     Chapter 13 compares companies by putting the same handful of ratios side by
@@ -3225,7 +3294,9 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
                                  labels=labels)
     goodwill = _annual_balances(gaap, ("Goodwill",), labels=labels)
     intangibles = _annual_balances(gaap, ("IntangibleAssetsNetExcludingGoodwill",), labels=labels)
-    counts = _annual_share_counts(gaap, {})
+    if annual_eps is None:
+        annual_eps = _annual_eps(gaap)
+    counts = _annual_share_counts(gaap, {}, annual_eps, annual_ni)
     options = _annual_balances(gaap, OPTION_COUNT_TAGS, unit=("shares",), labels=labels)
     rsus = _annual_balances(gaap, RSU_COUNT_TAGS, unit=("shares",), labels=labels)
 
@@ -3450,7 +3521,7 @@ def _context_notes(gaap: dict, annual_eps: dict[int, Fact],
     # post-split report measures the split and calls it dilution: NVIDIA's
     # ten-for-one made it look like an 867% issuance when the count had fallen.
     # A report states three years on one basis, which is basis enough.
-    weighted = _annual_union(gaap, _WEIGHTED_SHARE_TAGS, unit=("shares",))
+    weighted = _annual_share_counts(gaap, {}, annual_eps, annual_ni)
     newest = max((f.provenance.accession for f in weighted.values()), default=None,
                  key=lambda a: max(f.provenance.filed for f in weighted.values()
                                    if f.provenance.accession == a))

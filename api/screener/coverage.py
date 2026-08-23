@@ -34,10 +34,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from . import store
+from . import evidence, store
 from .normalize import (
-    UnsupportedFilerError, build_snapshot, _is_financial_form,  # noqa: F401
+    COMMON_INCOME_TAGS, UnsupportedFilerError, build_snapshot,
+    _annual_dollar_series, _is_financial_form,  # noqa: F401
 )
+from .sources.edgar import EdgarClient
 
 DASHBOARD = Path(__file__).parent / "static" / "dashboard.json"
 CACHE = Path.home() / ".cache" / "graham-screener"
@@ -162,6 +164,12 @@ OUT_OF_SCOPE = (
      "equity-statement flows: stocks of equity are derived from A - L"),
     (r"RegulatedAndUnregulated|PublicUtilities|Regulatory|FuelCosts|PurchasedPower|UtilitiesOperatingExpense",
      "utility rate-case detail: revenue/assets totals are read"),
+    (r"CommonUnitIssuanceValue|DevelopmentStageEnterpriseDeficitAccumulatedDuringDevelopmentStage",
+     "equity-statement mechanics: book value is derived from assets less liabilities, while issuance flows and accumulated deficit are already inside that stock"),
+    (r"VariableLeaseIncome",
+     "lessor revenue composition: variable lease income is already inside the consolidated revenue total"),
+    (r"RelatedPartyTaxExpenseDueToAffiliatesCurrent",
+     "related-party tax detail: the expense is already inside net income and the current payable inside liabilities"),
     (r"OilAndGas|ProvedReserves|ExplorationExpense|DepletionOfOilAndGas|ResultsOfOperationsOilAndGas",
      "extractives detail: consolidated statements are read"),
     (r"InsuranceCommissions|PolicyholderBenefitsAndClaims|IncurredClaims|PaidClaims|LiabilityForUnpaidClaims|ReinsuranceRecoverable|PrepaidReinsurancePremiums|DirectPremiums|CededPremiums|AssumedPremiums|SeparateAccount",
@@ -361,6 +369,7 @@ KNOWN_IDENTITY: dict[str, str] = {
     "CIRX": "criterion 1 already INSUFFICIENT; negative implied count from a loss year",
     "PNPL": "criterion 1 already INSUFFICIENT; negative implied count from a loss year",
     "STEK": "criterion 1 already INSUFFICIENT; per-share element an order of magnitude off",
+    "FBCD": "criterion 1 already INSUFFICIENT; FY2012 EPS predates a reverse-split-scale 2013 share count and all fundamentals are over 13 years stale",
 }
 _OOS_COMPILED = tuple((re.compile(p), reason) for p, reason in OUT_OF_SCOPE)
 
@@ -616,6 +625,8 @@ def verify(limit: int | None = None) -> dict:
     known_identity: list[str] = []
     derived_failures: list[str] = []
     companies_clean = 0
+    conn = store.connect()
+    loader = evidence.EvidenceLoader(conn, EdgarClient(cache_dir=CACHE))
 
     for row in sample:
         path = CACHE / f"companyfacts_{row['cik']}.json"
@@ -623,7 +634,9 @@ def verify(limit: int | None = None) -> dict:
             continue
         facts = json.loads(path.read_text())
         try:
-            snap = build_snapshot(row["ticker"], row["cik"], facts)
+            bundle = loader.load(row["cik"], row["ticker"], facts)
+            snap = build_snapshot(bundle.ticker, bundle.cik, bundle.facts,
+                                  dimensioned=bundle.dimensioned, receipt=bundle.receipt)
         except UnsupportedFilerError:
             continue
         gaap = facts.get("facts", {}).get("us-gaap", {})
@@ -704,13 +717,27 @@ def verify(limit: int | None = None) -> dict:
                     why = ("criterion 3 takes the larger of two same-date representations, "
                            "so the smaller is treated as a fragment")
                 known_identity.append(f"{line} — {why}")
-        if snap.ttm_eps and snap.ttm_net_income and snap.shares_outstanding and snap.ttm_eps != 0:
-            # EPS nets preferred dividends from income; the NI tag does not
-            common = snap.ttm_net_income - (snap.ttm_preferred_dividends or Decimal(0))
-            implied = common / snap.ttm_eps
+        # NetIncomeLoss is parent profit, but EPS is struck on income available
+        # to common after preferred dividends and other common-specific
+        # adjustments. Prefer the filer's direct common numerator for this
+        # identity without redefining the profit series used by UI margins.
+        common_income = _annual_dollar_series(gaap, COMMON_INCOME_TAGS)
+        shared_years = sorted(set(snap.annual_eps) & set(snap.annual_net_income))
+        if shared_years and snap.shares_outstanding:
+            # Compare one fiscal year's income and EPS, never a newer trailing
+            # income window with an older annual-only EPS (GIPR). EPS nets that
+            # year's preferred dividends from income; the NI tag does not.
+            year = shared_years[-1]
+            eps = snap.annual_eps[year].value
+            common = (common_income[year].value if year in common_income else
+                      snap.annual_net_income[year].value
+                      - snap.annual_preferred_dividends.get(year, Decimal(0)))
+            implied = common / eps if eps else None
             actual = snap.shares_outstanding.value
-            if actual > 0 and not (Decimal("0.5") <= implied / actual <= Decimal("2")):
-                line = f"{row['ticker']}: NI/EPS implies {implied:,.0f} shares vs {actual:,.0f} extracted"
+            if (implied is not None and actual > 0
+                    and not (Decimal("0.5") <= implied / actual <= Decimal("2"))):
+                line = (f"{row['ticker']}: FY{year} NI/EPS implies {implied:,.0f} shares "
+                        f"vs {actual:,.0f} extracted")
                 if snap.basis_conflict:
                     # The engine reached the same conclusion from the other side and
                     # withheld criterion 1 for it, so no per-share figure built on
@@ -723,6 +750,7 @@ def verify(limit: int | None = None) -> dict:
                 else:
                     identity_failures.append(line)
 
+    conn.close()
     return {
         "sampled": len(sample),
         "companies_clean": companies_clean,

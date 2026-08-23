@@ -29,7 +29,7 @@ from pathlib import Path
 
 import httpx
 
-from . import ch13, pricestats, profiles, store
+from . import ch13, evidence, pricestats, profiles, store
 from . import normalize
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
@@ -119,6 +119,12 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
     except Exception as exc:  # a malformed filing must not stop a 4,000-company run
         return "error", {"error": repr(exc)[:200]}
     r = evaluate(snap, quote)
+    historical_ratios = normalize.annual_ratios(
+        facts.get("facts", {}).get("us-gaap", {}), snap.annual_net_income,
+        snap.annual_revenue, snap.annual_operating_income,
+        annual_eps=snap.annual_eps)
+    if receipt and receipt.get("ratio"):
+        _restate_historical_ratios(historical_ratios, Decimal(str(receipt["ratio"])))
     return "ok", {
         "cik": cik,
         "ticker": ticker,
@@ -180,9 +186,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # the same ratios at each of the last fiscal year ends, each struck on its
         # own year's report. The price multiples are completed at export, where the
         # price history lives; the vintage EPS series is their denominator.
-        "annual_ratios": normalize.annual_ratios(
-            facts.get("facts", {}).get("us-gaap", {}), snap.annual_net_income,
-            snap.annual_revenue, snap.annual_operating_income),
+        "annual_ratios": historical_ratios,
         "current_assets": float(snap.current_assets.value) if snap.current_assets else None,
         "current_liabilities": (float(snap.current_liabilities.value)
                                 if snap.current_liabilities else None),
@@ -261,6 +265,26 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("revenue", _series_mix(snap.annual_revenue)),
         ) if mix is not None} or None,
     }
+
+
+def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None) -> tuple[str, dict | None]:
+    """The sole production entry point from assembled evidence to a snapshot."""
+    return _derive(bundle.cik, bundle.ticker, bundle.facts, quote=quote,
+                   dimensioned=bundle.dimensioned, receipt=bundle.receipt)
+
+
+def _restate_historical_ratios(ratios: dict, receipt_ratio: Decimal) -> None:
+    """Put historical per-share book figures onto the same receipt as its prices.
+
+    Percentages and entity-level totals do not move. A ratio at or below one is
+    not an underlying-shares-per-receipt conversion and is deliberately ignored.
+    """
+    if receipt_ratio <= 1:
+        return
+    for values in ratios.values():
+        for key in ("bvps", "tbvps", "ncavps"):
+            if values.get(key) is not None:
+                values[key] *= float(receipt_ratio)
 
 
 # A margin needs a base worth taking a percentage of, and both figures must belong
@@ -417,6 +441,7 @@ def bootstrap(conn, limit: int | None = None, progress=_print_progress) -> None:
     """Derive from whatever raw facts are already cached locally — no network."""
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
+    loader = evidence.EvidenceLoader(conn, edgar)
     cached = sorted(edgar.cache_dir.glob("companyfacts_*.json"))
     if limit:
         cached = cached[:limit]
@@ -428,8 +453,7 @@ def bootstrap(conn, limit: int | None = None, progress=_print_progress) -> None:
             facts = json.loads(fp.read_text())
         except ValueError:
             continue
-        status, data = _derive(cik, ticker or cik, facts,
-                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
+        status, data = _derive_evidence(loader.load(cik, ticker, facts))
         store.upsert_company(conn, cik, ticker, name, facts_synced=True)
         store.put_snapshot(conn, cik, status, data)
         if i % 100 == 0:
@@ -443,6 +467,7 @@ def bulk(conn, limit: int | None = None, progress=_print_progress) -> None:
     """One 1.4GB download instead of thousands of rate-limited requests."""
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
+    loader = evidence.EvidenceLoader(conn, edgar)
     progress("downloading companyfacts.zip from SEC (1.4 GB)")
     with httpx.stream("GET", BULK_FACTS_URL, headers={"User-Agent": edgar.user_agent},
                       timeout=None, follow_redirects=True) as resp:
@@ -465,8 +490,7 @@ def bulk(conn, limit: int | None = None, progress=_print_progress) -> None:
             except ValueError:
                 continue
             (edgar.cache_dir / f"companyfacts_{cik}.json").write_bytes(z.read(n))
-            status, data = _derive(cik, ticker or cik, facts,
-                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
+            status, data = _derive_evidence(loader.load(cik, ticker, facts))
             store.upsert_company(conn, cik, ticker, name, facts_synced=True)
             store.put_snapshot(conn, cik, status, data)
             if i % 500 == 0:
@@ -557,8 +581,8 @@ def dera_sync(conn, start: str | None = None, progress=_print_progress) -> None:
     """Carry the dimension-qualified and issuer-extension facts that Company
     Facts cannot express into a sidecar cache beside the raw filings.
 
-    Nothing reads the sidecars yet: this only makes the data local and
-    measurable, which is the whole of step 5a in DIMENSIONS-PLAN.md."""
+    Changed sidecars invalidate their companies' snapshots. The next derive or
+    export reads them through the same evidence bundle as every other path."""
     edgar = EdgarClient()
     cache = edgar.cache_dir
     ciks = {r["cik"] for r in conn.execute(
@@ -573,8 +597,11 @@ def dera_sync(conn, start: str | None = None, progress=_print_progress) -> None:
             progress(f"{quarter} is not published yet", i, len(quarters))
             continue
         harvested = dera.harvest(path, ciks, wanted, per_share)
-        written = dera.merge_into_sidecars(harvested, cache, quarter)
-        progress(f"{quarter}: {written} companies", i, len(quarters))
+        changed = dera.merge_into_sidecars(harvested, cache, quarter)
+        for cik in changed:
+            store.mark_snapshot_dirty(conn, cik, f"DERA evidence updated through {quarter}")
+        conn.commit()
+        progress(f"{quarter}: {len(changed)} companies changed", i, len(quarters))
     progress("done", len(quarters), len(quarters))
 
 
@@ -744,6 +771,7 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
     """One ~1MB file per day names every company that filed. Refetch only those."""
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
+    loader = evidence.EvidenceLoader(conn, edgar)
     end = store.today()
     last = store.get_state(conn, "last_daily_index")
     start = max(end - timedelta(days=days),
@@ -788,8 +816,7 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
         except EdgarError as exc:
             print(f"  {ticker}: {exc}")
             continue
-        status, data = _derive(cik, ticker or cik, facts,
-                               dimensioned=dera.load_sidecar(edgar.cache_dir, cik))
+        status, data = _derive_evidence(loader.load(cik, ticker, facts))
         store.upsert_company(conn, cik, ticker, name, facts_synced=True)
         store.put_snapshot(conn, cik, status, data)
         progress("refetching filers", i, len(pending))
@@ -803,19 +830,16 @@ def derive(conn, progress=_print_progress) -> None:
     """Recompute snapshots after an engine change, from raw facts already on disk."""
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
+    loader = evidence.EvidenceLoader(conn, edgar)
     stale = store.needs_recompute(conn)
-    # the cover ratio is transcribed once and applied on every recompute
-    covers = {(cik, s["symbol"]): s
-              for cik, found in store.covers_by_cik(conn).items() for s in found}
     progress(f"{len(stale)} snapshots predate engine v{store.ENGINE_VERSION}", 0, len(stale))
     for i, cik in enumerate(stale, 1):
         fp = _facts_path(edgar, cik)
         if not fp.exists():
             continue
         ticker, name = tickers.get(cik, (None, None))
-        status, data = _derive(cik, ticker or cik, json.loads(fp.read_text()),
-                               dimensioned=dera.load_sidecar(fp.parent, cik),
-                               receipt=covers.get((cik, ticker)))
+        status, data = _derive_evidence(
+            loader.load(cik, ticker, json.loads(fp.read_text())))
         store.put_snapshot(conn, cik, status, data)
         if i % 200 == 0:
             conn.commit()
@@ -849,6 +873,15 @@ def apply_price(row: dict, price: float | None) -> dict:
     price-free (they change only when the company files), so the valuation
     criteria are settled here — pure arithmetic over ttm_eps and tbvps, no I/O.
     The same rule runs client-side when the UI refreshes a price."""
+    # A symbol absent from SEC's current company/ticker mapping has no verified
+    # security identity.  Yahoo may still return a stale quote, or may later reuse
+    # the symbol for another issuer; neither may be joined to this CIK's filings.
+    # Rows without a `listed` key are direct/unit-test callers and retain the
+    # historical API contract.  Exported rows always carry the key.
+    if "listed" in row and row.get("listed") != "y":
+        price = None
+        row.pop("price", None)
+        row.pop("price_asof", None)
     crit = {c["n"]: c for c in row["criteria"]}
     if price is not None and price > 0 and not row.get("basis_conflict"):
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
@@ -1089,13 +1122,15 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
     rows = store.dashboard_rows(conn)
     if with_prices:
         prices = YahooPriceProvider()
-        progress(f"fetching prices for {len(rows)} tickers", 0, len(rows))
+        priceable = [r for r in rows if r.get("ticker") and r.get("listed") == "y"]
+        progress(f"fetching prices for {len(priceable)} verified tickers", 0,
+                 len(priceable))
         done = 0
         # one request per company returns the quote *and* five years of weekly
         # closes, so the price statistics cost no extra call; each is independent,
         # and a small pool turns an hour of waiting into a few minutes
         with ThreadPoolExecutor(max_workers=12) as pool:
-            futures = {pool.submit(prices.history, r["ticker"]): r for r in rows if r.get("ticker")}
+            futures = {pool.submit(prices.history, r["ticker"]): r for r in priceable}
             for fut in as_completed(futures):
                 row = futures[fut]
                 try:
@@ -1117,11 +1152,18 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
             if closes:
                 store.set_price_history(conn, row["cik"], closes)
             apply_price(row, row.get("price"))
-            closes_by_cik[row["cik"]] = closes or store.price_history(conn, row["cik"])
+            closes_by_cik[row["cik"]] = (
+                closes or store.price_history(conn, row["cik"])
+                if row.get("listed") == "y" else []
+            )
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
         conn.commit()
     else:
-        closes_by_cik = {r["cik"]: store.price_history(conn, r["cik"]) for r in rows}
+        closes_by_cik = {
+            r["cik"]: (store.price_history(conn, r["cik"])
+                       if r.get("listed") == "y" else [])
+            for r in rows
+        }
         for row in rows:
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
     DASHBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)

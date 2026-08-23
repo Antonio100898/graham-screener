@@ -11,7 +11,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, jobs, pricestats, store
+from . import auth, evidence, jobs, pricestats, store
 from .models import CriterionResult, Fact, FinancialSnapshot, ScreenResult
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import evaluate
@@ -46,7 +46,14 @@ def _snapshot_for(ticker: str, assume_absent_zero: bool = False) -> FinancialSna
     except EdgarError as exc:
         raise HTTPException(502, f"EDGAR unavailable: {exc}")
     try:
-        return build_snapshot(ticker.upper(), cik, facts, assume_absent_zero=assume_absent_zero)
+        conn = store.connect()
+        try:
+            bundle = evidence.EvidenceLoader(conn, _edgar).load(cik, ticker.upper(), facts)
+        finally:
+            conn.close()
+        return build_snapshot(bundle.ticker, bundle.cik, bundle.facts,
+                              assume_absent_zero=assume_absent_zero,
+                              dimensioned=bundle.dimensioned, receipt=bundle.receipt)
     except UnsupportedFilerError as exc:
         raise HTTPException(422, str(exc))
 

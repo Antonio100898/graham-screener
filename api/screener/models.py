@@ -84,7 +84,10 @@ class FinancialSnapshot:
     cik: str
     ticker: str
     annual_eps: dict[int, Fact]  # fiscal year -> diluted EPS, 10-K facts only
-    annual_net_income: dict[int, Fact]  # the numerator behind EPS, same basis
+    # Profit attributable to the parent, used for margins and return on book.
+    # It is not necessarily the EPS numerator: preferred dividends and other
+    # common-specific adjustments may sit between the two.
+    annual_net_income: dict[int, Fact]
     ttm_net_income: Decimal | None
     ttm_eps: Decimal | None
     ttm_eps_inputs: tuple[Fact, ...]

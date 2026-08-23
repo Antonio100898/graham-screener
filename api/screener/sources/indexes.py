@@ -9,18 +9,23 @@ reconstitution, and absence is visible.
 """
 from __future__ import annotations
 
+import os
 import re
 
 import httpx
 
 WIKI_API = ("https://en.wikipedia.org/w/api.php"
             "?action=parse&prop=text&format=json&formatversion=2&page={page}")
+WIKIMEDIA_USER_AGENT = os.environ.get(
+    "WIKIMEDIA_USER_AGENT",
+    os.environ.get("SEC_USER_AGENT", "GrahamScreener am.worker.15@gmail.com"),
+)
 
 
 def _page(page: str, timeout: float = 20.0) -> str | None:
     try:
         resp = httpx.get(WIKI_API.format(page=page), timeout=timeout, follow_redirects=True,
-                         headers={"User-Agent": "graham-screener (contact via repo)"})
+                         headers={"User-Agent": WIKIMEDIA_USER_AGENT})
         resp.raise_for_status()
         return resp.json()["parse"]["text"]
     except (httpx.HTTPError, KeyError, ValueError):

@@ -670,6 +670,30 @@ def test_the_cover_names_which_share_class_the_ticker_is():
     assert 2025 not in other.annual_eps
 
 
+def test_a_receipt_rebases_every_per_security_figure_and_no_dollar_total():
+    """One receipt represents two ordinary shares: all per-security history moves
+    together, while entity income and preferred dividends remain company totals."""
+    gaap = dict(GAAP)
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-12-31", 1.25, accn="k25", filed="2026-02-15")])
+    facts = facts_doc(gaap)
+    ordinary = build_snapshot("ADR", "0000000001", facts)
+    receipt = build_snapshot(
+        "ADR", "0000000001", facts,
+        receipt={"ratio": "2", "accn": "cover-1", "title": "ADS, each representing 2 shares"},
+    )
+
+    assert receipt.shares_outstanding.value == ordinary.shares_outstanding.value / 2
+    assert receipt.ttm_eps == ordinary.ttm_eps * 2
+    assert receipt.annual_eps[2025].value == ordinary.annual_eps[2025].value * 2
+    assert receipt.dividend_per_share == ordinary.dividend_per_share * 2
+    assert receipt.ttm_eps_vintage == {k: v * 2 for k, v in ordinary.ttm_eps_vintage.items()}
+    assert [f.value for f in receipt.ttm_eps_inputs] == [
+        f.value * 2 for f in ordinary.ttm_eps_inputs]
+    assert receipt.ttm_net_income == ordinary.ttm_net_income
+    assert receipt.ttm_preferred_dividends == ordinary.ttm_preferred_dividends
+
+
 def test_fiscal_years_end_when_the_company_says_they_do():
     """Microsoft's fiscal 2026 closed 2026-06-30. Reading it as 2026-12-31 asked the
     price history for a December that has not arrived, so the newest P/E column was
@@ -754,6 +778,68 @@ def test_a_preferred_dividend_is_not_a_contradiction():
     }
     from screener.normalize import _annual_eps
     assert float(_annual_eps(gaap)[2020].value) == 55.63
+
+
+def test_income_available_to_common_does_not_redefine_parent_profit():
+    gaap = {
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", -35.71, accn="k25", filed="2026-06-15")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", -6486000, accn="k25", filed="2026-06-15")]),
+        "NetIncomeLossAvailableToCommonStockholdersDiluted": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", -17128000, accn="k25", filed="2026-06-15")]),
+        "WeightedAverageNumberOfSharesOutstandingBasic": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 479613, accn="k25", filed="2026-06-15")]),
+    }
+
+    from screener.normalize import _annual_net_income
+
+    income = _annual_net_income(gaap)
+
+    assert float(income[2025].value) == -6486000
+    assert "NetIncomeLoss" in income[2025].provenance.tag
+
+
+def test_statement_share_scale_is_reconciled_from_same_filing_arithmetic():
+    """McDonald's states shares in millions but exposes 716.4 under the plain
+    `shares` unit. EPS, income and count from one accession prove the multiplier."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 11.95, accn="k25", filed="2026-02-24")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", 8563e6, accn="k25", filed="2026-02-24")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 716.4, accn="k25", filed="2026-02-24")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts, _basis_conflict,
+    )
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2025].value == Decimal("716400000.0")
+    assert "scaled 1000000x" in counts[2025].provenance.concept
+    assert _basis_conflict(gaap, {}, eps, income, {}, False) is None
+
+
+def test_non_decimal_security_basis_mismatch_is_not_scaled_away():
+    """A 13x ADR/class mismatch is not a thousands-or-millions presentation scale."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 11.95, accn="k25", filed="2026-02-24")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", 8563e6, accn="k25", filed="2026-02-24")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 55e6, accn="k25", filed="2026-02-24")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts, _basis_conflict,
+    )
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2025].value == Decimal("55000000.0")
+    assert _basis_conflict(gaap, {}, eps, income, {}, False) is not None
 
 
 def test_the_parents_own_profit_outranks_a_longer_group_series():

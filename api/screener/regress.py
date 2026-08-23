@@ -26,25 +26,21 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
-from . import store
-from .sources import dera
+from . import evidence, store
 from .sources.edgar import EdgarClient
 from . import profiles
-from .sync import DASHBOARD_JSON, _derive, _index_tickers
+from .sync import (
+    DASHBOARD_JSON, _derive_evidence, _index_tickers, _mark_peer_efficiency,
+    _price_the_ratio_history, apply_price,
+)
 
 # Fields whose value is a live quote or a clock reading rather than a product of
 # the engine. They differ on every run and would bury the fields that matter.
 VOLATILE = frozenset({
-    "price", "quote_time", "generated", "market_cap", "dividend_yield",
-    "price_stats", "pe", "ptbv", "pncav", "pb", "engine_version", "as_of",
+    "price", "price_asof", "quote_time", "generated", "price_stats",
+    "engine_version", "as_of",
     # dropped from the payload on the way out: engine-internal, no reader
     "ttm_eps_vintage",
-})
-# Settled at export against a live quote (criteria 1 and 7 and everything counted
-# over them). A recomputation has no quote, so these are carried over from the
-# shipped row rather than compared — otherwise every company reads as a regression.
-PRICE_SETTLED = frozenset({
-    "criteria", "n_pass", "verdict", "grade", "peer", "membership", "in_index",
 })
 # How far a number may drift before it counts as moved: enough to ignore the last
 # decimal place of a rounded figure, not enough to hide a real change.
@@ -58,7 +54,10 @@ def _flat(row: dict, prefix: str = "") -> dict:
     out = {}
     for key, value in (row or {}).items():
         name = f"{prefix}{key}"
-        if key in VOLATILE:
+        # Current quote/clock fields really are volatile. Nested historical price
+        # fields are not: they are rebuilt from the stored closes and must be
+        # compared like every other UI value.
+        if not prefix and key in VOLATILE:
             continue
         if isinstance(value, dict):
             out.update(_flat(value, f"{name}."))
@@ -94,15 +93,14 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
     conn = store.connect()
     edgar = EdgarClient()
     index = _index_tickers(conn, edgar)
-    covers = {(cik, s["symbol"]): s
-              for cik, found in store.covers_by_cik(conn).items() for s in found}
+    loader = evidence.EvidenceLoader(conn, edgar)
     # Export builds the auditor and delisting notes from these, then drops them from
     # the payload. Without them the notes cannot be rebuilt and read as deleted.
     events = store.events_by_cik(conn)
     events_from = {r["cik"]: r["events_from"] for r in
                    conn.execute("SELECT cik, events_from FROM company").fetchall()}
 
-    changes: dict[str, list] = defaultdict(list)
+    candidates: list[tuple[dict, dict]] = []
     failed = []
     for i, row in enumerate(chosen, 1):
         cik = row["cik"]
@@ -111,11 +109,10 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
             continue
         ticker = index.get(cik, (row["ticker"], None))[0] or row["ticker"]
         try:
-            # exactly what derive() passes — the sidecar and the cover ratio
-            # included, because leaving either out invents differences
-            status, fresh = _derive(cik, ticker, json.loads(path.read_text()),
-                                    dimensioned=dera.load_sidecar(path.parent, cik),
-                                    receipt=covers.get((cik, ticker)))
+            # Exactly what every production path passes. Leaving a slower-moving
+            # evidence source out here would invent regression differences.
+            bundle = loader.load(cik, ticker, json.loads(path.read_text()))
+            status, fresh = _derive_evidence(bundle)
         except Exception as exc:                     # a bad filing must not stop the sweep
             failed.append((row["ticker"], repr(exc)[:80]))
             continue
@@ -126,11 +123,32 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
         # recomputation is missing fields the engine never produced and reports them
         # as deleted. Overlaying onto the shipped row keeps whatever `derive` does
         # not own, which is exactly the set that must not count as a change.
-        merged = {**row, **{k: v for k, v in fresh.items() if k not in PRICE_SETTLED},
+        merged = {**row, **fresh,
                   "filing_events": events.get(cik, []),
-                  "events_from": events_from.get(cik)}
+                  "events_from": events_from.get(cik),
+                  "last_filing": conn.execute(
+                      "SELECT last_filing FROM company WHERE cik = ?", (cik,)
+                  ).fetchone()["last_filing"]}
+        # Settle the candidate with the exact quote already shown by the UI. This
+        # makes criteria, verdict, yield, market value and alignment comparable
+        # without introducing a live-price change into an engine regression.
+        apply_price(merged, row.get("price"))
+        _price_the_ratio_history(merged, store.price_history(conn, cik))
+        candidates.append((row, merged))
+
+    # The full mandatory run can recompute peer medians exactly. A ticker/sample
+    # run retains the shipped peer record because an incomplete peer universe is
+    # less accurate than the baseline it is diagnosing.
+    if tickers is None and sample is None:
+        for _, merged in candidates:
+            merged.pop("peer_efficiency", None)
+        _mark_peer_efficiency([merged for _, merged in candidates])
+
+    changes: dict[str, list] = defaultdict(list)
+    for i, (row, merged) in enumerate(candidates, 1):
         merged.update(profiles.enrich(merged))
-        for gone in ("filing_events", "events_from"):   # popped on the way out
+        for gone in ("filing_events", "events_from", "last_filing",
+                     "ttm_eps_vintage"):                 # popped on the way out
             merged.pop(gone, None)
         old, new = _flat(row), _flat(merged)
         for key in sorted(set(old) | set(new)):
@@ -140,7 +158,7 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
             if _moved(a, b):
                 changes[key].append((row["ticker"], a, b))
         if i % 250 == 0:
-            progress(f"  {i}/{len(chosen)} compared")
+            progress(f"  {i}/{len(candidates)} compared")
     if failed:
         progress(f"  {len(failed)} companies could not be recomputed: {failed[:3]}")
     return dict(changes), len(chosen)

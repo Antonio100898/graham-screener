@@ -174,11 +174,12 @@ def sidecar_path(cache_dir: Path, cik: str) -> Path:
     return cache_dir / f"dimensioned_{cik}.json"
 
 
-def merge_into_sidecars(harvested: dict[str, dict], cache_dir: Path, quarter: Quarter) -> int:
+def merge_into_sidecars(harvested: dict[str, dict], cache_dir: Path,
+                        quarter: Quarter) -> set[str]:
     """Accumulate quarters into one file per company. A filing appears in every
     quarter that carries it, so entries are deduplicated on what identifies a
     fact: its accession, period, unit and dimensions."""
-    written = 0
+    changed: set[str] = set()
     for cik, doc in harvested.items():
         path = sidecar_path(cache_dir, cik)
         existing = {"facts": {}, "quarters": []}
@@ -202,9 +203,12 @@ def merge_into_sidecars(harvested: dict[str, dict], cache_dir: Path, quarter: Qu
                             seen.add(key)
         quarters = set(existing.get("quarters") or ()) | {str(quarter)}
         existing["quarters"] = sorted(quarters)
-        path.write_text(json.dumps(existing, separators=(",", ":")))
-        written += 1
-    return written
+        encoded = json.dumps(existing, separators=(",", ":"))
+        before = path.read_text() if path.exists() else None
+        if encoded != before:
+            path.write_text(encoded)
+            changed.add(cik)
+    return changed
 
 
 def load_sidecar(cache_dir: Path, cik: str) -> dict | None:

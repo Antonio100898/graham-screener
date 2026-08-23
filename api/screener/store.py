@@ -16,7 +16,7 @@ from . import sectors
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 85  # one date belongs to one fiscal year
+ENGINE_VERSION = 89  # reconcile filing-level thousands/millions share scales
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS security_cover (
     PRIMARY KEY (cik, symbol)
 );
 
+-- Evidence can change without engine code changing: a newly parsed cover or a
+-- newly published DERA quarter may settle a previously unknown share basis.
+CREATE TABLE IF NOT EXISTS snapshot_dirty (
+    cik        TEXT PRIMARY KEY,
+    reason     TEXT NOT NULL,
+    marked_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -101,7 +109,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 
 REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "price_history",
-                             "filing_event", "security_cover"})
+                             "filing_event", "security_cover", "snapshot_dirty"})
 
 
 def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -194,6 +202,7 @@ def _put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
              data           = excluded.data""",
         (cik, ENGINE_VERSION, _now(), status, json.dumps(data) if data else None),
     )
+    conn.execute("DELETE FROM snapshot_dirty WHERE cik = ?", (cik,))
 
 
 # a filer with no XBRL on SEC's side has nothing a recompute could read — only a
@@ -205,10 +214,23 @@ def needs_recompute(conn) -> list[str]:
     """Companies whose derived snapshot predates the current engine — recomputed
     from stored raw facts, never refetched."""
     rows = conn.execute(
-        f"SELECT cik FROM snapshot WHERE engine_version < ? AND status NOT IN {_UNRECOMPUTABLE}",
+        f"""SELECT cik FROM snapshot
+             WHERE engine_version < ? AND status NOT IN {_UNRECOMPUTABLE}
+           UNION
+           SELECT d.cik FROM snapshot_dirty d JOIN snapshot s USING (cik)
+             WHERE s.status NOT IN {_UNRECOMPUTABLE}
+           ORDER BY cik""",
         (ENGINE_VERSION,),
     ).fetchall()
     return [r["cik"] for r in rows]
+
+
+def mark_snapshot_dirty(conn, cik: str, reason: str) -> None:
+    conn.execute(
+        "INSERT INTO snapshot_dirty (cik, reason, marked_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(cik) DO UPDATE SET reason = excluded.reason, marked_at = excluded.marked_at",
+        (cik, reason, _now()),
+    )
 
 
 def needs_refetch(conn) -> list[str]:
@@ -274,6 +296,13 @@ def dashboard_rows(conn) -> list[dict]:
 
 def set_cover(conn, cik: str, securities: list[dict], accn: str) -> None:
     """Every registered class a filing's cover names, with the symbol attached."""
+    before = [tuple(r) for r in conn.execute(
+        "SELECT symbol, accn, title, ratio FROM security_cover WHERE cik = ? ORDER BY symbol",
+        (cik,),
+    )]
+    after = sorted((s["symbol"], accn, s["title"],
+                    str(s["ratio"]) if s.get("ratio") is not None else None)
+                   for s in securities)
     conn.execute("DELETE FROM security_cover WHERE cik = ?", (cik,))
     conn.executemany(
         """INSERT OR REPLACE INTO security_cover (cik, symbol, accn, title, ratio, read_at)
@@ -282,6 +311,8 @@ def set_cover(conn, cik: str, securities: list[dict], accn: str) -> None:
           str(s["ratio"]) if s.get("ratio") is not None else None, _now())
          for s in securities],
     )
+    if before != after:
+        mark_snapshot_dirty(conn, cik, "security cover changed")
 
 
 def cover_for(conn, cik: str, ticker: str) -> dict | None:

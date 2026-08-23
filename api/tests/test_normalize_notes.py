@@ -199,6 +199,25 @@ def test_one_time_gain_is_disclosed_with_flipped_wording():
     assert "added to" in note  # positive gain BOOSTS income — opposite of a charge
 
 
+def test_additional_sale_gain_tags_use_the_same_earnings_quality_guard():
+    cases = (
+        ("GainOnSaleOfInvestments", "investment sale gain"),
+        ("GainLossOnSaleOfProperty", "property disposal gain"),
+        ("GainOrLossOnSaleOfStockInSubsidiary", "subsidiary stock sale gain"),
+    )
+    for tag, label in cases:
+        gaap = dict(GAAP)
+        gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+            tagdata("USD", [dur("2026-01-01", "2026-03-31", 1e9, form="10-Q", accn="q126", filed="2026-05-05")])
+        gaap[tag] = tagdata("USD", [
+            dur("2026-01-01", "2026-03-31", 300e6, form="10-Q", accn="q126", filed="2026-05-05")])
+
+        note = next(n["text"] for n in build(gaap).earnings_quality
+                    if label in n["text"].lower())
+
+        assert "added to" in note
+
+
 def test_afs_successor_tag_is_the_fragment_never_the_total_pfe_style():
     gaap = dict(OE_GAAP)
     gaap["OtherShortTermInvestments"] = tagdata("USD", [inst("2026-03-31", 12454e6, accn="q126")])
