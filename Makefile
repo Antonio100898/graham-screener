@@ -1,7 +1,7 @@
 PY := api/.venv/bin/python
 PIP := api/.venv/bin/pip
 
-.PHONY: install share bootstrap bulk metadata daily derive events cover export dev api web build test clean status regress audit audit-filings
+.PHONY: install share bootstrap bulk metadata daily derive derive-all events cover quotes export dev api web build test clean status regress audit audit-filings
 
 install:                       ## set up both workspaces
 	python3 -m venv api/.venv
@@ -20,14 +20,20 @@ metadata:                      ## sector + exchange from SEC's submissions archi
 daily:                         ## catch up: refetch only companies that filed since last sync
 	cd api && .venv/bin/python -m screener.sync daily
 
-derive:                        ## recompute snapshots after an engine change (no refetch)
+derive:                        ## recompute dashboard-eligible snapshots (no refetch)
 	cd api && .venv/bin/python -m screener.sync derive
+
+derive-all:                    ## recompute every cached snapshot, including deferred filers
+	cd api && .venv/bin/python -m screener.sync derive --all-snapshots
 
 events:                        ## material 8-K items (restatements, delisting notices) per company
 	cd api && .venv/bin/python -m screener.sync events
 
 cover:                         ## read each filing's cover: which security the ticker prices
 	cd api && .venv/bin/python -m screener.sync cover
+
+quotes:                        ## refresh every universe quote using stored histories
+	cd api && .venv/bin/python -m screener.sync quotes
 
 export:                        ## write dashboard.json (adds live prices)
 	cd api && .venv/bin/python -m screener.sync export

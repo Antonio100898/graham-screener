@@ -13,10 +13,11 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from . import sectors
+from .sources import cover
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 89  # reconcile filing-level thousands/millions share scales
+ENGINE_VERSION = 108  # compact provenance for evidence-aware owner earnings and FCF
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS snapshot (
     cik            TEXT PRIMARY KEY,
     engine_version INTEGER NOT NULL,
     computed_at    TEXT NOT NULL,
-    status         TEXT NOT NULL,   -- ok | foreign | no_xbrl | error
+    status         TEXT NOT NULL,   -- ok | pending_facts | foreign | no_xbrl | error
     data           TEXT             -- derived snapshot + screen result, JSON
 );
 CREATE INDEX IF NOT EXISTS snapshot_stale ON snapshot(engine_version);
@@ -59,6 +60,41 @@ CREATE TABLE IF NOT EXISTS tracked (
     added_at TEXT NOT NULL,
     note     TEXT
 );
+
+-- Tracking is research intent; a portfolio is accounting history.  Keeping a
+-- trade ledger instead of an `owned` flag preserves repeated buys, partial
+-- sales, fees and the evidence that was visible when each decision was made.
+CREATE TABLE IF NOT EXISTS portfolio (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    base_currency TEXT NOT NULL DEFAULT 'USD',
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS portfolio_trade (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    portfolio_id      INTEGER NOT NULL,
+    cik               TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    side              TEXT NOT NULL CHECK (side IN ('BUY', 'SELL')),
+    quantity          TEXT NOT NULL,
+    price             TEXT NOT NULL,
+    fees              TEXT NOT NULL DEFAULT '0',
+    currency          TEXT NOT NULL DEFAULT 'USD',
+    executed_at       TEXT NOT NULL,
+    broker            TEXT,
+    account_label     TEXT,
+    external_id       TEXT,
+    note              TEXT,
+    decision_snapshot TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    FOREIGN KEY (portfolio_id) REFERENCES portfolio(id),
+    UNIQUE (portfolio_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS portfolio_trade_portfolio
+    ON portfolio_trade(portfolio_id, executed_at, id);
+CREATE INDEX IF NOT EXISTS portfolio_trade_company
+    ON portfolio_trade(portfolio_id, cik, executed_at, id);
 
 -- weekly closes, kept so the price statistics can be recomputed without asking
 -- the provider for five years of history again
@@ -101,6 +137,18 @@ CREATE TABLE IF NOT EXISTS snapshot_dirty (
     marked_at  TEXT NOT NULL
 );
 
+-- A filing can be visible in EDGAR before its numeric facts reach Company Facts.
+-- This queue retries that accession while the last complete, explicitly disclosed
+-- snapshot remains available to the dashboard.
+CREATE TABLE IF NOT EXISTS pending_filing (
+    cik          TEXT PRIMARY KEY,
+    accession    TEXT,
+    filed        TEXT,
+    reason       TEXT NOT NULL,
+    first_seen   TEXT NOT NULL,
+    last_checked TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -108,8 +156,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
 """
 
 
-REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "price_history",
-                             "filing_event", "security_cover", "snapshot_dirty"})
+REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "portfolio",
+                             "portfolio_trade", "price_history", "filing_event",
+                             "security_cover", "snapshot_dirty", "pending_filing"})
 
 
 def connect(path: str | Path = DEFAULT_DB) -> sqlite3.Connection:
@@ -192,6 +241,37 @@ def put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
 
 
 def _put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
+    if status == "pending_facts":
+        pending = (data or {}).get("data_pending") or {}
+        now = _now()
+        conn.execute(
+            """INSERT INTO pending_filing
+                   (cik, accession, filed, reason, first_seen, last_checked)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(cik) DO UPDATE SET
+                 accession = excluded.accession,
+                 filed = excluded.filed,
+                 reason = excluded.reason,
+                 last_checked = excluded.last_checked""",
+            (cik, pending.get("accession"), pending.get("filed"),
+             pending.get("note") or "SEC structured facts pending", now, now),
+        )
+        if data and data.get("cik"):
+            # `_derive` recomputed the last complete filing under the current
+            # engine. It is an ordinary usable snapshot with an explicit freshness
+            # warning, not stale arithmetic and not a fabricated current filing.
+            status = "ok"
+        else:
+            existing = conn.execute(
+                "SELECT status, data FROM snapshot WHERE cik = ?", (cik,)).fetchone()
+            if existing and existing["status"] == "ok" and existing["data"]:
+                preserved = json.loads(existing["data"])
+                preserved["data_pending"] = pending
+                conn.execute("UPDATE snapshot SET data = ? WHERE cik = ?",
+                             (json.dumps(preserved), cik))
+                return
+    else:
+        conn.execute("DELETE FROM pending_filing WHERE cik = ?", (cik,))
     conn.execute(
         """INSERT INTO snapshot (cik, engine_version, computed_at, status, data)
            VALUES (?, ?, ?, ?, ?)
@@ -209,16 +289,30 @@ def _put_snapshot(conn, cik: str, status: str, data: dict | None) -> None:
 # refetch can change it, so it never counts as "stale under the current engine"
 _UNRECOMPUTABLE = "('no_xbrl')"
 
+# SEC's ticker file suffixes a preferred series with -P and an optional series
+# letter (OAK-PA, ETI-P). A share class is suffixed with the class letter alone
+# (BRK-B, BF-B) and is genuinely the common, so the P is what distinguishes them.
+_PREFERRED_TICKER = "(ticker GLOB '*-P' OR ticker GLOB '*-P[A-Z]')"
 
-def needs_recompute(conn) -> list[str]:
+
+def needs_recompute(conn, *, eligible_only: bool = False) -> list[str]:
     """Companies whose derived snapshot predates the current engine — recomputed
-    from stored raw facts, never refetched."""
+    from stored raw facts, never refetched.
+
+    Routine derive/export jobs need only securities that can enter the dashboard.
+    Tickerless filers and preferred-only symbols remain safely stale until SEC's
+    mapping makes them eligible; an exhaustive maintenance run can still request
+    every cached snapshot with the default ``eligible_only=False``.
+    """
+    eligible = (" AND c.ticker IS NOT NULL AND NOT " + _PREFERRED_TICKER
+                if eligible_only else "")
+    company_join = " JOIN company c USING (cik)" if eligible_only else ""
     rows = conn.execute(
-        f"""SELECT cik FROM snapshot
-             WHERE engine_version < ? AND status NOT IN {_UNRECOMPUTABLE}
+        f"""SELECT s.cik FROM snapshot s{company_join}
+             WHERE s.engine_version < ? AND s.status NOT IN {_UNRECOMPUTABLE}{eligible}
            UNION
-           SELECT d.cik FROM snapshot_dirty d JOIN snapshot s USING (cik)
-             WHERE s.status NOT IN {_UNRECOMPUTABLE}
+           SELECT d.cik FROM snapshot_dirty d JOIN snapshot s USING (cik){company_join}
+             WHERE s.status NOT IN {_UNRECOMPUTABLE}{eligible}
            ORDER BY cik""",
         (ENGINE_VERSION,),
     ).fetchall()
@@ -238,8 +332,9 @@ def needs_refetch(conn) -> list[str]:
     restate years we already hold, so 'do we have the latest period' is not enough."""
     rows = conn.execute(
         """SELECT cik FROM company
-           WHERE last_filing IS NOT NULL
-             AND (facts_synced IS NULL OR substr(facts_synced, 1, 10) < last_filing)"""
+           WHERE (last_filing IS NOT NULL
+                  AND (facts_synced IS NULL OR substr(facts_synced, 1, 10) < last_filing))
+              OR EXISTS (SELECT 1 FROM pending_filing p WHERE p.cik = company.cik)"""
     ).fetchall()
     return [r["cik"] for r in rows]
 
@@ -255,12 +350,6 @@ def set_state(conn, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
-
-
-# SEC's ticker file suffixes a preferred series with -P and an optional series
-# letter (OAK-PA, ETI-P). A share class is suffixed with the class letter alone
-# (BRK-B, BF-B) and is genuinely the common, so the P is what distinguishes them.
-_PREFERRED_TICKER = "(ticker GLOB '*-P' OR ticker GLOB '*-P[A-Z]')"
 
 
 def dashboard_rows(conn) -> list[dict]:
@@ -296,6 +385,7 @@ def dashboard_rows(conn) -> list[dict]:
 
 def set_cover(conn, cik: str, securities: list[dict], accn: str) -> None:
     """Every registered class a filing's cover names, with the symbol attached."""
+    securities = cover.unique_securities(securities)
     before = [tuple(r) for r in conn.execute(
         "SELECT symbol, accn, title, ratio FROM security_cover WHERE cik = ? ORDER BY symbol",
         (cik,),
@@ -446,6 +536,125 @@ def untrack(conn, cik: str) -> bool:
     return bool(changed)
 
 
+def portfolios(conn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, name, base_currency, created_at FROM portfolio ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_portfolio(conn, name: str, base_currency: str = "USD") -> dict:
+    created_at = _now()
+    cursor = conn.execute(
+        "INSERT INTO portfolio (name, base_currency, created_at) VALUES (?, ?, ?)",
+        (name, base_currency, created_at),
+    )
+    conn.commit()
+    return {
+        "id": cursor.lastrowid,
+        "name": name,
+        "base_currency": base_currency,
+        "created_at": created_at,
+    }
+
+
+def ensure_portfolio(conn, name: str = "Paper", base_currency: str = "USD") -> dict:
+    row = conn.execute(
+        "SELECT id, name, base_currency, created_at FROM portfolio WHERE name = ? COLLATE NOCASE",
+        (name,),
+    ).fetchone()
+    if row is not None:
+        return dict(row)
+    return create_portfolio(conn, name, base_currency)
+
+
+def portfolio_by_id(conn, portfolio_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT id, name, base_currency, created_at FROM portfolio WHERE id = ?",
+        (portfolio_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def portfolio_trades(conn, portfolio_id: int) -> list[dict]:
+    rows = conn.execute(
+        """SELECT id, portfolio_id, cik, ticker, side, quantity, price, fees,
+                  currency, executed_at, broker, account_label, external_id, note,
+                  decision_snapshot, created_at
+             FROM portfolio_trade
+            WHERE portfolio_id = ?
+            ORDER BY executed_at, id""",
+        (portfolio_id,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["decision_snapshot"] = json.loads(item["decision_snapshot"])
+        out.append(item)
+    return out
+
+
+def add_portfolio_trade(
+    conn,
+    *,
+    portfolio_id: int,
+    cik: str,
+    ticker: str,
+    side: str,
+    quantity: str,
+    price: str,
+    fees: str,
+    currency: str,
+    executed_at: str,
+    decision_snapshot: dict,
+    broker: str | None = None,
+    account_label: str | None = None,
+    external_id: str | None = None,
+    note: str | None = None,
+) -> dict:
+    created_at = _now()
+    cursor = conn.execute(
+        """INSERT INTO portfolio_trade
+               (portfolio_id, cik, ticker, side, quantity, price, fees, currency,
+                executed_at, broker, account_label, external_id, note,
+                decision_snapshot, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            portfolio_id,
+            cik,
+            ticker,
+            side,
+            quantity,
+            price,
+            fees,
+            currency,
+            executed_at,
+            broker,
+            account_label,
+            external_id,
+            note,
+            json.dumps(decision_snapshot, allow_nan=False, separators=(",", ":")),
+            created_at,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM portfolio_trade WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    result = dict(row)
+    result["decision_snapshot"] = json.loads(result["decision_snapshot"])
+    return result
+
+
+def delete_portfolio_trade(conn, portfolio_id: int, trade_id: int) -> bool:
+    changed = conn.execute(
+        "DELETE FROM portfolio_trade WHERE portfolio_id = ? AND id = ?",
+        (portfolio_id, trade_id),
+    ).rowcount
+    conn.commit()
+    return bool(changed)
+
+
 def set_price_history(conn, cik: str, closes) -> None:
     """Closes as (date, Decimal) pairs; stored as floats — this is a chart series,
     not money being added up, and the statistics over it are ratios."""
@@ -464,19 +673,37 @@ def price_history(conn, cik: str) -> list[tuple[date, float]]:
     return [(date.fromisoformat(d), c) for d, c in json.loads(row["series"])]
 
 
+def price_history_record(conn, cik: str) -> tuple[datetime | None, list[tuple[date, float]]]:
+    """Stored history with the fetch time needed to validate later split revisions."""
+    row = conn.execute(
+        "SELECT fetched_at, series FROM price_history WHERE cik = ?", (cik,)).fetchone()
+    if row is None:
+        return None, []
+    try:
+        fetched = datetime.fromisoformat(row["fetched_at"])
+    except (TypeError, ValueError):
+        fetched = None
+    return fetched, [(date.fromisoformat(d), c) for d, c in json.loads(row["series"])]
+
+
 def stats(conn) -> dict:
     q = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
+    all_stale = len(needs_recompute(conn))
+    eligible_stale = len(needs_recompute(conn, eligible_only=True))
     return {
         "companies": q("SELECT COUNT(*) FROM company"),
         "snapshots": q("SELECT COUNT(*) FROM snapshot"),
         "ok": q("SELECT COUNT(*) FROM snapshot WHERE status='ok'"),
-        "stale": conn.execute(
-            f"SELECT COUNT(*) FROM snapshot WHERE engine_version < ? "
-            f"AND status NOT IN {_UNRECOMPUTABLE}", (ENGINE_VERSION,)
-        ).fetchone()[0],
+        # "stale" is actionable work for the next routine derive/export.  Cached
+        # tickerless/preferred-only rows are reported separately rather than
+        # making an otherwise current dashboard look perpetually unfinished.
+        "stale": eligible_stale,
+        "deferred_stale": all_stale - eligible_stale,
         "pending_refetch": q(
-            """SELECT COUNT(*) FROM company WHERE last_filing IS NOT NULL
-               AND (facts_synced IS NULL OR substr(facts_synced,1,10) < last_filing)"""),
+            """SELECT COUNT(*) FROM company WHERE
+               (last_filing IS NOT NULL
+                AND (facts_synced IS NULL OR substr(facts_synced,1,10) < last_filing))
+               OR EXISTS (SELECT 1 FROM pending_filing p WHERE p.cik = company.cik)"""),
         "last_daily_index": get_state(conn, "last_daily_index"),
         "price_histories": q("SELECT COUNT(*) FROM price_history"),
         "companies_scanned_for_events": q(
@@ -488,6 +715,9 @@ def stats(conn) -> dict:
         "last_fetch": q("SELECT MAX(facts_synced) FROM company"),
         "computed_at": q("SELECT MAX(computed_at) FROM snapshot"),
         "last_export": get_state(conn, "last_export"),
+        "last_quote_refresh": get_state(conn, "last_quote_refresh"),
+        "last_quote_refresh_updated": get_state(conn, "last_quote_refresh_updated"),
+        "last_quote_refresh_failed": get_state(conn, "last_quote_refresh_failed"),
     }
 
 

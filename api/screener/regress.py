@@ -24,13 +24,14 @@ import argparse
 import json
 import random
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from . import evidence, store
 from .sources.edgar import EdgarClient
 from . import profiles
 from .sync import (
-    DASHBOARD_JSON, _derive_evidence, _index_tickers, _mark_peer_efficiency,
+    DASHBOARD_JSON, _derive_cached_worker, _index_tickers, _mark_peer_efficiency,
     _price_the_ratio_history, apply_price,
 )
 
@@ -38,6 +39,7 @@ from .sync import (
 # the engine. They differ on every run and would bury the fields that matter.
 VOLATILE = frozenset({
     "price", "price_asof", "quote_time", "generated", "price_stats",
+    "price_session", "market_state", "market_state_asof",
     "engine_version", "as_of",
     # dropped from the payload on the way out: engine-internal, no reader
     "ttm_eps_vintage",
@@ -77,10 +79,22 @@ def _moved(before, after) -> bool:
     return True
 
 
+def _price_history_for_row(conn, cik: str, row: dict) -> list:
+    """Mirror export's identity gate for market history.
+
+    A cached price series can outlive or predate a listing-identity decision.  The
+    UI export deliberately withholds that series unless the company is currently
+    resolved as listed, so the regression rebuild must do the same.
+    """
+    if row.get("listed") != "y":
+        return []
+    return store.price_history(conn, cik)
+
+
 def compare(sample: int | None, tickers: set[str] | None, field: str | None,
-            progress=print) -> dict:
+            progress=print, baseline: Path | None = None) -> dict:
     """Recompute and diff. Returns {field: [(ticker, before, after), ...]}."""
-    shipped = json.loads(Path(DASHBOARD_JSON).read_text())["rows"]
+    shipped = json.loads(Path(baseline or DASHBOARD_JSON).read_text())["rows"]
     rows = {r["ticker"]: r for r in shipped if r.get("ticker")}
     if tickers:
         chosen = [rows[t] for t in tickers if t in rows]
@@ -102,39 +116,51 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
 
     candidates: list[tuple[dict, dict]] = []
     failed = []
-    for i, row in enumerate(chosen, 1):
-        cik = row["cik"]
-        path = Path(edgar.cache_dir) / f"companyfacts_{cik}.json"
-        if not path.exists():
-            continue
-        ticker = index.get(cik, (row["ticker"], None))[0] or row["ticker"]
-        try:
-            # Exactly what every production path passes. Leaving a slower-moving
-            # evidence source out here would invent regression differences.
-            bundle = loader.load(cik, ticker, json.loads(path.read_text()))
-            status, fresh = _derive_evidence(bundle)
-        except Exception as exc:                     # a bad filing must not stop the sweep
-            failed.append((row["ticker"], repr(exc)[:80]))
-            continue
-        if not fresh:
-            continue
-        # `derive` is only half the pipeline. Export merges stored metadata into the
-        # row — sector, exchange, filer size — and then enriches it, so a bare
-        # recomputation is missing fields the engine never produced and reports them
-        # as deleted. Overlaying onto the shipped row keeps whatever `derive` does
-        # not own, which is exactly the set that must not count as a change.
-        merged = {**row, **fresh,
-                  "filing_events": events.get(cik, []),
-                  "events_from": events_from.get(cik),
-                  "last_filing": conn.execute(
-                      "SELECT last_filing FROM company WHERE cik = ?", (cik,)
-                  ).fetchone()["last_filing"]}
-        # Settle the candidate with the exact quote already shown by the UI. This
-        # makes criteria, verdict, yield, market value and alignment comparable
-        # without introducing a live-price change into an engine regression.
-        apply_price(merged, row.get("price"))
-        _price_the_ratio_history(merged, store.price_history(conn, cik))
-        candidates.append((row, merged))
+    # Consume completed futures promptly so one unusually large early filer cannot
+    # hold thousands of later results in memory. Candidates are sorted back into
+    # `chosen` order afterward, keeping two reports directly diffable.
+    jobs = {}
+    completed: dict[int, tuple[dict, dict]] = {}
+    with ProcessPoolExecutor(max_workers=4) as pool:
+        for order, row in enumerate(chosen):
+            cik = row["cik"]
+            path = Path(edgar.cache_dir) / f"companyfacts_{cik}.json"
+            if not path.exists():
+                continue
+            ticker = index.get(cik, (row["ticker"], None))[0] or row["ticker"]
+            ticker, receipt = loader.identity(cik, ticker)
+            task = (cik, ticker, receipt, str(edgar.cache_dir))
+            jobs[pool.submit(_derive_cached_worker, task)] = (order, row)
+
+        total_jobs = len(jobs)
+        for i, future in enumerate(as_completed(jobs), 1):
+            order, row = jobs.pop(future)
+            cik = row["cik"]
+            try:
+                _, result = future.result()
+                status, fresh = result if result is not None else (None, None)
+            except Exception as exc:                 # one bad filing must not stop the sweep
+                failed.append((row["ticker"], repr(exc)[:80]))
+                continue
+            if not fresh:
+                continue
+            # `derive` is only half the pipeline. Export merges stored metadata into
+            # the row and enriches it; retain fields that derive does not own.
+            merged = {**row, **fresh,
+                      "filing_events": events.get(cik, []),
+                      "events_from": events_from.get(cik),
+                      "last_filing": conn.execute(
+                          "SELECT last_filing FROM company WHERE cik = ?", (cik,)
+                      ).fetchone()["last_filing"]}
+            # Settle with the exact quote already shown by the UI, so only engine
+            # changes—not a live-price move—reach the comparison.
+            apply_price(merged, row.get("price"))
+            _price_the_ratio_history(merged, _price_history_for_row(conn, cik, merged))
+            completed[order] = (row, merged)
+            if i % 250 == 0:
+                progress(f"  {i}/{total_jobs} recomputed")
+
+    candidates = [completed[order] for order in sorted(completed)]
 
     # The full mandatory run can recompute peer medians exactly. A ticker/sample
     # run retains the shipped peer record because an incomplete peer universe is
@@ -171,10 +197,13 @@ def main(argv=None) -> int:
     ap.add_argument("--field", help="only fields starting with this prefix")
     ap.add_argument("--ticker", help="comma-separated tickers instead of a sample")
     ap.add_argument("--show", type=int, default=6, help="examples per field")
+    ap.add_argument("--baseline", type=Path,
+                    help="dashboard payload to compare instead of the currently shipped one")
     args = ap.parse_args(argv)
 
     tickers = {t.strip().upper() for t in args.ticker.split(",")} if args.ticker else None
-    changes, n = compare(None if args.all else args.sample, tickers, args.field)
+    changes, n = compare(None if args.all else args.sample, tickers, args.field,
+                         baseline=args.baseline)
 
     if not changes:
         print(f"\nno field moved across {n} companies")

@@ -55,6 +55,26 @@ This is intentionally evolutionary. The tag chains and filing-specific knowledge
 in `normalize.py` are valuable and should not be rewritten merely to rearrange
 files.
 
+Three operational guards sit across those boundaries:
+
+- Annual statement series share one filing-anchored fiscal calendar. The newest
+  credible annual declaration settles whether a January/February year uses the
+  ending calendar year or the prior year; comparative columns are propagated from
+  that anchor. Non-conflicting dates from an older calendar regime may fill history
+  without shifting the current convention.
+- When a new 20-F/40-F accession reaches Company Facts before its structured
+  statements, `pending_filing` keeps it on the retry queue while normalization
+  recomputes and clearly labels the last complete filing. The company therefore
+  remains visible without presenting old fundamentals as current.
+- Export accepts only positive finite USD quotes. A refreshed weekly history may
+  not lose coverage or rescale old closes unless a recent provider split event
+  explains the factor; rejected refreshes retain the stored series and add a UI
+  warning.
+- The running API performs one small quote request for every eligible ticker each
+  hour and atomically replaces `dashboard.json`. It reuses validated local weekly
+  histories; both Research and Portfolio consume this one snapshot. A failed
+  ticker request retains its previous timestamped quote and adds a warning.
+
 ## Next boundary: entity versus security
 
 Introduce persistent `security` records keyed independently of CIK, carrying the

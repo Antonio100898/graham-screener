@@ -59,6 +59,8 @@ def build(gaap=GAAP):
     return build_snapshot("TEST", "0000000001", facts_doc(gaap))
 OE_GAAP = {
     **GAAP,
+    "NetIncomeLoss": tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 70e9, accn="k25", filed="2026-02-15")]),
     "OperatingIncomeLoss": tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 100e9, accn="k25", filed="2026-02-15")]),
     "DepreciationDepletionAndAmortization": tagdata("USD", [
@@ -67,6 +69,8 @@ OE_GAAP = {
         dur("2025-01-01", "2025-12-31", 20e9, accn="k25", filed="2026-02-15")]),
     "PaymentsToAcquirePropertyPlantAndEquipment": tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15")]),
+    "NetCashProvidedByUsedInOperatingActivities": tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 75e9, accn="k25", filed="2026-02-15")]),
     "CashAndCashEquivalentsAtCarryingValue": tagdata("USD", [
         inst("2026-03-31", 40e9, accn="q126")]),
 }

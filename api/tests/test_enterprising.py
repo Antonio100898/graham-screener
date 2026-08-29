@@ -44,6 +44,7 @@ def snap(**overrides):
         shares_outstanding=F("CommonStockSharesOutstanding", 10),
         dividend=F("Dividends", 5),
         dividend_per_share=Decimal("0.50"),
+        recurring_dividend_per_share=F("RecurringDividendPerShare", "0.50", form="10-Q"),
         pays_dividend=True,
         balance_sheet_date=date(2026, 3, 31),
     )
@@ -170,6 +171,18 @@ def test_zero_current_liabilities_is_insufficient():
 def test_no_dividend_fails_criterion_5():
     r = evaluate(snap(pays_dividend=False, dividend=None), QUOTE)
     assert crit(r)[5].status == Status.FAIL
+
+
+def test_criterion_5_yield_uses_recurring_rate_not_special_inclusive_ttm_cash():
+    r = evaluate(snap(
+        dividend_per_share=Decimal("4.40"),
+        recurring_dividend_per_share=F("RecurringDividendPerShare", "1.40", form="10-Q"),
+    ), QUOTE)
+
+    c5 = crit(r)[5]
+    assert c5.value == Decimal("2.80")
+    assert "special dividends excluded" in c5.note
+    assert "trailing cash was 4.40" in c5.note
 
 
 def test_noncontrolling_interest_deducted_from_tbv():

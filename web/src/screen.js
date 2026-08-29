@@ -31,6 +31,21 @@ const PRICE_CRITERIA = new Set([1, 7]);
 /** Criterion by its number — the array is no longer numbered 1..n positionally. */
 export const byN = (row, n) => row.criteria.find((c) => c.n === n);
 
+/** A missing operating margin is materially different from a zero margin.
+ * The filing must provide a same-period operating-income/revenue basis; the UI
+ * says when it did not instead of leaving an unexplained dash. */
+export function reportedRate(value) {
+  return value == null ? "Not available" : `${Number(value).toFixed(1)}%`;
+}
+
+/** Criterion 5 shows only the filing-backed recurring rate. The engine keeps
+ * special-inclusive trailing cash in the note, never in the headline yield. */
+export function recurringDividendPresentation(value, note) {
+  if (value == null) return { value: "—", note };
+  const rate = Number(value).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return { value: `${rate}% recurring`, note };
+}
+
 export function closeness(row) {
   const unmet = row.criteria.filter((c) => c.status !== "PASS");
   if (unmet.length === 0)
@@ -125,4 +140,34 @@ export function pe3(row) {
   if (priceYear && years[0] < priceYear - 2) return null;
   const avg = (eps[years[0]] + eps[years[1]] + eps[years[2]]) / 3;
   return avg > 0 ? row.price / avg : null;
+}
+
+/** Median of usable valuation multiples. A loss-making company has no meaningful
+ * positive P/E, and missing evidence stays missing rather than becoming zero. */
+export function medianPositive(values) {
+  const usable = values
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b);
+  if (!usable.length) return null;
+  const middle = Math.floor(usable.length / 2);
+  return usable.length % 2
+    ? usable[middle]
+    : (usable[middle - 1] + usable[middle]) / 2;
+}
+
+/** Valuation reference for one index over the complete, unfiltered UI universe.
+ * Current P/E is read from settled criterion 1; it is never recomputed here. */
+export function indexValuation(rows, indexName) {
+  const members = rows.filter((row) => row.idx?.includes(indexName));
+  const peValues = members
+    .map((row) => byN(row, 1)?.value)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const pe3Values = members
+    .map((row) => row.pe3)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return {
+    members: members.length,
+    pe: { median: medianPositive(peValues), count: peValues.length },
+    pe3: { median: medianPositive(pe3Values), count: pe3Values.length },
+  };
 }

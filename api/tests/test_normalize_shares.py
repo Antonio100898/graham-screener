@@ -102,6 +102,62 @@ def test_per_share_dividend_detection_uses_the_chain_unit_not_the_name():
     assert s.dividend_per_share == Decimal("1.9") + Decimal("0.5") - Decimal("0.45")
 
 
+def test_recurring_dividend_annualizes_regular_quarter_and_excludes_bke_style_special():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["CommonStockDividendsPerShareCashPaid"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-03-31", 0.35, form="10-Q", accn="q125"),
+        dur("2025-04-01", "2025-06-30", 0.35, form="10-Q", accn="q225"),
+        dur("2025-07-01", "2025-09-30", 0.35, form="10-Q", accn="q325"),
+        dur("2025-10-01", "2025-12-31", 0.35, form="10-K", accn="k25"),
+        # The annual cash figure contains a $3.00 special on top of $1.40 regular.
+        dur("2025-01-01", "2025-12-31", 4.40, form="10-K", accn="k25"),
+        dur("2026-01-01", "2026-03-31", 0.35, form="10-Q", accn="q126"),
+    ])
+
+    s = build(gaap)
+
+    assert s.dividend_per_share == Decimal("4.40")
+    assert s.recurring_dividend_per_share.value == Decimal("1.40")
+    assert s.recurring_dividend_per_share.provenance.period_end == date(2026, 3, 31)
+    assert "annualized" in s.recurring_dividend_per_share.provenance.concept
+
+
+def test_a_special_in_the_latest_quarter_does_not_become_the_recurring_rate():
+    gaap = dict(GAAP)
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-04-01", "2025-06-30", 0.35, form="10-Q", accn="q225"),
+        dur("2025-07-01", "2025-09-30", 0.35, form="10-Q", accn="q325"),
+        dur("2025-10-01", "2025-12-31", 0.35, form="10-K", accn="k25"),
+        dur("2026-01-01", "2026-03-31", 3.35, form="10-Q", accn="q126"),
+    ])
+
+    recurring = build(gaap).recurring_dividend_per_share
+
+    assert recurring.value == Decimal("1.40")
+    assert recurring.provenance.period_end == date(2025, 12, 31)
+
+
+def test_recurring_dividend_is_missing_without_three_recent_direct_quarters():
+    gaap = dict(GAAP)
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-10-01", "2025-12-31", 0.35, form="10-K", accn="k25"),
+        dur("2026-01-01", "2026-03-31", 0.35, form="10-Q", accn="q126"),
+    ])
+
+    assert build(gaap).recurring_dividend_per_share is None
+
+
+def test_variable_quarterly_distributions_are_not_called_recurring():
+    gaap = dict(GAAP)
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-07-01", "2025-09-30", 0.20, form="10-Q", accn="q325"),
+        dur("2025-10-01", "2025-12-31", 0.70, form="10-K", accn="k25"),
+        dur("2026-01-01", "2026-03-31", 0.80, form="10-Q", accn="q126"),
+    ])
+
+    assert build(gaap).recurring_dividend_per_share is None
+
+
 def test_per_unit_lp_distribution_feeds_dps_without_a_share_count_uan_style():
     gaap = {k: v for k, v in GAAP.items()
             if k not in ("PaymentsOfDividendsCommonStock", "CommonStockSharesOutstanding")}
@@ -193,6 +249,25 @@ def test_dual_class_instant_fragment_loses_to_corroborated_weighted_hei_style():
         dur("2026-01-01", "2026-03-31", 141e6, form="10-Q", accn="q126", filed="2026-05-05")])
     s = build_snapshot("TEST", "0000000001", facts_doc(gaap))
     assert float(s.shares_outstanding.value) == 141e6
+
+
+def test_same_filing_cover_and_weighted_count_outvote_flattened_comparative_omh_style():
+    """OMH's 2025 20-F says 22.260M Class A shares on its cover and reports a
+    14.139M annual weighted count, but its flattened GAAP instant repeats the
+    2.359M comparative. Same-accession/date evidence identifies the outlier."""
+    gaap = dict(GAAP)
+    gaap["CommonStockSharesOutstanding"] = tagdata("shares", [
+        inst("2025-12-31", 2_359_030, form="20-F", accn="k25", filed="2026-04-28")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 14_138_744,
+            form="20-F", accn="k25", filed="2026-04-28")])
+    dei = {"EntityCommonStockSharesOutstanding": tagdata("shares", [
+        inst("2025-12-31", 22_259_591, form="20-F", accn="k25", filed="2026-04-28")])}
+
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap, dei))
+
+    assert s.shares_outstanding.value == Decimal("22259591")
+    assert s.shares_outstanding.provenance.tag == "dei:EntityCommonStockSharesOutstanding"
 
 
 def test_lone_lp_unit_instant_retired_when_earnings_disagree_sun_style():
@@ -513,6 +588,40 @@ def test_a_cover_title_stops_where_its_cell_does():
     assert _class_member("Class B Common Stock") != clean
 
 
+def test_class_voting_decoration_does_not_hide_the_registered_class():
+    """BAM's cover calls its security Class A Limited Voting Shares while the
+    taxonomy calls the same security CommonClassA. Voting is a legal attribute,
+    not a different class identifier once the Class A name is present."""
+    from screener.normalize import _class_member
+
+    assert _class_member("Class A Limited Voting Shares") == _class_member("CommonClassA")
+
+
+def test_a_preferred_cover_collision_does_not_replace_a_plain_common_ticker():
+    """The old cover grammar truncated ``GLP pr B`` to ``GLP`` and persisted its
+    preferred title over the real common-unit row. A plain ticker cannot name that
+    preferred row, so it must not suppress unambiguous common-unit evidence."""
+    from screener.normalize import _registered_class_title, _unambiguous_dimensioned
+
+    sidecar = dimensioned("EarningsPerShareDiluted", "USD/shares", [dict(
+        classed_entry("2025-01-01", "2025-12-31", 2.34,
+                      "ClassOfStock=CommonStock;"),
+    )])
+    registered = _registered_class_title(
+        "KKR", {"title": "6.25% Series D Mandatory Convertible Preferred Stock"})
+    assert registered is None
+    assert _unambiguous_dimensioned(sidecar, registered)
+
+    # A SPAC unit's own title may mention the redeemable warrant bundled with its
+    # Class A share. That is not an overwritten preferred row, and its explicit
+    # Class A identity must continue to reject the founder's Class B count.
+    unit = _registered_class_title(
+        "BCSS", {"title": "Units, each consisting of one Class A ordinary share "
+                           "and one-half of one redeemable warrant"})
+    assert unit is not None
+    assert _unambiguous_dimensioned(sidecar, unit) == {}
+
+
 def test_the_only_class_on_file_is_refused_when_it_is_not_the_ticker_s():
     """One class reported for a period reads as unambiguous, and usually is. But a
     blank-cheque company files a weighted share count for its founders' Class B and
@@ -524,3 +633,30 @@ def test_the_only_class_on_file_is_refused_when_it_is_not_the_ticker_s():
     assert _a_different_class("ClassOfStock=CommonClassA;", "CommonClassA") is False
     assert _a_different_class("ClassOfStock=CommonClassB;", None) is False   # nothing to contradict
     assert _a_different_class("", "CommonClassA") is False                   # not class-dimensioned
+
+
+def test_an_unlisted_preferred_dimension_is_not_assigned_to_common_by_default():
+    """ELDN's only dimensioned EPS member is Series X convertible preferred.
+    'Only one' does not make a clearly non-common security the listed common."""
+    from screener.normalize import _unambiguous_dimensioned
+
+    sidecar = dimensioned("EarningsPerShareDiluted", "USD/shares", [dict(
+        classed_entry(
+            "2025-01-01", "2025-12-31", -28.73,
+            "ClassOfStock=SeriesXAndSeriesX1NonVotingConvertiblePreferredStock;"),
+    )])
+    assert _unambiguous_dimensioned(sidecar) == {}
+
+
+def test_a_named_but_unmatched_class_is_withheld():
+    """A ticker/cover naming Class A is contradictory evidence when the sidecar
+    offers only Class B; it is not permission to take the lone wrong class."""
+    from screener.normalize import _registered_class_title, _unambiguous_dimensioned
+
+    sidecar = dimensioned("EarningsPerShareDiluted", "USD/shares", [dict(
+        classed_entry("2025-01-01", "2025-12-31", -28.77,
+                      "ClassOfStock=CommonClassB;"),
+    )])
+    registered = _registered_class_title("BH-A", None)
+    assert registered == "Class A Common Stock"
+    assert _unambiguous_dimensioned(sidecar, registered) == {}

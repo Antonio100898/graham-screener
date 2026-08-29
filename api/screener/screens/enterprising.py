@@ -251,13 +251,23 @@ def _c5_dividend(s: FinancialSnapshot, q: Quote | None) -> CriterionResult:
         return CriterionResult(5, name, Status.INSUFFICIENT_DATA, None, threshold, (),
                                note="dividend status could not be established")
     if s.pays_dividend:
-        inputs = (s.dividend,) if s.dividend else ()
+        inputs = tuple(f for f in (s.dividend, s.recurring_dividend_per_share)
+                       if f is not None)
         # the test is yes/no, but the yield is what a reader actually wants to see
         yield_pct = None
         note = None
-        if s.dividend_per_share is not None and q is not None and q.price > 0:
-            pct = (s.dividend_per_share / q.price * 100).quantize(_CENT)
-            note = f"{s.dividend_per_share.quantize(_CENT)} per share over twelve months"
+        recurring = s.recurring_dividend_per_share
+        if recurring is not None and q is not None and q.price > 0:
+            pct = (recurring.value / q.price * 100).quantize(_CENT)
+            quarter = recurring.provenance.period_end
+            note = (f"{recurring.value.quantize(_CENT)} per share annualized from the "
+                    f"latest ordinary quarterly rate"
+                    + (f" reported for the quarter ended {quarter.isoformat()}" if quarter else "")
+                    + "; special dividends excluded")
+            if (s.dividend_per_share is not None
+                    and s.dividend_per_share != recurring.value):
+                note += (f"; trailing cash was {s.dividend_per_share.quantize(_CENT)} "
+                         "per share including any specials")
             # A yield above par is arithmetic, not information: it means the price and
             # the payment describe different securities — a preferred-share ticker
             # mapped to the parent's facts, or a stub price against a real dividend.
@@ -266,6 +276,9 @@ def _c5_dividend(s: FinancialSnapshot, q: Quote | None) -> CriterionResult:
                 yield_pct = pct
             else:
                 note += f"; yield of {pct}% is not meaningful against this price"
+        elif recurring is None:
+            note = ("pays a dividend, but no reliable recurring rate is available "
+                    "from direct quarterly per-share filing facts")
         return CriterionResult(5, name, Status.PASS, yield_pct, threshold, inputs, note=note)
     return CriterionResult(5, name, Status.FAIL, None, threshold, (),
                            note="no dividend payments found in recent filings")

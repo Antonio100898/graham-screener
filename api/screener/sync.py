@@ -3,10 +3,12 @@
     python -m screener.sync bootstrap [--limit N]   from the cache already on disk
     python -m screener.sync bulk                    download SEC's 1.4GB companyfacts.zip
     python -m screener.sync daily                   catch up via the daily index
-    python -m screener.sync derive                  recompute snapshots after a code change
+    python -m screener.sync derive                  recompute dashboard-eligible snapshots
+    python -m screener.sync derive --all-snapshots  recompute every cached snapshot
     python -m screener.sync events                  material 8-K items from each filing index
     python -m screener.sync cover                   what each filing's cover says the ticker is
     python -m screener.sync export                  write dashboard.json
+    python -m screener.sync quotes                  refresh every dashboard quote
     python -m screener.sync dera --from 2021q1      dimensioned + extension facts
     python -m screener.sync status
 
@@ -22,8 +24,8 @@ import io
 import json
 import sys
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -31,7 +33,7 @@ import httpx
 
 from . import ch13, evidence, pricestats, profiles, store
 from . import normalize
-from .normalize import UnsupportedFilerError, build_snapshot
+from .normalize import PendingFilingFactsError, UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
                                    YIELD_IMPLAUSIBLE, evaluate, settled_debt)
 from .sources import cover, dera, indexes
@@ -50,6 +52,23 @@ def _print_progress(message: str, done: int = 0, total: int = 0) -> None:
 
 def _facts_path(edgar: EdgarClient, cik: str) -> Path:
     return edgar.cache_dir / f"companyfacts_{cik}.json"
+
+
+def _derive_cached_worker(task: tuple[str, str, dict | None, str]):
+    """Read and derive one cached filer in a process with no database handle."""
+    cik, ticker, receipt, cache_dir = task
+    cache = Path(cache_dir)
+    fp = cache / f"companyfacts_{cik}.json"
+    if not fp.exists():
+        return cik, None
+    bundle = evidence.EvidenceBundle(
+        cik=cik,
+        ticker=ticker,
+        facts=json.loads(fp.read_text()),
+        dimensioned=dera.load_sidecar(cache, cik),
+        receipt=receipt,
+    )
+    return cik, _derive_evidence(bundle)
 
 
 def _source(fact) -> dict | None:
@@ -95,6 +114,16 @@ def _source(fact) -> dict | None:
     return src
 
 
+def _duration_source(fact, unit: str | None = None) -> dict | None:
+    """A duration fact whose start is required to identify the exact context."""
+    src = _source(fact)
+    if src is not None and fact.provenance.period_start is not None:
+        src["start"] = fact.provenance.period_start.isoformat()
+    if src is not None and unit is not None:
+        src["unit"] = unit
+    return src
+
+
 def _series_mix(series: dict) -> dict | None:
     """Which tag served which years — only when the series switched tags, so the
     reader sees a scope change (ProfitLoss beside NetIncomeLoss) instead of a
@@ -107,25 +136,76 @@ def _series_mix(series: dict) -> dict | None:
     return {tag: sorted(years) for tag, years in tags.items()}
 
 
+def _without_filing(companyfacts: dict, filing: tuple[str, str]) -> dict:
+    """A Company Facts view before an incomplete accession appeared.
+
+    SEC normally retains every older fact when a new filing arrives. Removing only
+    the pending accession therefore reconstructs the last complete evidence set and
+    lets the current engine recompute it, instead of retaining stale arithmetic or
+    dropping the company while SEC finishes ingesting the new filing.
+    """
+    filed, accn = filing
+    facts = {}
+    for namespace, taxonomy in (companyfacts.get("facts") or {}).items():
+        kept_taxonomy = {}
+        for tag, tagdata in taxonomy.items():
+            units = {}
+            for unit, entries in (tagdata.get("units") or {}).items():
+                kept = [e for e in entries
+                        if (e.get("filed"), e.get("accn", "")) != (filed, accn)]
+                if kept:
+                    units[unit] = kept
+            if units:
+                kept_taxonomy[tag] = {**tagdata, "units": units}
+        if kept_taxonomy:
+            facts[namespace] = kept_taxonomy
+    return {**companyfacts, "facts": facts}
+
+
 def _derive(cik: str, ticker: str, facts: dict, quote=None,
             dimensioned: dict | None = None,
             receipt: dict | None = None) -> tuple[str, dict | None]:
     """Snapshot + screen result, flattened for the dashboard."""
+    pending: dict | None = None
     try:
         snap = build_snapshot(ticker, cik, facts, assume_absent_zero=False,
                               dimensioned=dimensioned, receipt=receipt)
+    except PendingFilingFactsError as exc:
+        filed, accession = exc.filing
+        pending = {
+            "kind": "SEC_FACTS_PENDING",
+            "filed": filed,
+            "accession": accession,
+            "note": ("A newer annual filing is indexed, but SEC structured statements "
+                     "are not complete yet; calculations use the last complete filing."),
+        }
+        try:
+            snap = build_snapshot(
+                ticker, cik, _without_filing(facts, exc.filing),
+                assume_absent_zero=False, dimensioned=dimensioned, receipt=receipt)
+        except UnsupportedFilerError:
+            return "pending_facts", {"data_pending": pending}
+        except Exception as fallback_exc:
+            return "error", {"error": repr(fallback_exc)[:200], "data_pending": pending}
     except UnsupportedFilerError:
         return "foreign", None
     except Exception as exc:  # a malformed filing must not stop a 4,000-company run
         return "error", {"error": repr(exc)[:200]}
     r = evaluate(snap, quote)
+    source_namespace = (snap.total_assets.provenance.tag.partition(":")[0]
+                        if snap.total_assets is not None else "us-gaap")
+    statement_taxonomy = (
+        normalize._ifrs_as_us_gaap(facts.get("facts", {}).get("ifrs-full", {}))
+        if source_namespace == "ifrs-full"
+        else facts.get("facts", {}).get("us-gaap", {})
+    )
     historical_ratios = normalize.annual_ratios(
-        facts.get("facts", {}).get("us-gaap", {}), snap.annual_net_income,
+        statement_taxonomy, snap.annual_net_income,
         snap.annual_revenue, snap.annual_operating_income,
         annual_eps=snap.annual_eps)
     if receipt and receipt.get("ratio"):
         _restate_historical_ratios(historical_ratios, Decimal(str(receipt["ratio"])))
-    return "ok", {
+    row = {
         "cik": cik,
         "ticker": ticker,
         "verdict": r.verdict.value,
@@ -141,9 +221,13 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         "annual_eps": {str(y): float(v) for y, v in r.annual_eps_series.items()},
         "annual_net_income": {str(y): float(f.value)
                               for y, f in sorted(snap.annual_net_income.items())},
-        # the panel divides income by EPS to cross-check the share count, and EPS
-        # nets preferred dividends while the income tag does not: Occidental's
-        # column read 3,509.6M implied shares against a reported 999.7M
+        # The weighted denominator reported in the filing. The panel formerly
+        # inferred this from total net income / EPS, which is not valid when the
+        # EPS numerator has a narrower scope (ZWS continuing operations, LP units).
+        "annual_weighted_shares": {str(y): float(f.value)
+                                   for y, f in sorted(snap.annual_share_counts.items())},
+        # Retained as engine evidence: EPS nets preferred dividends while the
+        # income tag generally does not.
         "annual_preferred_dividends": {str(y): float(v) for y, v in
                                        sorted(snap.annual_preferred_dividends.items())} or None,
         "ttm_net_income": float(snap.ttm_net_income) if snap.ttm_net_income is not None else None,
@@ -218,6 +302,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         "cover_shares": float(snap.cover_shares.value) if snap.cover_shares else None,
         "dividend_per_share": float(snap.dividend_per_share)
                               if snap.dividend_per_share is not None else None,
+        "recurring_dividend_per_share": (
+            float(snap.recurring_dividend_per_share.value)
+            if snap.recurring_dividend_per_share is not None else None),
         "owner_earnings": _owner_earnings_row(snap),
         "short_term_debt": float(snap.short_term_debt.value) if snap.short_term_debt else None,
         "goodwill": float(snap.goodwill.value) if snap.goodwill else None,
@@ -253,7 +340,10 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("temporary_equity", _source(snap.temporary_equity)),
             ("noncontrolling_interest", _source(snap.noncontrolling_interest)),
             ("shares", _source(snap.shares_outstanding)),
+            ("weighted_shares", _source(_newest(snap.annual_share_counts))),
             ("dividend", _source(snap.dividend)),
+            ("recurring_dividend_per_share",
+             _duration_source(snap.recurring_dividend_per_share, "USD/shares")),
             # the newest annual earnings figure: which element stated it, and in
             # which filing — a restatement changes both
             ("eps", _source(snap.annual_eps[max(snap.annual_eps)]) if snap.annual_eps else None),
@@ -261,10 +351,14 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # scope-switch disclosure: annual series stitched from more than one tag
         "series_mix": {name: mix for name, mix in (
             ("eps", _series_mix(snap.annual_eps)),
+            ("weighted_shares", _series_mix(snap.annual_share_counts)),
             ("net_income", _series_mix(snap.annual_net_income)),
             ("revenue", _series_mix(snap.annual_revenue)),
         ) if mix is not None} or None,
     }
+    if pending is not None:
+        row["data_pending"] = pending
+    return ("pending_facts" if pending is not None else "ok"), row
 
 
 def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None) -> tuple[str, dict | None]:
@@ -276,10 +370,10 @@ def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None) -> tuple[str, 
 def _restate_historical_ratios(ratios: dict, receipt_ratio: Decimal) -> None:
     """Put historical per-share book figures onto the same receipt as its prices.
 
-    Percentages and entity-level totals do not move. A ratio at or below one is
-    not an underlying-shares-per-receipt conversion and is deliberately ignored.
+    Percentages and entity-level totals do not move. The conversion is valid for
+    any positive ratio: some receipts represent a fraction of one ordinary share.
     """
-    if receipt_ratio <= 1:
+    if receipt_ratio <= 0 or receipt_ratio == 1:
         return
     for values in ratios.values():
         for key in ("bvps", "tbvps", "ncavps"):
@@ -363,19 +457,87 @@ def _ttm_basis(snap) -> str:
 
 
 def _owner_earnings_row(snap) -> dict | None:
-    """Return on capital is not one of Graham's requirements, so it rides alongside
-    the verdict rather than inside it — a way to rank companies that already passed."""
+    """Serialize owner-earnings evidence without inventing maintenance capex.
+
+    The legacy definitive fields stay present as null so an old client cannot silently
+    relabel the all-capex proxy as Buffett owner earnings. The named estimates and FCF
+    are the only numeric fields consumers may use.
+    """
     oe = snap.owner_earnings
     if oe is None:
         return None
+    # The requested view is a calendar of the latest ten fiscal-year slots, not
+    # the latest ten observations. Sparse evidence must produce visible gaps
+    # rather than reaching farther into the past to fill the quota.
+    years = [year for year in sorted(oe.annual)
+             if oe.fiscal_year - 9 <= year <= oe.fiscal_year]
+    floor_sources = oe.all_capex_floor.provenance.components
+    owner_sources = {}
+    for name, provenance in zip(
+        ("reported_earnings", "depreciation_and_amortisation", "total_capex"),
+        floor_sources,
+    ):
+        owner_sources[name] = {
+            "tag": provenance.tag,
+            "form": provenance.form,
+            "accn": provenance.accession,
+            "end": (provenance.period_end.isoformat()
+                    if provenance.period_end else None),
+            "filed": provenance.filed.isoformat() if provenance.filed else None,
+        }
+    if oe.free_cash_flow is not None and oe.free_cash_flow.provenance.components:
+        provenance = oe.free_cash_flow.provenance.components[0]
+        owner_sources["operating_cash_flow"] = {
+            "tag": provenance.tag,
+            "form": provenance.form,
+            "accn": provenance.accession,
+            "end": (provenance.period_end.isoformat()
+                    if provenance.period_end else None),
+            "filed": provenance.filed.isoformat() if provenance.filed else None,
+        }
     return {
         "fiscal_year": oe.fiscal_year,
-        "owner_earnings": float(oe.owner_earnings),
+        "status": "ESTIMATE_ONLY",
+        "owner_earnings": None,
+        "maintenance_capex": None,
+        "maintenance_basis": "UNAVAILABLE_PRIMARY_XBRL",
+        "all_capex_floor": float(oe.all_capex_floor.value),
+        "maintenance_estimate": float(oe.maintenance_estimate.value),
+        "free_cash_flow": (float(oe.free_cash_flow.value)
+                           if oe.free_cash_flow is not None else None),
         "invested_capital": float(oe.invested_capital) if oe.invested_capital is not None else None,
-        "roic": float(oe.roic) if oe.roic is not None else None,
-        "roic_maintenance": float(oe.roic_maintenance) if oe.roic_maintenance is not None else None,
+        "roic": None,
+        "all_capex_return": (float(oe.all_capex_return)
+                             if oe.all_capex_return is not None else None),
+        "maintenance_estimate_return": (
+            float(oe.maintenance_estimate_return)
+            if oe.maintenance_estimate_return is not None else None),
         "components": [[label, float(v)] for label, v in oe.components],
+        "free_cash_flow_components": [
+            [label, float(value)] for label, value in oe.free_cash_flow_components],
+        # One compact source per filed input. The three derived measures share
+        # these inputs; repeating their full provenance trees inflated the UI
+        # payload by tens of megabytes without adding evidence.
+        "sources": owner_sources,
         "caveats": list(oe.caveats),
+        # Ten completed fiscal years, on today's split and traded-security basis.
+        # A missing year is omitted rather than imputed; the UI renders the gap.
+        "annual_per_share": {
+            str(year): {
+                "all_capex_floor_per_share": float(
+                    oe.annual[year].all_capex_floor_per_share.value),
+                "maintenance_estimate_per_share": float(
+                    oe.annual[year].maintenance_estimate_per_share.value),
+                "free_cash_flow_per_share": (
+                    float(oe.annual[year].free_cash_flow_per_share.value)
+                    if oe.annual[year].free_cash_flow_per_share is not None else None),
+                "diluted_shares": float(oe.annual[year].diluted_shares.value),
+                "end": (oe.annual[year].maintenance_estimate_per_share.provenance.period_end.isoformat()
+                        if oe.annual[year].maintenance_estimate_per_share.provenance.period_end
+                        else None),
+            }
+            for year in years
+        },
     }
 
 
@@ -559,6 +721,7 @@ def _dera_tags() -> tuple[frozenset[str], frozenset[str]]:
     per_share = frozenset(
         normalize.EPS_TAGS + normalize.EPS_BASIC_TAGS + (normalize.EPS_CONTINUING_TAG,)
         + tuple(tag for tag, unit in normalize.DIVIDEND_TAGS if "USD/shares" in unit)
+        + tuple(normalize.IFRS_PER_SHARE_TAGS)
     )
     wanted = frozenset(
         tuple(per_share)
@@ -566,6 +729,7 @@ def _dera_tags() -> tuple[frozenset[str], frozenset[str]]:
         + normalize.NET_INCOME_TAGS + normalize.REVENUE_TAGS
         + normalize.OPERATING_INCOME_TAGS + normalize.PRETAX_TAGS
         + tuple(tag for tag, _ in normalize.DIVIDEND_TAGS)
+        + tuple(normalize.IFRS_SOURCE_TAGS)
         + ("Assets", "Liabilities", "AssetsCurrent", "LiabilitiesCurrent",
            "CommonStockSharesOutstanding", "EntityCommonStockSharesOutstanding",
            "Goodwill", "IntangibleAssetsNetExcludingGoodwill")
@@ -707,7 +871,32 @@ def events(conn, progress=_print_progress) -> None:
     progress("done", len(ciks), len(ciks))
 
 
-def cover_pages(conn, progress=_print_progress) -> None:
+def _current_supported_annual(facts: dict) -> tuple[str, str] | None:
+    """Newest foreign annual filing when it carries supported USD statements.
+
+    Old facts from another reporting basis can remain after a transition, so the
+    accession must match the newest 20-F/40-F represented anywhere in Company Facts.
+    """
+    namespaces = (facts.get("facts") or {})
+    newest, statement_basis = normalize._current_supported_foreign_annual(namespaces)
+    if newest is None or statement_basis is None or not newest[1]:
+        return None
+    return newest[1], newest[0]
+
+
+def _submissions_identity(d: dict) -> tuple[str | None, str | None, str | None, str | None]:
+    """Incorporation plus the visible filing-history span from one SEC header."""
+    filings = d.get("filings") or {}
+    recent = (filings.get("recent") or {}).get("filingDate") or []
+    first = [f["filingFrom"] for f in (filings.get("files") or []) if f.get("filingFrom")]
+    if recent:
+        first.append(min(recent))
+    return (d.get("stateOfIncorporation"), d.get("stateOfIncorporationDescription"),
+            min(first) if first else None, max(recent) if recent else None)
+
+
+def cover_pages(conn, progress=_print_progress, *, foreign_only: bool = False,
+                ciks: set[str] | None = None) -> None:
     """Read the cover of each company's newest annual filing.
 
     Two facts there decide what every per-share figure on this dashboard means,
@@ -735,12 +924,56 @@ def cover_pages(conn, progress=_print_progress) -> None:
                    for s in (row.get("sources") or {}).values() if s.get("accn")]
         return max(filings)[1] if filings else None
 
-    todo = [(r["cik"], r["ticker"], newest(r)) for r in store.dashboard_rows(conn)]
-    todo = [(cik, ticker, accn) for cik, ticker, accn in todo if accn]
+    todo = [] if foreign_only else [
+        (r["cik"], r["ticker"], newest(r), False) for r in store.dashboard_rows(conn)
+    ]
+
+    # Foreign-form rows are not on the dashboard yet, so they cannot be reached
+    # through dashboard_rows(). Read the cached facts just far enough to select
+    # current USD US-GAAP/IFRS 20-F/40-F filers.
+    foreign_rows = conn.execute(
+        """SELECT c.cik, c.ticker, c.name
+           FROM snapshot s JOIN company c USING (cik)
+           WHERE s.status = 'foreign' AND c.listed = 'y' AND c.ticker IS NOT NULL
+             AND NOT (c.ticker GLOB '*-P' OR c.ticker GLOB '*-P[A-Z]')
+           ORDER BY c.cik"""
+    ).fetchall()
+    for row in foreign_rows:
+        if ciks is not None and row["cik"] not in ciks:
+            continue
+        path = _facts_path(edgar, row["cik"])
+        if not path.exists():
+            continue
+        try:
+            current = _current_supported_annual(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+        if current:
+            accn, filed = current
+            store.upsert_company(conn, row["cik"], row["ticker"], row["name"],
+                                 last_filing=filed)
+            todo.append((row["cik"], row["ticker"], accn, True))
+
+    # An unchanged cover is immutable. Do not make another SEC request merely
+    # because the derivation engine changed; parser improvements are applied to
+    # the preserved title by EvidenceLoader.
+    covered = {
+        (cik, security["symbol"], security["accn"])
+        for cik, securities in store.covers_by_cik(conn).items()
+        for security in securities
+    }
+    todo = [(cik, ticker, accn, foreign) for cik, ticker, accn, foreign in todo
+            if accn and (cik, ticker, accn) not in covered]
     progress(f"reading cover pages for {len(todo)} companies", 0, len(todo))
 
     def read(item):
-        cik, ticker, accn = item
+        cik, ticker, accn, foreign = item
+        identity = (None, None, None, None)
+        if foreign:
+            try:
+                identity = _submissions_identity(edgar.submissions(cik))
+            except Exception:
+                pass
         for n in cover.COVER_REPORTS:
             try:
                 url = cover.R_URL.format(cik=int(cik), accn=accn.replace("-", ""), n=n)
@@ -750,13 +983,20 @@ def cover_pages(conn, progress=_print_progress) -> None:
             if found:
                 for security in found:
                     security["ratio"] = cover.depositary_ratio(security["title"])
-                return cik, accn, found
-        return cik, accn, []
+                return cik, accn, found, identity
+        return cik, accn, [], identity
 
     done = ratios = 0
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for cik, accn, found in pool.map(read, todo):
+        for cik, accn, found, identity in pool.map(read, todo):
             done += 1
+            inc, inc_name, first_filed, last_filing = identity
+            if inc:
+                store.set_incorporation(conn, cik, inc, inc_name)
+            if first_filed:
+                store.set_first_filed(conn, cik, first_filed)
+            if last_filing:
+                store.upsert_company(conn, cik, None, None, last_filing=last_filing)
             if found:
                 store.set_cover(conn, cik, found, accn)
                 ratios += sum(1 for s in found if s["ratio"])
@@ -788,7 +1028,7 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
             day += timedelta(days=1)
             continue  # weekends and holidays have no index
         for line in text.splitlines():
-            if not line.startswith(("10-K", "10-Q")):
+            if not line.startswith(normalize.FINANCIAL_FORMS):
                 continue
             parts = [p for p in line.split("  ") if p.strip()]
             if len(parts) < 3:
@@ -825,28 +1065,48 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
     conn.commit()
     progress("done")
 
+    # A newly filed 20-F/40-F can change the registered class or its receipt
+    # ratio. The stale cover deliberately made the first derivation unsupported;
+    # refresh just those new foreign annual filers, then retry from cached facts.
+    if filed:
+        cover_pages(conn, progress, foreign_only=True, ciks=set(filed))
+        derive(conn, progress)
 
-def derive(conn, progress=_print_progress) -> None:
-    """Recompute snapshots after an engine change, from raw facts already on disk."""
+
+def derive(conn, progress=_print_progress, *, all_snapshots: bool = False,
+           workers: int = 4) -> None:
+    """Recompute snapshots after an engine change from cached raw facts.
+
+    Filing reads and normalization are independent per CIK and CPU-bound, so
+    separate processes do that expensive work concurrently. SQLite writes stay on
+    this calling process: one writer preserves the existing WAL/commit behavior.
+    """
     edgar = EdgarClient()
     tickers = _index_tickers(conn, edgar)
     loader = evidence.EvidenceLoader(conn, edgar)
-    stale = store.needs_recompute(conn)
-    progress(f"{len(stale)} snapshots predate engine v{store.ENGINE_VERSION}", 0, len(stale))
-    for i, cik in enumerate(stale, 1):
-        fp = _facts_path(edgar, cik)
-        if not fp.exists():
-            continue
+    stale = store.needs_recompute(conn, eligible_only=not all_snapshots)
+    scope = "cached" if all_snapshots else "dashboard-eligible"
+    progress(f"{len(stale)} {scope} snapshots predate engine v{store.ENGINE_VERSION}",
+             0, len(stale))
+
+    tasks = []
+    for cik in stale:
         ticker, name = tickers.get(cik, (None, None))
-        status, data = _derive_evidence(
-            loader.load(cik, ticker, json.loads(fp.read_text())))
-        store.put_snapshot(conn, cik, status, data)
-        if i % 200 == 0:
-            conn.commit()
-            progress("recomputing snapshots", i, len(stale))
+        ticker, receipt = loader.identity(cik, ticker)
+        tasks.append((cik, ticker, receipt, str(edgar.cache_dir)))
+
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(_derive_cached_worker, task) for task in tasks]
+        for i, future in enumerate(as_completed(futures), 1):
+            cik, result = future.result()
+            if result is not None:
+                status, data = result
+                store.put_snapshot(conn, cik, status, data)
+            if i % 200 == 0:
+                conn.commit()
+                progress("recomputing snapshots", i, len(stale))
     conn.commit()
     progress("done")
-
 
 _DORMANT_DAYS = 200   # a filer silent this long has stopped, not merely gone stale
 
@@ -872,7 +1132,8 @@ def apply_price(row: dict, price: float | None) -> dict:
     """Criteria 1 and 7 are the only price-dependent tests. Snapshots are stored
     price-free (they change only when the company files), so the valuation
     criteria are settled here — pure arithmetic over ttm_eps and tbvps, no I/O.
-    The same rule runs client-side when the UI refreshes a price."""
+    Portfolio execution snapshots mirror these two thresholds server-side; the
+    browser only displays settled criteria."""
     # A symbol absent from SEC's current company/ticker mapping has no verified
     # security identity.  Yahoo may still return a stale quote, or may later reuse
     # the symbol for another issuer; neither may be joined to this CIK's filings.
@@ -880,8 +1141,9 @@ def apply_price(row: dict, price: float | None) -> dict:
     # historical API contract.  Exported rows always carry the key.
     if "listed" in row and row.get("listed") != "y":
         price = None
-        row.pop("price", None)
-        row.pop("price_asof", None)
+        for field in ("price", "price_asof", "price_session", "market_state",
+                      "market_timezone", "market_state_asof", "price_source"):
+            row.pop(field, None)
     crit = {c["n"]: c for c in row["criteria"]}
     if price is not None and price > 0 and not row.get("basis_conflict"):
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
@@ -926,7 +1188,7 @@ def apply_price(row: dict, price: float | None) -> dict:
                 pe = round(price / eps, 2)  # display only
                 crit[1].update(status="PASS" if price_d < PE_MAX * eps_d else "FAIL",
                                value=pe, note=None)
-        dps = row.get("dividend_per_share")
+        dps = row.get("recurring_dividend_per_share")
         if dps is not None and crit[5]["status"] == "PASS":
             pct = round(dps / price * 100, 2)
             # The engine refuses to publish a yield above par — it means the price
@@ -936,12 +1198,28 @@ def apply_price(row: dict, price: float | None) -> dict:
                 crit[5]["value"] = pct
                 # ...and the engine's own note is evidence, not decoration: appending
                 # keeps the aggregate-tag and unknown-payer disclosures it wrote.
-                paid = f"${dps:,.2f} per share over twelve months"
+                source = ((row.get("sources") or {}).get("recurring_dividend_per_share") or {})
+                quarter = source.get("end")
+                paid = (f"${dps:,.2f} per share annualized from the latest ordinary "
+                        "quarterly rate"
+                        + (f" reported for the quarter ended {quarter}" if quarter else "")
+                        + "; special dividends excluded")
+                trailing = row.get("dividend_per_share")
+                if trailing is not None and trailing != dps:
+                    paid += (f"; trailing cash was ${trailing:,.2f} per share "
+                             "including any specials")
                 crit[5]["note"] = f"{crit[5]['note']}; {paid}" if crit[5].get("note") else paid
             else:
                 crit[5]["value"] = None
                 crit[5]["note"] = ((crit[5].get("note") or "")
                                    + f"; yield of {pct}% is not meaningful against this price").lstrip("; ")
+        elif crit[5]["status"] == "PASS":
+            missing = ("pays a dividend, but no reliable recurring rate is available "
+                       "from direct quarterly per-share filing facts")
+            crit[5]["value"] = None
+            crit[5]["note"] = (f"{crit[5]['note']}; {missing}"
+                               if crit[5].get("note") and missing not in crit[5]["note"]
+                               else crit[5].get("note") or missing)
         if tbvps is not None:
             if tbvps <= 0:
                 crit[7].update(status="FAIL", value=None, note="non-positive tangible book value")
@@ -965,6 +1243,66 @@ def apply_price(row: dict, price: float | None) -> dict:
 def _newest(series: dict) -> object | None:
     """The latest year's fact in an annual series, for its provenance."""
     return series[max(series)] if series else None
+
+
+_HISTORY_COVERAGE_SLACK = 45
+_HISTORY_POINT_SLACK = 8
+_HISTORY_REVISION_TOLERANCE = Decimal("0.05")
+_SPLIT_EVENT_LOOKBACK = 7
+
+
+def _validated_price_history(
+    old_fetched: datetime | None,
+    old_closes,
+    new_closes,
+    split_events=(),
+) -> tuple[tuple | None, str | None]:
+    """Accept a provider history only when revisions have an evidenced cause.
+
+    Small candle corrections are harmless. A split can legitimately rescale every
+    pre-event close, but only by the provider's declared corporate-action factor.
+    Unexplained rescaling and suddenly truncated coverage retain the stored series
+    instead of silently rewriting every historical multiple in the UI.
+    """
+    new = tuple((d, Decimal(str(value))) for d, value in new_closes
+                if Decimal(str(value)).is_finite() and Decimal(str(value)) > 0)
+    if not new:
+        return None, "the provider returned no positive historical closes"
+    if any(new[i][0] <= new[i - 1][0] for i in range(1, len(new))):
+        return None, "the provider returned duplicate or unordered history dates"
+
+    old = tuple((d, Decimal(str(value))) for d, value in old_closes
+                if Decimal(str(value)).is_finite() and Decimal(str(value)) > 0)
+    if not old:
+        return new, None
+    if new[0][0] > old[0][0] + timedelta(days=_HISTORY_COVERAGE_SLACK):
+        return None, "the refreshed history lost its oldest coverage"
+    if new[-1][0] < old[-1][0] - timedelta(days=14):
+        return None, "the refreshed history ends before the stored history"
+    if len(new) + _HISTORY_POINT_SLACK < len(old):
+        return None, "the refreshed history unexpectedly lost weekly observations"
+
+    old_by_date = dict(old)
+    overlap = [(d, old_by_date[d], value) for d, value in new if d in old_by_date]
+    if len(old) >= 20 and len(overlap) < 8:
+        return None, "too few dates overlap the stored history to validate it"
+
+    floor = ((old_fetched.date() - timedelta(days=_SPLIT_EVENT_LOOKBACK))
+             if old_fetched is not None else date.max)
+    recent_splits = [(d, Decimal(str(factor))) for d, factor in split_events
+                     if d >= floor and Decimal(str(factor)) > 0]
+    bad = 0
+    for day, old_value, new_value in overlap:
+        expected = Decimal(1)
+        for split_day, factor in recent_splits:
+            if day < split_day:
+                expected *= factor
+        actual = new_value / old_value
+        if abs(actual / expected - 1) > _HISTORY_REVISION_TOLERANCE:
+            bad += 1
+    if bad > max(2, len(overlap) // 20):
+        return None, "historical closes were rescaled without matching split evidence"
+    return new, None
 
 
 def _equity_awards(snap) -> dict:
@@ -1112,49 +1450,133 @@ def _mark_memberships(rows: list[dict], progress) -> None:
             r["index_memberships"] = m
 
 
-def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
+_QUOTE_FIELDS = (
+    "price", "price_asof", "price_session", "market_state",
+    "market_timezone", "market_state_asof", "price_source",
+)
+
+
+def _previous_dashboard_rows() -> dict[str, dict]:
+    """Read the snapshot that readers are using before replacing it.
+
+    An hourly provider miss must not turn a real, dated quote into missing data.
+    The previous quote is safe to retain because its timestamp remains attached.
+    """
+    try:
+        payload = json.loads(DASHBOARD_JSON.read_text(encoding="utf-8"))
+        return {row["cik"]: row for row in payload.get("rows", []) if row.get("cik")}
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def _set_quote(row: dict, quote) -> None:
+    row.update({
+        "price": float(quote.price),
+        "price_asof": quote.asof.isoformat(),
+        "price_session": quote.session,
+        "market_state": quote.market_state,
+        "market_timezone": quote.market_timezone,
+        "market_state_asof": (
+            quote.market_state_asof.isoformat() if quote.market_state_asof else None
+        ),
+        "price_source": quote.source,
+    })
+
+
+def _retain_previous_quote(row: dict, previous: dict | None) -> bool:
+    if previous is None or previous.get("price") is None:
+        return False
+    for field in _QUOTE_FIELDS:
+        if field in previous:
+            row[field] = previous[field]
+    return True
+
+
+def export(conn, with_prices: bool = True, progress=_print_progress,
+           *, quote_only: bool = False) -> None:
     """Write the whole universe as one JSON file — the UI fetches it once.
     Snapshots below the current engine are recomputed first, so a refresh never
-    ships stale arithmetic — recomputation is automatic, not a separate button."""
-    stale = store.needs_recompute(conn)
+    ships stale arithmetic — recomputation is automatic, not a separate button.
+
+    ``quote_only`` is the hourly path: one small intraday request per ticker and
+    the already-validated local weekly histories. A full export still refreshes
+    those histories and current index membership lists.
+    """
+    stale = store.needs_recompute(conn, eligible_only=True)
     if stale:
         derive(conn, progress=progress)
     rows = store.dashboard_rows(conn)
+    previous_rows = _previous_dashboard_rows()
+    quote_updated = 0
+    quote_failed = 0
     if with_prices:
         prices = YahooPriceProvider()
         priceable = [r for r in rows if r.get("ticker") and r.get("listed") == "y"]
-        progress(f"fetching prices for {len(priceable)} verified tickers", 0,
+        label = "quotes" if quote_only else "prices and history"
+        progress(f"fetching {label} for {len(priceable)} verified tickers", 0,
                  len(priceable))
         done = 0
-        # one request per company returns the quote *and* five years of weekly
-        # closes, so the price statistics cost no extra call; each is independent,
-        # and a small pool turns an hour of waiting into a few minutes
-        with ThreadPoolExecutor(max_workers=12) as pool:
-            futures = {pool.submit(prices.history, r["ticker"]): r for r in priceable}
-            for fut in as_completed(futures):
-                row = futures[fut]
-                try:
-                    hist = fut.result()
-                except Exception:
-                    hist = None
-                if hist:
-                    row["price"] = float(hist.quote.price)
-                    row["price_asof"] = hist.quote.asof.isoformat()
-                    row["_closes"] = hist.closes
-                done += 1
-                if done % 25 == 0 or done == len(futures):
-                    progress("fetching prices", done, len(futures))
+        # Calls are independent. Hourly refreshes ask only for the one-day chart;
+        # full exports also replace the five-year weekly history.
+        try:
+            with ThreadPoolExecutor(max_workers=12) as pool:
+                fetch = prices.quote if quote_only else prices.history
+                futures = {pool.submit(fetch, r["ticker"]): r for r in priceable}
+                for fut in as_completed(futures):
+                    row = futures[fut]
+                    try:
+                        result = fut.result()
+                    except Exception:
+                        result = None
+                    quote = result if quote_only else (result.quote if result else None)
+                    if quote is not None:
+                        _set_quote(row, quote)
+                        quote_updated += 1
+                        if not quote_only:
+                            row["_history"] = result
+                    else:
+                        quote_failed += 1
+                        retained = quote_only and _retain_previous_quote(
+                            row, previous_rows.get(row["cik"])
+                        )
+                        if quote_only:
+                            row["quote_refresh_warning"] = {
+                                "kind": "QUOTE_REFRESH_FAILED",
+                                "note": (
+                                    "the hourly provider request failed; the previous dated quote "
+                                    "remains in use" if retained else
+                                    "the hourly provider request failed and no previous quote is available"
+                                ),
+                            }
+                    done += 1
+                    if done % 25 == 0 or done == len(futures):
+                        progress(f"fetching {label}", done, len(futures))
+        finally:
+            prices.close()
         # the series is written once per company, so a later `derive` can rebuild
         # the statistics without asking the provider for five more years of data
         closes_by_cik = {}
         for row in rows:
-            closes = row.pop("_closes", None)
-            if closes:
-                store.set_price_history(conn, row["cik"], closes)
+            history = row.pop("_history", None)
+            closes = None
+            if history is not None:
+                old_fetched, old_closes = store.price_history_record(conn, row["cik"])
+                closes, warning = _validated_price_history(
+                    old_fetched, old_closes, history.closes, history.splits)
+                if warning is not None:
+                    row["price_history_warning"] = {
+                        "kind": "HISTORY_REJECTED",
+                        "note": warning + "; the previously validated history remains in use",
+                    }
+                elif closes:
+                    store.set_price_history(conn, row["cik"], closes)
+            elif quote_only:
+                prior = previous_rows.get(row["cik"], {})
+                if prior.get("price_history_warning"):
+                    row["price_history_warning"] = prior["price_history_warning"]
             apply_price(row, row.get("price"))
-            closes_by_cik[row["cik"]] = (
+            closes_by_cik[row["cik"]] = [] if row.get("listed") != "y" else (
                 closes or store.price_history(conn, row["cik"])
-                if row.get("listed") == "y" else []
             )
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
         conn.commit()
@@ -1167,8 +1589,13 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
         for row in rows:
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
     DASHBOARD_JSON.parent.mkdir(parents=True, exist_ok=True)
-    if with_prices:  # membership needs the network; offline exports keep blanks
+    if with_prices and not quote_only:  # full refresh owns the changing index lists
         _mark_memberships(rows, progress)
+    elif quote_only:  # hourly prices must not erase memberships during a list outage
+        for row in rows:
+            prior = previous_rows.get(row["cik"], {})
+            if prior.get("index_memberships"):
+                row["index_memberships"] = prior["index_memberships"]
     _mark_peer_efficiency(rows)
     for row in rows:
         row.update(profiles.enrich(row))
@@ -1181,21 +1608,40 @@ def export(conn, with_prices: bool = True, progress=_print_progress) -> None:
         row.pop("filing_events", None)
         row.pop("events_from", None)
         row.pop("last_filing", None)   # read by apply_price, not by the panel
-    payload = {"generated": store._now(), "engine_version": store.ENGINE_VERSION, "rows": rows}
-    DASHBOARD_JSON.write_text(json.dumps(payload, separators=(",", ":")))
-    store.set_state(conn, "last_export", store._now())
+    refreshed_at = store._now()
+    payload = {"generated": refreshed_at, "engine_version": store.ENGINE_VERSION, "rows": rows}
+    # Readers see either the complete old payload or the complete new one, never
+    # a partially-written 35 MB JSON document during an hourly replacement.
+    temporary = DASHBOARD_JSON.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(DASHBOARD_JSON)
+    store.set_state(conn, "last_export", refreshed_at)
+    if with_prices:
+        store.set_state(conn, "last_quote_refresh", refreshed_at)
+        store.set_state(conn, "last_quote_refresh_updated", str(quote_updated))
+        store.set_state(conn, "last_quote_refresh_failed", str(quote_failed))
     conn.commit()
-    progress(f"wrote dashboard.json — {DASHBOARD_JSON.stat().st_size / 1e6:.2f} MB, {len(rows)} companies", len(rows), len(rows))
+    suffix = (f"; {quote_updated} quotes updated, {quote_failed} retained/missing"
+              if quote_only else "")
+    progress(f"wrote dashboard.json — {DASHBOARD_JSON.stat().st_size / 1e6:.2f} MB, "
+             f"{len(rows)} companies{suffix}", len(rows), len(rows))
+
+
+def quotes(conn, progress=_print_progress) -> None:
+    """Refresh all eligible universe quotes using stored price histories."""
+    export(conn, with_prices=True, progress=progress, quote_only=True)
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
-                                        "derive", "export", "listing-age", "events",
+                                        "derive", "export", "quotes", "listing-age", "events",
                                         "cover", "dera", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
+    ap.add_argument("--all-snapshots", action="store_true",
+                    help="with derive, include cached filers that cannot enter the dashboard")
     ap.add_argument("--from", dest="start", help="first quarter for dera, e.g. 2021q1")
     args = ap.parse_args(argv)
     conn = store.connect()
@@ -1208,7 +1654,7 @@ def main(argv=None) -> int:
     elif args.command == "daily":
         daily(conn, args.days)
     elif args.command == "derive":
-        derive(conn)
+        derive(conn, all_snapshots=args.all_snapshots)
     elif args.command == "listing-age":
         listing_age(conn)
     elif args.command == "events":
@@ -1219,6 +1665,8 @@ def main(argv=None) -> int:
         dera_sync(conn, args.start)
     elif args.command == "export":
         export(conn, not args.no_prices)
+    elif args.command == "quotes":
+        quotes(conn)
     else:
         print(json.dumps(store.stats(conn), indent=2))
     return 0

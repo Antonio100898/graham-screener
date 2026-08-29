@@ -114,14 +114,41 @@ about two quarters, an annual tagger is not false-failed. If the chain misses bu
 **unknown**, never FAIL. The per-year record (calendar years with a positive
 fact) feeds the defensive dividend test and the windowed short-history variant.
 
-### 1.6 Owner earnings / ROIC (context metrics, not Graham criteria)
+### 1.6 Owner-earnings evidence (context metrics, not Graham criteria)
+
+A definitive Buffett figure is deliberately withheld unless maintenance capital
+expenditure and required additional working capital are evidenced. Primary XBRL
+normally reports neither. The payload therefore keeps three differently scoped
+figures separate:
+
+- **all-capex floor:** `reported earnings attributable to owners + D&A - total capex`;
+- **maintenance≈D&A estimate:** reported earnings, because the D&A add-back and
+  assumed maintenance-capex deduction cancel; and
+- **standard free cash flow:** `operating cash flow - total capex`.
+
+The all-capex floor can materially understate a growing business because it deducts
+growth capex. The maintenance≈D&A figure is an explicit assumption, not a reported
+maintenance number. Standard FCF includes actual working-capital movements but
+cannot identify which portion was required. None is serialized or labelled as
+definitive owner earnings.
+
+The company panel carries the newest ten completed fiscal-year slots. Every year
+requires the three same-period floor inputs and that year's reported diluted weighted
+average share count; a missing or differently dated input leaves the year blank.
+Historical denominators are rebased for filing-observed later splits and for the
+priced depositary-receipt ratio, so the per-share values are on today's traded-
+security basis. If one interior denominator is an exact 1,000x/1,000,000x table-
+scale outlier and both adjacent split-adjusted years agree, that exact correction
+is applied to this series and disclosed; otherwise the filed count is not guessed.
+The UI shows each year, YoY change, endpoint CAGR, coverage, years
+increased, and years growing at least 6%. These are observations, never scores.
 
 | Concept | Tags |
 |---|---|
-| Pre-tax income | `IncomeLossFromContinuingOperationsBeforeIncomeTaxes…` (3 variants — see audit finding on the Domestic fragment) |
+| Reported earnings attributable to owners | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, then `ProfitLoss` when it is the only usable total |
 | D&A | `DepreciationDepletionAndAmortization`, `DepreciationAmortizationAndAccretionNet`, `DepreciationAndAmortization`, else `Depreciation` + `AmortizationOfIntangibleAssets` |
-| Tax | `IncomeTaxExpenseBenefit` |
-| Capex | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets`, `PaymentsForCapitalImprovements` |
+| Total capex | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets`, `PaymentsForCapitalImprovements` |
+| Operating cash flow (standard FCF only) | `NetCashProvidedByUsedInOperatingActivities`, `NetCashProvidedByUsedInOperatingActivitiesContinuingOperations` |
 | Cash & investments (netted from invested capital) | `CashAndCashEquivalentsAtCarryingValue`, `CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`; `ShortTermInvestments`, `AvailableForSaleSecuritiesCurrent`, `MarketableSecuritiesCurrent`, `OtherShortTermInvestments` |
 
 ### 1.7 Earnings-quality notes → criterion 1 disclosure
@@ -479,8 +506,8 @@ least one missing concept**.
 
 ### 2.4 Deliberately out of scope
 
-Cash-flow-statement totals (no criterion consumes OCF; owner earnings is built
-from parts with provenance on purpose) and the ASC 842 operating-lease family
+Other cash-flow-statement totals (no criterion consumes them; OCF is read only for
+the separately labelled standard-FCF context metric) and the ASC 842 operating-lease family
 (rentals are not borrowed money under criterion 3; the current portion already
 sits inside `LiabilitiesCurrent`). Trap tags documented as never-fallbacks:
 `AssetsFairValueDisclosure`, `LiabilitiesFairValueDisclosure`, `NoncurrentAssets`.
@@ -656,11 +683,24 @@ without new evidence overturning the recorded counterexample.
 | 4e | **DONE — engine v67 (2026-08-22).** The audit of 2026-08-21 and its repairs. Thirty of thirty-three findings fixed, each against the company that proved it: one split counted twice (Lam Research FY2022 0.3275 to 3.275), an 8-K read as a split (Essential Utilities 5.50 to its filed 2.20), a debt rollup smaller than its own parts (Pangaea 0.52x PASS to 3.75x FAIL), a lease book standing in for Ford's borrowings, a partnership's group profit over its own units (Westlake 2.29x PASS to 13.29x FAIL), a 52/53-week year losing its restatement (ATI FAIL to PASS), criterion 4 decided on windows that closed a decade ago (Hershey, Berkshire), earnings and share counts on different bases (SM Energy, NRC), Canadian filers priced in the wrong currency, ROIC divided by a balance sheet twelve years newer (J&J FY2014 13.1% to FY2025 22.0%), a 2012 special dividend priced as a 9.49% yield, yields above 100% shipped by the export the engine refuses to publish, preferred-only payouts passing criterion 5 (Boeing), and a current ratio built from two different balance-sheet dates. **The coverage harness sampled nobody**: `coverage.py` selected on `mcap`, which the payload does not carry, so thirteen strata drew zero companies and only the forty pins were ever tested — the parts-vs-rollup identity that catches Pangaea was already written and had never run. Fixed, and the first real run over 113 companies found 110 unclassified tag families and fifteen identity mismatches; all are now read, registered with a reason, or explained by the engine's own refusal. **New**: Graham's two profitability ratios (net margin, return on book value) and a ratio table showing every ratio at today's price and at each of the last five fiscal year ends, each column struck on its own year's report and its own year's price; per-company incorporation from the filing index; a "check the filing" record for what only prose can settle (927 rows). **The cover page is read** (`sources/cover.py`, `make cover`): `dei:Security12bTitle` and `dei:TradingSymbol` are text under a share-class axis, so Company Facts strips both, and between them they settle the question every per-share figure rests on — which security the ticker prices. 3,750 covers read, 4,709 registered classes, six depositary ratios above one. Where a ratio exists the figures are restated onto the traded security: the share count divided by it, earnings, book value and dividends multiplied, so both sides of every multiple describe one thing. Onconova's market capitalisation falls from $550.2B to $42.3B and its P/E becomes measurable at 67.0; Akari's from $1,099B to $0.55B. The note quotes the filer's own sentence, so the parse can be checked rather than trusted, and a cover that has been read closes the gap it answers — 927 down to 632. Seven documentation defects corrected, including a verdict precedence stated backwards and a client-side price mirror that four documents promised and no commit ever built. 307 pytest + 22 node. |
 | 5 | Inline-XBRL extension adapter — the only route to issuer-extension concepts (e.g. franchise rights) that Company Facts cannot expose, **and to the cover page**: `dei:Security12bTitle` carries the depositary ratio in prose ("each representing 10 Ordinary Shares") with the trading symbol attached to one share class, which is the only deterministic answer to "which security does this ticker price". 616 rows are waiting on it for the ratio and 183 for the class. |
 
-### 4.4 Foreign-filer policy (clarified, not a conflict)
+### 4.4 Foreign-filer policy
 
-The review flagged v35's hiding of foreign-form filers (e.g. MNDY) against
-v34's guarded US-GAAP 20-F support as an unresolved conflict. It is a
-**deliberate, user-directed reversal** (2026-08-19): most foreign-form filers
-carried stale or partial balance sheets, so all filers whose newest financial
-filing is 20-F/40-F/6-K are hidden until proper IFRS/Inline-XBRL ingestion
-exists. Now documented in `HOW-IT-WORKS.md` §2.7.
+Engine v95 (2026-08-25) replaces the blanket foreign-form exclusion with an
+evidence gate. A current 20-F/40-F filer enters when that same annual accession
+carries a USD US-GAAP balance-sheet anchor and its cover attaches the exact ticker
+to common/ordinary/voting/partnership equity. A depositary security enters only
+with a positive underlying-shares-per-receipt ratio parsed from that cover; the
+engine applies the conversion to shares, EPS, dividends, book value and historical
+per-share ratios, including fractional ratios. New 20-F/40-F/6-K filings are now
+part of the daily refresh, and a new annual filing invalidates the old cover until
+the current class is read. The initial filing-backed cohort adds 420 listed foreign
+issuers.
+
+Engine v102 (2026-08-27) extends the same evidence gate to standard IFRS. A USD
+`ifrs-full` balance sheet in the current 20-F/40-F is normalized through explicit
+accounting-equivalent concept aliases; every selected figure keeps its original
+`ifrs-full` element, form, accession and period in provenance. The mapping does not
+convert currencies or infer missing values. Ambiguous near-matches are omitted:
+for example, the generic IFRS 16 lease liability is disclosed as lease context and
+is not silently reclassified as Graham debt. Non-USD reporters remain outside the
+table until a filing-date-aware currency pipeline exists.

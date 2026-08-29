@@ -23,10 +23,10 @@ const ACTIONS = [
     hint: "Reads SEC's daily index to see who filed a 10-K or 10-Q, and refetches only those companies.",
   },
   {
-    cmd: "export",
+    cmd: "quotes",
     label: "Refresh prices",
-    sub: "rebuilds the table",
-    hint: "Fetches current share prices, recomputes the valuation criteria, and rebuilds the table below.",
+    sub: "every listed ticker",
+    hint: "Fetches every universe quote and atomically rebuilds the shared Research and Portfolio snapshot.",
   },
 ];
 
@@ -132,9 +132,10 @@ export default function LoadBar({ onFinished, shown }) {
                 computed <b>{ago(st.computed_at)}</b>
               </span>
               {" · "}
-              <span title={st.last_export ?? "no price refresh recorded"}>
-                prices <b>{ago(st.last_export)}</b>
+              <span title={st.last_quote_refresh ?? st.last_export ?? "no price refresh recorded"}>
+                prices <b>{ago(st.last_quote_refresh ?? st.last_export)}</b>
               </span>
+              {job.auto_quotes?.running && <> · automatic every hour</>}
             </span>
             <span>
               <b>{st.snapshots.toLocaleString()}</b> of {st.companies.toLocaleString()} companies have
@@ -174,9 +175,10 @@ export default function LoadBar({ onFinished, shown }) {
             anything missing a recent quarter".
           </p>
           <p className="dim">
-            To cover the whole market: <b>Load all</b> once, then <b>Refresh prices</b>.
-            Afterwards <b>Fetch filings</b> daily or weekly keeps it current. When the
-            screening engine itself changes, results are recomputed automatically.
+            To cover the whole market: <b>Load all</b> once. While the local server is
+            running, every listed ticker's quote refreshes automatically each hour;
+            <b> Refresh prices</b> runs the same universe-wide update immediately.
+            Afterwards <b>Fetch filings</b> daily or weekly keeps fundamentals current.
           </p>
         </div>
       )}

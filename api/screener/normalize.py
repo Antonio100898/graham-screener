@@ -10,22 +10,117 @@ import re
 from datetime import date, timedelta
 from decimal import Decimal
 
-from .models import Fact, FinancialSnapshot, OwnerEarnings, Provenance
+from .models import AnnualOwnerEarnings, Fact, FinancialSnapshot, OwnerEarnings, Provenance
+from .sources import cover
 
 
 class UnsupportedFilerError(Exception):
     """A filing basis not covered by the normalizer; never partially evaluate it."""
 
 
+class PendingFilingFactsError(UnsupportedFilerError):
+    """A newly indexed annual filing whose structured statements have not arrived."""
+
+    def __init__(self, filing: tuple[str, str]):
+        self.filing = filing
+        filed, accession = filing
+        super().__init__(
+            f"SEC structured facts are pending for {accession or 'the annual filing'} "
+            f"filed {filed}")
+
+
 # Foreign issuers file annual 20-F/40-F reports and interim 6-K reports, mostly
-# under IFRS, and their US-GAAP facts (when any) trail the domestic cadence —
-# balance sheets arrive stale or not at all.  A filer whose newest financial
-# filing is a foreign form is rejected outright; the form tuples still include
-# the foreign forms so that a filer that later moved to 10-K/10-Q keeps its
-# pre-transition history readable.
+# under IFRS. The normalizer admits USD statements under either standard taxonomy
+# when the exact traded class is settled by the current filing cover. Non-USD
+# statements and an unresolved depositary ratio stay unsupported rather than
+# being converted or guessed.
+# The form tuples also preserve pre-transition history when a filer moves between
+# foreign and domestic forms.
 ANNUAL_FORMS = ("10-K", "20-F", "40-F")
 INTERIM_FORMS = ("10-Q", "6-K")
 FINANCIAL_FORMS = ANNUAL_FORMS + INTERIM_FORMS
+_FOREIGN_BALANCE_ANCHORS = (
+    "Assets", "LiabilitiesAndStockholdersEquity", "Liabilities",
+    "AssetsCurrent", "StockholdersEquity",
+)
+_IFRS_BALANCE_ANCHORS = (
+    "Assets", "EquityAndLiabilities", "CurrentAssets", "Equity",
+)
+
+# Standard IFRS concepts whose accounting meaning is equivalent to a concept the
+# existing US-GAAP chains already understand. This is a translation of taxonomy,
+# not of values: units, periods, accessions and the original ``ifrs-full`` element
+# all survive on the selected fact. Ambiguous near-matches stay absent. In
+# particular, IFRS 16's generic lease liabilities are exposed as operating-lease
+# context, not silently counted as Graham debt.
+_IFRS_ALIASES: dict[str, tuple[str, ...]] = {
+    # balance sheet and the listed-share denominator
+    "Assets": ("Assets",),
+    "LiabilitiesAndStockholdersEquity": ("EquityAndLiabilities",),
+    "AssetsCurrent": ("CurrentAssets",),
+    "LiabilitiesCurrent": ("CurrentLiabilities",),
+    "LiabilitiesNoncurrent": ("NoncurrentLiabilities",),
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest": ("Equity",),
+    "StockholdersEquity": ("EquityAttributableToOwnersOfParent",),
+    "MinorityInterest": ("NoncontrollingInterests",),
+    "CommonStockSharesOutstanding": ("NumberOfSharesOutstanding",),
+    "Goodwill": ("Goodwill",),
+    "IntangibleAssetsNetExcludingGoodwill": ("IntangibleAssetsOtherThanGoodwill",),
+    # borrowed money; generic IFRS lease liabilities deliberately are not finance debt
+    "LongTermDebtNoncurrent": ("LongtermBorrowings",),
+    "ShortTermBorrowings": ("ShorttermBorrowings",),
+    "OperatingLeaseLiability": ("LeaseLiabilities",),
+    # income statement and per-share history
+    "Revenues": ("Revenue", "RevenueFromContractsWithCustomers"),
+    "OperatingIncomeLoss": ("ProfitLossFromOperatingActivities",),
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": (
+        "ProfitLossBeforeTax",
+    ),
+    "NetIncomeLoss": ("ProfitLossAttributableToOwnersOfParent",),
+    "ProfitLoss": ("ProfitLoss",),
+    "NetIncomeLossAttributableToNoncontrollingInterest": (
+        "ProfitLossAttributableToNoncontrollingInterests",
+    ),
+    "EarningsPerShareDiluted": ("DilutedEarningsLossPerShare",),
+    "EarningsPerShareBasic": ("BasicEarningsLossPerShare",),
+    "WeightedAverageNumberOfDilutedSharesOutstanding": ("AdjustedWeightedAverageShares",),
+    "WeightedAverageNumberOfSharesOutstandingBasic": ("WeightedAverageShares",),
+    # common distributions. The cash-flow total is intentionally an aggregate;
+    # it proves a payout but does not claim every dollar went to the listed class.
+    "PaymentsOfDividendsCommonStock": (
+        "DividendsPaidToOwnersOfParent",
+        "DividendsRecognisedAsDistributionsToOwnersOfParent",
+    ),
+    "PaymentsOfOrdinaryDividends": (
+        "DividendsPaidClassifiedAsFinancingActivities", "DividendsPaid",
+    ),
+    "CommonStockDividendsPerShareCashPaid": ("DividendsPaidOrdinarySharesPerShare",),
+    "DividendsPayableCurrent": ("CurrentDividendPayables",),
+    # owner-earnings and contextual evidence
+    "DepreciationAndAmortization": ("AdjustmentsForDepreciationAndAmortisationExpense",),
+    "AmortizationOfIntangibleAssets": ("AmortisationIntangibleAssetsOtherThanGoodwill",),
+    "IncomeTaxExpenseBenefit": ("IncomeTaxExpenseContinuingOperations",),
+    "DeferredIncomeTaxExpenseBenefit": ("DeferredTaxExpenseIncome",),
+    "DeferredTaxAssetsGross": ("DeferredTaxAssets",),
+    "PaymentsToAcquirePropertyPlantAndEquipment": (
+        "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+    ),
+    "CashAndCashEquivalentsAtCarryingValue": ("CashAndCashEquivalents",),
+    "NetCashProvidedByUsedInOperatingActivities": ("CashFlowsFromUsedInOperatingActivities",),
+    "InterestExpense": ("InterestExpense",),
+    "AccountsReceivableNetCurrent": ("CurrentTradeReceivables",),
+    "InventoryNet": ("Inventories", "InventoriesTotal"),
+}
+_IFRS_TO_CANONICAL = {
+    source: canonical
+    for canonical, sources in _IFRS_ALIASES.items()
+    for source in sources
+}
+IFRS_SOURCE_TAGS = frozenset(_IFRS_TO_CANONICAL)
+IFRS_PER_SHARE_TAGS = frozenset((
+    "DilutedEarningsLossPerShare", "BasicEarningsLossPerShare",
+    "DividendsPaidOrdinarySharesPerShare",
+))
 
 
 def _is_annual_form(form: str) -> bool:
@@ -108,6 +203,7 @@ REVENUE_TAGS = (
     # elements above are absent or carry sub-scope scraps (Camden's `Revenues`
     # is $13M against $1.5B of lease income)
     "RegulatedAndUnregulatedOperatingRevenue",
+    "RegulatedOperatingRevenue",
     "OperatingLeaseLeaseIncome",
     "OperatingLeasesIncomeStatementLeaseRevenue",
     "RealEstateRevenueNet",
@@ -420,23 +516,63 @@ def _senior_claims(gaap: dict, fresh: date | None, total_assets: Fact | None,
     return preferred, nci, temporary_equity
 
 
+def _ifrs_as_us_gaap(ifrs: dict) -> dict:
+    """Expose exact IFRS equivalents through the established extraction chains.
+
+    Entries are copied because Company Facts is shared with evidence/audit callers.
+    Private markers retain both the filed namespace/tag and the normalized element
+    used for rule selection; neither marker is serialized as filing data.
+    """
+    out: dict[str, dict] = {}
+    for canonical, aliases in _IFRS_ALIASES.items():
+        source = next((tag for tag in aliases if tag in ifrs), None)
+        if source is None:
+            continue
+        source_data = ifrs[source]
+        units = {
+            unit: [
+                {
+                    **entry,
+                    "_source_namespace": "ifrs-full",
+                    "_source_tag": source,
+                    "_normalized_tag": canonical,
+                }
+                for entry in entries
+            ]
+            for unit, entries in (source_data.get("units") or {}).items()
+        }
+        out[canonical] = {**source_data, "units": units}
+    return out
+
+
 def build_snapshot(
     ticker: str, cik: str, companyfacts: dict, assume_absent_zero: bool = False,
     dimensioned: dict | None = None, receipt: dict | None = None,
 ) -> FinancialSnapshot:
     facts = companyfacts.get("facts", {})
-    _reject_foreign(facts)
-    gaap = facts.get("us-gaap", {})
+    statement_basis = _reject_foreign(facts, receipt)
+    gaap = _with_fiscal_calendar(
+        facts.get("us-gaap", {}) if statement_basis == "us-gaap"
+        else _ifrs_as_us_gaap(facts.get("ifrs-full", {})))
     dei = facts.get("dei", {})
     # Company Facts cannot express a dimension, so a filer that reports only by
     # share class looks silent to it. The unambiguous half of those facts is read
-    # through the same chains, and only ever fills a gap: a consolidated figure
-    # always outranks a figure that had to be attributed to one class.
-    classed = _unambiguous_dimensioned(dimensioned, (receipt or {}).get('title'))
-
-    annual_eps = _annual_eps(gaap)
+    # through the same chains. A consolidated figure normally outranks one that
+    # had to be attributed to a class; the narrow reconciliation gate below is
+    # the exception when the filing's own income and weighted count prove the
+    # consolidated EPS is mis-scaled.
+    classed = _unambiguous_dimensioned(
+        dimensioned, _registered_class_title(ticker, receipt), statement_basis)
     if classed:
-        annual_eps = {**_annual_eps(classed), **annual_eps}
+        classed = _with_fiscal_calendar(classed)
+
+    bare_eps = _annual_eps(gaap)
+    annual_eps = bare_eps
+    classed_eps: dict[int, Fact] = {}
+    if classed:
+        classed_eps = _annual_eps(classed)
+        annual_eps = _prefer_reconciling_classed_eps(
+            gaap, {**classed_eps, **annual_eps}, classed_eps)
     ttm_eps, ttm_inputs = _ttm_eps(gaap, annual_eps)
     if ttm_eps is None and classed:
         ttm_eps, ttm_inputs = _ttm_eps(classed, annual_eps)
@@ -510,23 +646,7 @@ def build_snapshot(
     if total_liabilities is None:
         total_liabilities, parent_only_derivation = _derive_liabilities(gaap, fresh)
         liabilities_derived = total_liabilities is not None
-    goodwill = _latest_instant(gaap, "Goodwill", ("Goodwill",), not_before=fresh)
-    if goodwill is None:
-        # RNR files no Goodwill element at all; the combined line minus the
-        # ex-goodwill line is the same figure by identity
-        goodwill = _derived_instant(
-            gaap, "Goodwill (derived: combined line - intangibles excluding goodwill)",
-            "IntangibleAssetsNetIncludingGoodwill", "IntangibleAssetsNetExcludingGoodwill", fresh,
-        )
-    if goodwill is None:
-        goodwill = _derived_instant(
-            gaap, "Goodwill (derived: gross - accumulated impairment)",
-            "GoodwillGross", "GoodwillImpairedAccumulatedImpairmentLoss", fresh,
-            subtrahend_optional=True,
-        )
-    intangibles = _intangibles(gaap, fresh)
-    if goodwill is None and intangibles is None:
-        goodwill, intangibles = _combined_goodwill_and_intangibles(gaap, fresh)
+    goodwill, intangibles = _goodwill_and_intangibles(gaap, fresh)
     preferred, nci, temporary_equity = _senior_claims(
         gaap, fresh, total_assets, total_liabilities, liabilities_derived,
         parent_only_derivation)
@@ -614,7 +734,7 @@ def build_snapshot(
         # ...and the same minority-interest guard the annual series applies: a
         # trailing figure built from ProfitLoss divides the whole group's profit,
         # the sponsor's two thirds included, by the units the public holds.
-        group_profit = any(f.provenance.tag.endswith(":ProfitLoss") for f in ttm_ni_inputs)
+        group_profit = any(_tag_of(f) == "ProfitLoss" for f in ttm_ni_inputs)
         trailing_income, trailing_inputs = ttm_net_income, ttm_ni_inputs
         if group_profit and _has_minority_interest(gaap, fresh, nci):
             trailing_income, trailing_inputs = _ttm_eps(
@@ -632,7 +752,9 @@ def build_snapshot(
                 if minority:
                     trailing_income = ttm_net_income - minority
                     trailing_inputs = ttm_ni_inputs
+        reported_scope = annual_eps[max(annual_eps)] if annual_eps else None
         if ((ttm_eps is None or income_is_newer)
+                and (reported_scope is None or _eps_uses_total_income(reported_scope))
                 and trailing_income is not None and shares and shares.value > 0):
             ttm_eps = ((trailing_income - (ttm_preferred_dividends or Decimal(0)))
                        / shares.value)
@@ -664,6 +786,8 @@ def build_snapshot(
     reference = balance_sheet_date or _latest_annual_end(annual_eps)
     pays_dividend, dividend = _dividend(gaap, reference)
     dividend_per_share = _dividend_per_share(gaap, dividend, shares, fresh)
+    recurring_dividend_per_share = _recurring_dividend_per_share(
+        gaap, balance_sheet_date)
 
     assumed: set[str] = set()
     if assume_absent_zero:
@@ -679,12 +803,6 @@ def build_snapshot(
         if "intangibles" in clean and intangibles is None:
             assumed.add("intangibles")
 
-    owner_earnings = _owner_earnings(gaap, {
-        "total_assets": total_assets,
-        "current_liabilities": current_liabilities,
-        "short_term_debt": short_term_debt,
-    }, fresh)
-
     # Whether the filing is internally consistent is asked of the filing's own
     # figures, before any restatement onto the traded security — the ratio moves
     # both sides of that comparison and would otherwise create the mismatch it is
@@ -692,6 +810,23 @@ def build_snapshot(
     basis_conflict = _basis_conflict(gaap, dei, annual_eps, annual_net_income,
                                      annual_preferred_dividends,
                                      _has_minority_interest(gaap, fresh, nci), shares)
+    if basis_conflict is None:
+        basis_conflict = _depositary_dimension_conflict(
+            bare_eps, classed_eps, receipt)
+
+    # The annual-history table used to infer this count by dividing total net
+    # income by EPS. That arithmetic is invalid when EPS is continuing-operations
+    # income, an LP-unit allocation, or any other narrower numerator. Carry the
+    # weighted count the filing actually reports instead. Dimensioned counts fill
+    # only the years Company Facts cannot see, exactly as dimensioned EPS does.
+    annual_share_counts = _annual_share_counts(
+        gaap, dei, annual_eps, annual_net_income, annual_preferred_dividends)
+    if classed:
+        annual_share_counts = {
+            **_annual_share_counts(
+                classed, {}, annual_eps, annual_net_income, annual_preferred_dividends),
+            **annual_share_counts,
+        }
 
     vintage = vintage_ttm_eps(gaap)
 
@@ -699,19 +834,33 @@ def build_snapshot(
     # ordinary shares behind it; the cover names the ratio and nothing else can.
     if receipt and receipt.get("ratio"):
         ratio = Decimal(str(receipt["ratio"]))
-        if ratio > 1:
-            parts = {"shares": shares, "annual_eps": annual_eps, "ttm_eps": ttm_eps,
+        if ratio > 0 and ratio != 1:
+            parts = {"shares": shares, "annual_eps": annual_eps,
+                     "annual_share_counts": annual_share_counts, "ttm_eps": ttm_eps,
                      "dividend_per_share": dividend_per_share,
+                     "recurring_dividend_per_share": recurring_dividend_per_share,
                      "ttm_eps_inputs": ttm_inputs, "ttm_eps_vintage": vintage}
             _restate_onto_receipt(parts, ratio, receipt.get("accn", ""))
             shares, annual_eps = parts["shares"], parts["annual_eps"]
+            annual_share_counts = parts["annual_share_counts"]
             ttm_eps, dividend_per_share = parts["ttm_eps"], parts["dividend_per_share"]
+            recurring_dividend_per_share = parts["recurring_dividend_per_share"]
             ttm_inputs, vintage = parts["ttm_eps_inputs"], parts["ttm_eps_vintage"]
+
+    # Owner-earnings evidence per share belongs on the same split/receipt basis as
+    # every other per-share history. Build it only after the reported annual
+    # denominator has gone through the security-class restatement above.
+    owner_earnings = _owner_earnings(gaap, {
+        "total_assets": total_assets,
+        "current_liabilities": current_liabilities,
+        "short_term_debt": short_term_debt,
+    }, fresh, annual_share_counts, classed)
 
     return FinancialSnapshot(
         cik=cik,
         ticker=ticker,
         annual_eps=annual_eps,
+        annual_share_counts=annual_share_counts,
         annual_net_income=annual_net_income,
         ttm_net_income=ttm_net_income,
         ttm_eps=ttm_eps,
@@ -740,6 +889,7 @@ def build_snapshot(
                                      ns="dei", unit=("shares",)),
         dividend=dividend,
         dividend_per_share=dividend_per_share,
+        recurring_dividend_per_share=recurring_dividend_per_share,
         pays_dividend=pays_dividend,
         balance_sheet_date=balance_sheet_date,
         total_debt=total_debt,
@@ -760,7 +910,80 @@ def build_snapshot(
     )
 
 
-def _reject_foreign(facts: dict) -> None:
+def _filing_keys(taxo: dict, forms: tuple[str, ...]) -> set[tuple[str, str]]:
+    """Return the filing dates/accessions represented in one taxonomy."""
+    out: set[tuple[str, str]] = set()
+    for tagdata in taxo.values():
+        for entries in tagdata.get("units", {}).values():
+            for entry in entries:
+                if entry.get("form", "").startswith(forms) and entry.get("filed"):
+                    out.add((entry["filed"], entry.get("accn", "")))
+    return out
+
+
+def _has_usd_balance_in_filing(
+    taxo: dict,
+    filing: tuple[str, str],
+    anchors: tuple[str, ...] = _FOREIGN_BALANCE_ANCHORS,
+) -> bool:
+    """A real USD balance sheet, not one stray standard-taxonomy concept."""
+    filed, accn = filing
+    for tag in anchors:
+        for entry in taxo.get(tag, {}).get("units", {}).get("USD", []):
+            if (entry.get("filed"), entry.get("accn", "")) == (filed, accn):
+                return True
+    return False
+
+
+def _has_any_balance_in_filing(facts: dict, filing: tuple[str, str]) -> bool:
+    """Whether the annual accession carries a standard balance in any currency."""
+    filed, accn = filing
+    for namespace, anchors in (("us-gaap", _FOREIGN_BALANCE_ANCHORS),
+                               ("ifrs-full", _IFRS_BALANCE_ANCHORS)):
+        taxo = facts.get(namespace, {})
+        for tag in anchors:
+            for entries in taxo.get(tag, {}).get("units", {}).values():
+                if any((e.get("filed"), e.get("accn", "")) == (filed, accn)
+                       for e in entries):
+                    return True
+    return False
+
+
+def _has_prior_supported_foreign_annual(
+    facts: dict, newest: tuple[str, str],
+) -> bool:
+    for namespace, anchors in (("us-gaap", _FOREIGN_BALANCE_ANCHORS),
+                               ("ifrs-full", _IFRS_BALANCE_ANCHORS)):
+        taxo = facts.get(namespace, {})
+        for filing in _filing_keys(taxo, ("20-F", "40-F")):
+            if filing < newest and _has_usd_balance_in_filing(taxo, filing, anchors):
+                return True
+    return False
+
+
+def _current_supported_foreign_annual(
+    facts: dict,
+) -> tuple[tuple[str, str] | None, str | None]:
+    """Newest 20-F/40-F and its supported USD statement namespace, if any."""
+    all_annual: set[tuple[str, str]] = set()
+    for taxo in facts.values():
+        all_annual.update(_filing_keys(taxo, ("20-F", "40-F")))
+    newest = max(all_annual, default=None)
+    if newest is None:
+        return None, None
+    for namespace, anchors in (
+        ("us-gaap", _FOREIGN_BALANCE_ANCHORS),
+        ("ifrs-full", _IFRS_BALANCE_ANCHORS),
+    ):
+        taxo = facts.get(namespace, {})
+        if (newest in _filing_keys(taxo, ("20-F", "40-F"))
+                and _has_usd_balance_in_filing(taxo, newest, anchors)):
+            return newest, namespace
+    return newest, None
+
+
+def _reject_foreign(facts: dict, receipt: dict | None = None) -> str:
+    """Return the statement taxonomy to normalize, refusing unsafe foreign bases."""
     latest = {"foreign": "", "domestic": ""}
     for taxo in facts.values():
         for tagdata in taxo.values():
@@ -775,11 +998,54 @@ def _reject_foreign(facts: dict) -> None:
                         continue
                     if e.get("filed", "") > latest[side]:
                         latest[side] = e["filed"]
-    if latest["foreign"] > latest["domestic"]:
+    if latest["foreign"] <= latest["domestic"]:
+        return "us-gaap"
+
+    # Old US-GAAP history can remain after an IFRS transition (and vice versa).
+    # The basis is determined by the newest foreign annual itself, never by which
+    # namespace happens to have the longer history.
+    newest, statement_basis = _current_supported_foreign_annual(facts)
+    recently_filed = bool(newest and 0 <= (date.today() - date.fromisoformat(newest[0])).days <= 7)
+    if (newest is not None and statement_basis is None
+            and not _has_any_balance_in_filing(facts, newest)
+            and (recently_filed or _has_prior_supported_foreign_annual(facts, newest))):
+        # SEC's filing index can lead Company Facts by hours or days. One cover
+        # share fact from the new accession is enough to make it the newest 20-F,
+        # but not enough to conclude that the filing is non-USD or unsupported.
+        raise PendingFilingFactsError(newest)
+    if newest is None or statement_basis is None:
         raise UnsupportedFilerError(
-            "filer currently reports on foreign forms (20-F/40-F/6-K); foreign "
-            "reporting cadence and IFRS taxonomy are not supported"
+            "filer's current foreign annual report does not carry a supported USD "
+            "US-GAAP or IFRS balance sheet; non-USD statements are not supported"
         )
+
+    # The exact SEC cover class is the bridge between statement figures and the
+    # traded ticker. Ordinary/common shares need no conversion. A receipt must
+    # carry a positive, filing-backed underlying-shares-per-receipt ratio.
+    title = (receipt or {}).get("title")
+    if not title:
+        raise UnsupportedFilerError(
+            "foreign filer has no exact filing-cover security title for this ticker"
+        )
+    if (receipt or {}).get("accn") != newest[1]:
+        raise UnsupportedFilerError(
+            "foreign filer's exact security title is not from its current annual cover"
+        )
+    if not cover.is_common_equity_security(title):
+        raise UnsupportedFilerError(
+            "foreign ticker's exact filing-cover class is not supported common equity"
+        )
+    if cover.is_depositary_security(title):
+        raw_ratio = (receipt or {}).get("ratio")
+        try:
+            ratio = Decimal(str(raw_ratio)) if raw_ratio is not None else None
+        except Exception:
+            ratio = None
+        if ratio is None or ratio <= 0:
+            raise UnsupportedFilerError(
+                "foreign depositary security has no resolved positive cover-page ratio"
+            )
+    return statement_basis
 
 
 def _entries(taxo: dict, tag: str, unit_pref: tuple[str, ...]) -> list[dict]:
@@ -814,8 +1080,123 @@ def _days(e: dict) -> int:
 
 
 def _fy_label(end: date) -> int:
-    # January-ending fiscal years (retail convention) are labeled with the prior year
+    # Date-only fallback. A January end is ambiguous: Veeva calls 2025-01-31
+    # FY2025, while many retailers call it FY2024. `_fiscal_calendar` uses the
+    # annual filing's own FY declaration first; this convention applies only when
+    # the filing supplies no usable anchor.
     return end.year if end.month > 1 else end.year - 1
+
+
+class _FiscalTaxonomy(dict):
+    """A statement taxonomy carrying its one company-wide fiscal calendar."""
+
+
+def _fiscal_year(value) -> int | None:
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1900 <= year <= 2200 else None
+
+
+def _build_fiscal_calendar(gaap: dict) -> dict[str, int]:
+    """Map every annual period end to the fiscal year the filer calls it.
+
+    Company Facts repeats the current filing's ``fy`` on its comparative columns,
+    so that field is authoritative only for the newest full-year period in each
+    annual accession. Once those accession-level anchors are found across the
+    whole taxonomy, adjacent comparative ends are placed relative to them. This
+    single map prevents EPS, income and balance-sheet tags from choosing different
+    years merely because SEC supplied a calendar frame for one tag but not another.
+    """
+    by_end: dict[str, dict] = {}
+    filings: dict[tuple[str, str], dict] = {}
+    frames: dict[str, tuple[str, int]] = {}
+    for tagdata in gaap.values():
+        for entries in (tagdata.get("units") or {}).values():
+            for e in entries:
+                if ("start" not in e or not _is_annual_form(e.get("form", ""))
+                        or _days(e) not in _ANNUAL_DAYS or not e.get("end")):
+                    continue
+                if e.get("filed") and e["end"] > e["filed"]:
+                    continue
+                end = e["end"]
+                previous = by_end.get(end)
+                if previous is None or e.get("filed", "") > previous.get("filed", ""):
+                    by_end[end] = e
+                filing = filings.setdefault(
+                    (e.get("filed", ""), e.get("accn", "")), {"ends": set(), "fy": []})
+                filing["ends"].add(end)
+                if (fy := _fiscal_year(e.get("fy"))) is not None:
+                    filing["fy"].append(fy)
+                match = re.fullmatch(r"CY(\d{4})", e.get("frame") or "")
+                if match:
+                    candidate = int(match.group(1))
+                    if candidate == _fy_label(date.fromisoformat(end)):
+                        held = frames.get(end)
+                        if held is None or e.get("filed", "") > held[0]:
+                            frames[end] = (e.get("filed", ""), candidate)
+    if not by_end:
+        return {}
+
+    # An accession's latest duration is its own fiscal year; earlier durations in
+    # that accession are comparative columns carrying the same filing-level `fy`.
+    anchors: dict[str, tuple[str, int]] = {}
+    for (filed, _), filing in filings.items():
+        if not filing["ends"] or not filing["fy"]:
+            continue
+        end = max(filing["ends"])
+        end_date = date.fromisoformat(end)
+        votes = filing["fy"]
+        fy = max(set(votes), key=votes.count)
+        if fy not in (end_date.year, end_date.year - 1):
+            continue
+        if fy == end_date.year - 1 and end_date.month > 2:
+            continue
+        held = anchors.get(end)
+        if held is None or filed > held[0]:
+            anchors[end] = (filed, fy)
+
+    # The current annual filing declares the company's convention. Older SEC
+    # metadata is not stable for January filers: Veeva's 2022 accession says
+    # FY2021 while its later filings and published statements consistently name
+    # years by the January in which they end; several retailers consistently do
+    # the opposite. Mixing accession-local offsets recreates the missing/duplicate
+    # years this calendar exists to prevent, so the newest credible anchor governs
+    # the adjacent history and `_fy_labels` propagates from that one point.
+    labels = {}
+    if anchors:
+        latest_end = max(anchors)
+        labels[latest_end] = anchors[latest_end][1]
+    # Calendar frames are useful for pre-IPO comparative-only years, but only
+    # where no filing-level anchor settles the company's convention.
+    if not labels:
+        labels = {end: value[1] for end, value in frames.items()}
+    return _fy_labels(sorted(by_end), labels, by_end)
+
+
+def _with_fiscal_calendar(gaap: dict) -> _FiscalTaxonomy:
+    if isinstance(gaap, _FiscalTaxonomy):
+        return gaap
+    wrapped = _FiscalTaxonomy(gaap)
+    wrapped.fiscal_labels = _build_fiscal_calendar(gaap)
+    return wrapped
+
+
+def _fiscal_labels(gaap: dict) -> dict[str, int]:
+    labels = getattr(gaap, "fiscal_labels", None)
+    return labels if labels is not None else _build_fiscal_calendar(gaap)
+
+
+def _provenance_tag(tag: str, e: dict, ns: str = "us-gaap") -> str:
+    """The element the filer used, even when a normalized chain selected it."""
+    return f"{e.get('_source_namespace', ns)}:{e.get('_source_tag', tag)}"
+
+
+def _canonical_tag(tag_text: str) -> str:
+    """The normalized rule tag behind a source-provenance element."""
+    bare = tag_text.split(":", 1)[-1]
+    return _IFRS_TO_CANONICAL.get(bare, bare)
 
 
 def _fact(concept: str, tag: str, e: dict, fiscal_year: int | None = None, ns: str = "us-gaap") -> Fact:
@@ -823,7 +1204,7 @@ def _fact(concept: str, tag: str, e: dict, fiscal_year: int | None = None, ns: s
         value=_dec(e["val"]),
         provenance=Provenance(
             concept=concept,
-            tag=f"{ns}:{tag}",
+            tag=_provenance_tag(tag, e, ns),
             fiscal_year=fiscal_year,
             form=e.get("form", ""),
             accession=e.get("accn", ""),
@@ -1035,7 +1416,23 @@ def _annual_series(gaap: dict, tag: str, unit: tuple[str, ...] = ("USD/shares",)
             by_end[e["end"]] = e
     if not by_end:
         return {}
-    labels = _fy_labels(sorted(by_end), frames, by_end)
+    # Prefer the taxonomy-wide filing calendar. A company can retain a few periods
+    # from an old fiscal-calendar regime that collide with other statement dates and
+    # therefore cannot all enter the shared map. Those old dates do not invalidate
+    # the current company calendar for the whole tag (MAMA had two old December
+    # periods and every recent January operating-income year shifted backward).
+    # Merge non-conflicting local labels for just the unmatched dates. If an
+    # unmatched date claims a year already settled by the shared map, the cut view
+    # is genuinely ambiguous and the tag-local calendar remains the safer answer.
+    shared = _fiscal_labels(gaap)
+    local = _fy_labels(sorted(by_end), frames, by_end)
+    mapped = {end: shared[end] for end in by_end if end in shared}
+    unmatched = {end: local[end] for end in by_end if end not in shared and end in local}
+    labels = (
+        local
+        if not mapped or set(mapped.values()) & set(unmatched.values())
+        else {**unmatched, **mapped}
+    )
     series: dict[int, Fact] = {}
     kept: dict[int, str] = {}
     for end in sorted(by_end):
@@ -1054,18 +1451,26 @@ def _annual_series(gaap: dict, tag: str, unit: tuple[str, ...] = ("USD/shares",)
 def _fy_labels(ends: list[str], frames: dict[str, int], by_end: dict[str, dict]) -> dict[str, int]:
     """Label each annual period end with its fiscal year.
 
-    SEC's frame is authoritative and is never moved. Ends without one are placed
-    relative to the nearest framed neighbour. Two invariants keep inference from
-    drifting: a fiscal year always ends in its own calendar year or the next one,
-    and an inferred label never displaces another period — a colliding old year is
-    dropped rather than pushed into a year that does not exist.
+    SEC's calendar frame labels comparative calendar years. The newest period's
+    own ``fy`` is a second anchor when it is structurally credible: normally it
+    equals the end year, while Jan/Feb retail years may use the prior year. A
+    comparative's filing-year value (GOOGL FY2015 on a 2014 period) and a March
+    filer's stale prior-year value (CRUS) are not anchors. Ends without an anchor
+    are placed relative to the nearest one. An inferred label never displaces
+    another period — a colliding old year is dropped rather than invented.
     """
     labels = dict(frames)
+    last = ends[-1]
+    end_d = date.fromisoformat(last)
+    fy = by_end[last].get("fy")
+    if (isinstance(fy, int)
+            and (fy == end_d.year or (end_d.month <= 2 and fy == end_d.year - 1))):
+        # DECK retained an old calendar-frame anchor after moving to a March
+        # year-end. Its current 10-K says FY2026 and must realign every tag to
+        # that common fiscal calendar.
+        labels[last] = fy
     if not labels:
-        last = ends[-1]
-        end_d = date.fromisoformat(last)
-        fy = by_end[last].get("fy")
-        labels[last] = fy if isinstance(fy, int) and abs(fy - end_d.year) <= 1 else _fy_label(end_d)
+        labels[last] = _fy_label(end_d)
     anchors = sorted(labels)
     taken = set(labels.values())
     for end in ends:
@@ -1139,7 +1544,7 @@ def _reconciled_annual_eps(gaap: dict, series: dict[int, Fact],
     basic = _by_accession(gaap, ("WeightedAverageNumberOfSharesOutstandingBasic",), ("shares",))
     out = dict(series)
     for year, chosen in series.items():
-        tag = chosen.provenance.tag.split(":", 1)[-1]
+        tag = _tag_of(chosen)
         end = chosen.provenance.period_end
         if end is None or "ContinuingOperations" in tag or year in preferred:
             continue
@@ -1360,6 +1765,12 @@ _NET_OF_INTEREST = "RevenuesNetOfInterestExpense"
 _INSIDE_NET_OF_INTEREST = ("InterestIncomeOperating", "InterestAndDividendIncomeOperating",
                            "InterestIncomeExpenseNet")
 
+# DTE files the whole utility group under the first tag and its regulated
+# operation under the second. The narrower series is longer, so the ordinary
+# depth tie-break would otherwise put the component above its own total.
+_REGULATED_TOTAL = "RegulatedAndUnregulatedOperatingRevenue"
+_REGULATED_PART = "RegulatedOperatingRevenue"
+
 
 # Sales tax collected for the state is at most a tenth or so of a sale, so the two
 # assessed-tax elements describe one quantity twice and cannot be far apart.
@@ -1425,6 +1836,10 @@ def _wider_top_line(pool, tag: str, series: dict[int, Fact]):
         whole = next((s for t, s in pool if t == _NET_OF_INTEREST), None)
         if whole is not None and max(whole) >= max(series):
             return _NET_OF_INTEREST, whole
+    if tag == _REGULATED_PART:
+        whole = next((s for t, s in pool if t == _REGULATED_TOTAL), None)
+        if whole is not None and max(whole) >= max(series):
+            return _REGULATED_TOTAL, whole
     if tag not in _TOTAL_AND_PART:
         return tag, series
     other = next((s for t, s in pool if t in _TOTAL_AND_PART and t != tag), None)
@@ -1518,7 +1933,7 @@ def _ttm_eps(gaap: dict, annual_eps: dict[int, Fact],
     if not annual_eps:
         return None, ()
     latest = annual_eps[max(annual_eps)]
-    tag = latest.provenance.tag.split(":", 1)[1]
+    tag = _tag_of(latest)
     all_durations = [e for e in _entries(gaap, tag, unit) if "start" in e]
     quarters = [e for e in all_durations if _is_interim_form(e.get("form", ""))]
     if not quarters:
@@ -1592,7 +2007,7 @@ def _filed_by(gaap: dict, cutoff: str) -> dict:
                  if (kept := [e for e in entries if e.get("filed", "") <= cutoff])}
         if units:
             cut[tag] = {**data, "units": units}
-    return cut
+    return _with_fiscal_calendar(cut)
 
 
 def fiscal_year_ends(gaap: dict) -> dict[int, str]:
@@ -1604,6 +2019,7 @@ def fiscal_year_ends(gaap: dict) -> dict[int, str]:
     balance sheet describes no moment that existed. Only annual filings are read,
     so the date has always already happened.
     """
+    gaap = _with_fiscal_calendar(gaap)
     ends: dict[int, str] = {}
     # The earnings series first, because it labels fiscal years from SEC's own frame
     # and the balance-sheet reader labels them from the month the period ends in.
@@ -1753,7 +2169,7 @@ def _earnings_quality(gaap: dict, ttm_inputs: tuple[Fact, ...], annual_eps: dict
     emit(*_WARRANT_TAG, neutral=True)
 
     # a loss quarter dropping out of (or sitting inside) the window swings the TTM
-    tag = ttm_inputs[0].provenance.tag.split(":", 1)[1]
+    tag = _tag_of(ttm_inputs[0])
     quarters = [
         e for e in _entries(gaap, tag, ("USD/shares",))
         if "start" in e and 80 <= _days(e) <= 100 and _dec(e["val"]) < 0
@@ -1892,7 +2308,7 @@ def _latest_instant_across(
 
 
 def _tag_of(fact: Fact | None) -> str | None:
-    return fact.provenance.tag.split(":", 1)[1] if fact else None
+    return _canonical_tag(fact.provenance.tag) if fact else None
 
 
 # Short-bucket slots a combined (current + noncurrent) long-bucket tag makes
@@ -1940,7 +2356,7 @@ def _debt_elsewhere(gaap: dict, lease: Fact) -> bool:
 
 
 def _component_value(gaap: dict, component, fresh: date | None) -> Decimal | None:
-    f = _latest_instant(gaap, component.concept, (component.tag.split(":", 1)[-1],),
+    f = _latest_instant(gaap, component.concept, (_canonical_tag(component.tag),),
                         not_before=fresh)
     return f.value if f else None
 
@@ -1964,6 +2380,29 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
          "LongTermNotesPayable", "LongTermDebt"),
         not_before=not_before, largest_wins=True,
     )
+    # Some foreign US-GAAP statements present bank borrowings and funding notes
+    # as two separate long-term balance-sheet lines. LX is explicit: $80.939M
+    # LongTermDebt plus $121.633M LongTermNotesPayable. The ordinary domestic
+    # meaning of LongTermDebt is a rollup, so this exception requires the same
+    # foreign annual filing/date and the debt line to be smaller than the notes
+    # line. That last guard keeps PMEC's $12.812M combined total from absorbing
+    # its own $4.331M note component twice.
+    borrowing = _latest_instant(gaap, "LongTermDebt (foreign borrowings)",
+                                ("LongTermDebt",), not_before=not_before)
+    funding = _latest_instant(gaap, "LongTermDebt (foreign funding notes)",
+                              ("LongTermNotesPayable",), not_before=not_before)
+    disjoint_foreign = None
+    if (borrowing and funding
+            and borrowing.provenance.form in ("20-F", "40-F")
+            and funding.provenance.form == borrowing.provenance.form
+            and funding.provenance.accession == borrowing.provenance.accession
+            and funding.provenance.period_end == borrowing.provenance.period_end
+            and borrowing.value < funding.value):
+        disjoint_foreign = _sum_facts(
+            "LongTermDebt (foreign borrowings + funding notes)",
+            [borrowing, funding],
+        )
+        primary = _fresher_or_larger(primary, disjoint_foreign)
     # The instrument families are a SECOND representation of the same debt, not an
     # addition to the first, so they are built whatever the primary chain found and
     # the better of the two is taken. Gating them on "primary is None" dropped
@@ -2084,7 +2523,11 @@ def _long_term_debt(gaap: dict, not_before: date | None) -> tuple[Fact | None, f
         if f is None:
             continue
         for tag in f.provenance.tag.split(" + "):  # summed facts carry every component tag
-            suppress |= _COMBINED_SUPPRESSIONS.get(tag.split(":", 1)[1], frozenset())
+            if f is disjoint_foreign and tag.split(":", 1)[-1] == "LongTermDebt":
+                # Here the filing proves the plain tag is the noncurrent
+                # borrowings line, not the usual current+noncurrent rollup.
+                continue
+            suppress |= _COMBINED_SUPPRESSIONS.get(_canonical_tag(tag), frozenset())
     return _sum_facts("LongTermDebt", parts), frozenset(suppress)
 
 
@@ -2325,7 +2768,7 @@ def _derive_liabilities(gaap: dict, not_before: date | None) -> tuple[Fact | Non
                 value=lse.value - equity.value,
                 provenance=Provenance(
                     concept="Liabilities (derived: LiabilitiesAndStockholdersEquity - equity)",
-                    tag=f"us-gaap:LiabilitiesAndStockholdersEquity - us-gaap:{equity_tag}",
+                    tag=f"{lse.provenance.tag} - {equity.provenance.tag}",
                     fiscal_year=None, form=p.form, accession=p.accession,
                     filed=p.filed, period_end=p.period_end,
                 ),
@@ -2374,7 +2817,8 @@ def _derived_instant(
         value=value,
         provenance=Provenance(
             concept=concept,
-            tag=f"us-gaap:{minuend} - us-gaap:{subtrahend}",
+            tag=(f"{_provenance_tag(minuend, a[end])} - "
+                 f"{_provenance_tag(subtrahend, b[end])}"),
             fiscal_year=None, form=base.get("form", ""), accession=base.get("accn", ""),
             filed=date.fromisoformat(base["filed"]), period_end=date.fromisoformat(end),
         ),
@@ -2472,17 +2916,49 @@ def _combined_goodwill_and_intangibles(gaap: dict, not_before: date | None) -> t
     return goodwill, combined
 
 
+def _goodwill_and_intangibles(
+    gaap: dict, not_before: date | None,
+) -> tuple[Fact | None, Fact | None]:
+    """Extract the two tangible-book deductions under one shared policy.
+
+    Current and historical tangible book must ask the same question. Previously
+    the current path used the full fallback/derivation chain while the history
+    read only two direct tags and silently changed either missing value to zero.
+    That made 2,355 UI rows show historical P/TBV beside an uncomputable current
+    P/TBV. This helper is reused for each annual balance sheet below so a missing
+    deduction remains missing in every column.
+    """
+    goodwill = _latest_instant(gaap, "Goodwill", ("Goodwill",), not_before=not_before)
+    if goodwill is None:
+        # RNR files no Goodwill element at all; the combined line minus the
+        # ex-goodwill line is the same figure by identity.
+        goodwill = _derived_instant(
+            gaap, "Goodwill (derived: combined line - intangibles excluding goodwill)",
+            "IntangibleAssetsNetIncludingGoodwill", "IntangibleAssetsNetExcludingGoodwill",
+            not_before,
+        )
+    if goodwill is None:
+        goodwill = _derived_instant(
+            gaap, "Goodwill (derived: gross - accumulated impairment)",
+            "GoodwillGross", "GoodwillImpairedAccumulatedImpairmentLoss", not_before,
+            subtrahend_optional=True,
+        )
+    intangibles = _intangibles(gaap, not_before)
+    if goodwill is None and intangibles is None:
+        goodwill, intangibles = _combined_goodwill_and_intangibles(gaap, not_before)
+    return goodwill, intangibles
+
+
 OPERATING_INCOME_TAGS = ("OperatingIncomeLoss",)
 # Energy and other filers whose income statement has no operating subtotal report a
-# pre-tax figure instead. It includes non-operating items, so it is flagged when used.
+# pre-tax figure instead. Context analysis may use it but owner earnings never does.
 PRETAX_INCOME_TAGS = (
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeignAndDomestic",
 )
 # The domestic figure is one geography, not the consolidated company: standing
-# alone it understates a multinational's profit, and with it the owner earnings
-# and return on capital built on top. It serves only added to its foreign twin,
+# alone it understates a multinational's profit. It serves only added to its foreign twin,
 # and only where both cover the same year.
 _PRETAX_GEOGRAPHY_TAGS = ("IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
                           "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign")
@@ -2505,13 +2981,16 @@ DEFERRED_TAX_ASSET_TAGS = ("DeferredTaxAssetsGross",)
 # is stale or scoped to something narrower than the allowance covers
 DEFERRED_TAX_ASSET_NET_TAGS = ("DeferredTaxAssetsNet",)
 DEFERRED_TAX_ALLOWANCE_TAGS = ("DeferredTaxAssetsValuationAllowance",)
-CAPEX_TAGS = (
+CASH_CAPEX_TAGS = (
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
     "PaymentsForCapitalImprovements",
+)
+CAPEX_TAGS = (
+    *CASH_CAPEX_TAGS,
     # last, so per-year fill only covers years the payments tags lack (SCHL's
-    # payments tag died in FY2020); accrual-basis overstatement is conservative
-    # for owner earnings and the provenance discloses the segment source
+    # payments tag died in FY2020); accrual-basis overstatement lowers the
+    # all-capex floor and the provenance discloses the segment source
     "SegmentExpenditureAdditionToLongLivedAssets",
 )
 CASH_TAGS = (
@@ -2603,54 +3082,37 @@ def _annual_union(gaap: dict, tags: tuple[str, ...],
     return out
 
 
-def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEarnings | None:
-    """Owner earnings over invested capital, on the latest fully audited year.
+def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
+                    annual_share_counts: dict[int, Fact] | None = None,
+                    classed: dict | None = None) -> OwnerEarnings | None:
+    """Build separately labelled owner-earnings evidence for audited years.
 
-    Three terms in the classic definition no longer describe how companies report,
-    and carrying them anyway would corrupt the number rather than complete it:
+    Buffett's definition starts with the earnings attributable to owners, adds
+    non-cash depreciation/amortisation, and deducts maintenance capital expenditure
+    plus any additional working capital the business requires. Company Facts normally
+    exposes total capex, not maintenance capex, and never identifies the *required*
+    portion of a working-capital movement. Therefore no definitive owner-earnings
+    number is manufactured here.
 
-    Goodwill amortisation ended with SFAS 142 in 2001 — goodwill is impaired now, not
-    amortised, and the tag appears in none of the filings on hand. Stock option cost is
-    already inside operating income: ASC 718 has required it to be expensed since 2006,
-    so the deduction the definition calls for has been made before we see the figure,
-    and subtracting it again would charge it twice. Pension return assumptions are
-    disclosed by too few filers to adjust for, and only defined-benefit plans can play
-    that game at all.
+    Instead the payload carries three facts with different meanings:
 
-    What is left is measurable: operating profit, plus depreciation and amortisation
-    because they are non-cash, less tax actually charged, less the capital spending the
-    business cannot avoid. That last term is the one no filing discloses — a company
-    reports total capital expenditure, never the split between maintaining the business
-    and growing it. Total capex is the conservative reading and the headline here, and
-    since Buffett's own approximation is that maintenance spending roughly equals
-    depreciation, that variant is carried alongside as the optimistic bound. A company
-    whose ROIC clears the bar on both readings clears it on any.
+    * reported earnings + D&A - total capex: an all-capex floor for organic growers;
+    * reported earnings: the explicit maintenance≈D&A estimate; and
+    * operating cash flow - total capex: standard free cash flow, separately named.
+
+    The first two still omit required additional working capital. FCF includes the
+    actual cash-flow-statement working-capital movement, but cannot say how much of it
+    was required to preserve the company's competitive position.
     """
     caveats: list[str] = []
     flows: dict[str, dict[int, Fact]] = {}
-    for label, tags in (("operating profit", OPERATING_INCOME_TAGS), ("tax", TAX_TAGS),
-                        ("capital expenditure", CAPEX_TAGS)):
-        if series := _annual_union(gaap, tags):
-            flows[label] = series
-    # The fallback is per year, not per company: Johnson & Johnson stopped tagging an
-    # operating subtotal after 2014 and kept reporting pre-tax income, so an
-    # all-or-nothing substitution froze its return on capital at a twelve-year-old
-    # year rather than continuing the series.
-    if series := _annual_union(gaap, PRETAX_INCOME_TAGS):
-        existing = flows.get("operating profit", {})
-        filled = [y for y in series if y not in existing]
-        if filled:
-            flows["operating profit"] = {**series, **existing}
-            caveats.append(
-                "no operating subtotal is reported for FY"
-                + ", FY".join(str(y) for y in sorted(filled)[-3:])
-                + ", so pre-tax income stands in for operating profit there and carries "
-                  "non-operating items with it")
-    if "operating profit" not in flows and (series := _geographic_pretax(gaap)):
-        flows["operating profit"] = series
-        caveats.append("no operating subtotal or consolidated pre-tax total is reported, so "
-                       "pre-tax income is the sum of the domestic and foreign figures for the "
-                       "same year, and carries non-operating items with it")
+    # Owner earnings belongs to the parent/common holders. Prefer that scope per
+    # fiscal year; ProfitLoss is only the final fallback where no parent line exists.
+    if series := _annual_union(gaap, NET_INCOME_TAGS):
+        flows["reported earnings attributable to owners"] = series
+    if series := _annual_union(gaap, CAPEX_TAGS):
+        flows["total capital expenditure"] = series
+    operating_cash_flow = _annual_union(gaap, OPERATING_CASH_FLOW_TAGS)
 
     da = _annual_union(gaap, DA_TAGS)
     parts = [s for tag in DA_PART_TAGS if (s := _annual_series(gaap, tag, unit=("USD",)))]
@@ -2668,56 +3130,113 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     if da:
         flows["depreciation & amortisation"] = da
 
-    required = ("operating profit", "depreciation & amortisation", "tax", "capital expenditure")
+    required = ("reported earnings attributable to owners",
+                "depreciation & amortisation", "total capital expenditure")
     if any(k not in flows for k in required):
         return None
     shared = set.intersection(*(set(flows[k]) for k in required))
     if not shared:
         return None
     fy = max(shared)
-    # A return divides a year's flows by the capital that produced them. Johnson &
-    # Johnson stopped tagging an operating subtotal after 2014, and its FY2014 flows
-    # were being divided by a 2026 balance sheet and shown as today's ROIC, green
-    # highlight and all. Twelve years apart is not a return on anything.
+    # A return divides a year's flows by the capital that produced them. Stale flows
+    # beside a current balance sheet are not a return on anything.
     newest_end = max((flows[k][fy].provenance.period_end for k in required
                       if flows[k][fy].provenance.period_end), default=None)
     if (fresh is not None and newest_end is not None
             and (fresh - newest_end).days > _OWNER_EARNINGS_LAG):
         return None
 
-    op, dep = flows["operating profit"][fy].value, flows["depreciation & amortisation"][fy].value
-    tax, capex = flows["tax"][fy].value, flows["capital expenditure"][fy].value
-    # Capex is a positive cash outflow in every tag we chain. Tax is NOT:
-    # IncomeTaxExpenseBenefit is signed, and a company with a net benefit files it
-    # negative. Forcing it positive charged Uber for a $4.3bn benefit it received,
-    # moving owner earnings the wrong way by twice the amount and reporting 3.36%
-    # where the truth is 21.59%. Subtracting the signed value adds a benefit back.
+    earnings_source = flows["reported earnings attributable to owners"][fy]
+    depreciation_source = flows["depreciation & amortisation"][fy]
+    capex_source = flows["total capital expenditure"][fy]
+    earnings = earnings_source.value
+    dep = depreciation_source.value
+    capex = capex_source.value
     capex = abs(capex)
     # InspireMD tags $476M of depreciation against $44.6M of total assets. A single
     # year's flow cannot exceed everything the company owns; where it does, the
     # element is holding something other than the flow it names.
     scale = snap_parts.get("total_assets")
     if scale is not None and scale.value > 0:
-        if any(abs(v) > scale.value for v in (op, dep, tax, capex)):
+        if any(abs(v) > scale.value for v in (earnings, dep, capex)):
             return None
-    owner = op + dep - tax - capex
+    all_capex_floor = earnings + dep - capex
+    maintenance_estimate = earnings  # D&A add-back and assumed maintenance capex cancel
+    latest_flow = max((earnings_source, depreciation_source, capex_source),
+                      key=lambda fact: fact.provenance.filed).provenance
+    all_capex_floor_fact = Fact(
+        value=all_capex_floor,
+        provenance=Provenance(
+            concept="Owner-earnings all-capex floor",
+            tag=(f"{earnings_source.provenance.tag} + "
+                 f"{depreciation_source.provenance.tag} - {capex_source.provenance.tag}"),
+            fiscal_year=fy, form=latest_flow.form, accession=latest_flow.accession,
+            filed=latest_flow.filed, period_end=latest_flow.period_end,
+            period_start=latest_flow.period_start,
+            components=tuple(f.provenance for f in (
+                earnings_source, depreciation_source, capex_source)),
+        ),
+    )
+    maintenance_estimate_fact = Fact(
+        value=maintenance_estimate,
+        provenance=Provenance(
+            concept="Owner-earnings estimate (maintenance capex assumed equal to D&A)",
+            tag=(f"{earnings_source.provenance.tag} + {depreciation_source.provenance.tag} "
+                 f"- assumed maintenance capex ({depreciation_source.provenance.tag})"),
+            fiscal_year=fy, form=latest_flow.form, accession=latest_flow.accession,
+            filed=latest_flow.filed, period_end=latest_flow.period_end,
+            period_start=latest_flow.period_start,
+            components=(earnings_source.provenance, depreciation_source.provenance),
+        ),
+    )
+    cash_flow = None
+    cash_flow_components: tuple[tuple[str, Decimal], ...] = ()
+    if (_tag_of(flows["total capital expenditure"][fy]) in CASH_CAPEX_TAGS
+            and fy in operating_cash_flow
+            and operating_cash_flow[fy].provenance.period_end
+            == flows["total capital expenditure"][fy].provenance.period_end):
+        operating_cash_source = operating_cash_flow[fy]
+        cash_latest = max((operating_cash_source, capex_source),
+                          key=lambda fact: fact.provenance.filed).provenance
+        cash_flow = Fact(
+            value=operating_cash_source.value - capex,
+            provenance=Provenance(
+                concept="Free cash flow (operating cash flow less total capex)",
+                tag=f"{operating_cash_source.provenance.tag} - {capex_source.provenance.tag}",
+                fiscal_year=fy, form=cash_latest.form, accession=cash_latest.accession,
+                filed=cash_latest.filed, period_end=cash_latest.period_end,
+                period_start=cash_latest.period_start,
+                components=(operating_cash_source.provenance, capex_source.provenance),
+            ),
+        )
+        cash_flow_components = (
+            ("operating cash flow", operating_cash_source.value),
+            ("- total capital expenditure", -capex),
+        )
     components = (
-        ("operating profit", op),
+        ("reported earnings attributable to owners", earnings),
         ("+ depreciation & amortisation", dep),
-        ("- income tax", -tax),
-        ("- capital expenditure", -capex),
+        ("- total capital expenditure", -capex),
     )
 
     caveats += [
-        "maintenance capital expenditure is not a reported figure; total capital "
-        "expenditure is used, which understates owner earnings for a company still growing",
+        "definitive Buffett owner earnings are withheld because primary XBRL does not "
+        "separate maintenance capital expenditure from growth capital expenditure",
+        "the all-capex floor deducts total capital expenditure and can materially understate "
+        "the economics of a company investing for growth",
+        "the maintenance≈D&A estimate assumes maintenance capital expenditure exactly equals "
+        "depreciation and amortisation; it is an assumption, not a reported figure",
+        "required additional working capital is not separately reported and is not deducted "
+        "from either estimate",
+        "standard free cash flow is operating cash flow less total capital expenditure; it "
+        "includes actual working-capital movements and is not labelled owner earnings",
         "past write-offs that reduced invested capital cannot be reconstructed from the "
         "filings, so invested capital is the balance sheet as it stands",
-        "stock compensation is already expensed within operating profit and is not "
+        "stock compensation is already expensed within reported earnings and is not "
         "deducted a second time",
     ]
 
-    invested = roic = roic_maint = None
+    invested = all_capex_return = maintenance_estimate_return = None
     assets, cur_liab = snap_parts.get("total_assets"), snap_parts.get("current_liabilities")
     short_debt = snap_parts.get("short_term_debt")
     cash = _latest_instant(gaap, "Cash", CASH_TAGS, not_before=fresh)
@@ -2753,8 +3272,8 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
         # of a few thousand dollars against millions of flow prints returns in the
         # thousands of per cent: 75 rows shipped |ROIC| over 1,000%.
         if invested > 0 and invested >= assets.value * _INVESTED_CAPITAL_FLOOR:
-            roic = owner / invested * 100
-            roic_maint = (op - tax) / invested * 100  # maintenance capex assumed equal to D&A
+            all_capex_return = all_capex_floor / invested * 100
+            maintenance_estimate_return = maintenance_estimate / invested * 100
         else:
             invested = None
             caveats.append("invested capital is too small a part of the assets employed for a "
@@ -2762,9 +3281,177 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None) -> OwnerEa
     else:
         caveats.append("no classified balance sheet, so invested capital cannot be separated")
 
-    return OwnerEarnings(fiscal_year=fy, owner_earnings=owner, invested_capital=invested,
-                         roic=roic, roic_maintenance=roic_maint, components=components,
-                         caveats=tuple(caveats))
+    annual: dict[int, AnnualOwnerEarnings] = {}
+    periods = _per_share_periods(gaap)
+    share_periods = _share_periods(gaap)
+    # A filer can put the traded class only on a dimension. Its split evidence
+    # then lives in the DERA sidecar, not Company Facts, and must participate in
+    # the same rebasing vote as the consolidated facts.
+    if classed:
+        for combined, additional in (
+            (periods, _per_share_periods(classed)),
+            (share_periods, _share_periods(classed)),
+        ):
+            for key, values in additional.items():
+                combined.setdefault(key, []).extend(value for value in values
+                                                        if value not in combined.get(key, ()))
+                combined[key].sort()
+    adjusted_counts: dict[int, Fact] = {}
+    for year, count in (annual_share_counts or {}).items():
+        # Comparative share counts in old filings predate later splits.  The EPS
+        # path already rebases those years; multiply its denominator by the same
+        # filing-observed factor so all owner-evidence per-share values are comparable.
+        factor = (_split_factor(periods, count.provenance.filed.isoformat(), share_periods)
+                  if periods else Decimal(1))
+        adjusted = count
+        if factor != 1:
+            p = count.provenance
+            adjusted = Fact(
+                value=count.value * factor,
+                provenance=Provenance(
+                    concept=f"{p.concept} (restated {factor:g}x for later split)",
+                    tag=p.tag, fiscal_year=p.fiscal_year, form=p.form,
+                    accession=p.accession, filed=p.filed, period_end=p.period_end,
+                    period_start=p.period_start, components=(p,), segments=p.segments,
+                ),
+            )
+        adjusted_counts[year] = adjusted
+
+    owner_years = {year for year in shared if fy - 9 <= year <= fy}
+    scale_repairs: list[tuple[int, Decimal]] = []
+    for year in sorted(adjusted_counts):
+        if year not in owner_years:
+            continue
+        current = adjusted_counts[year]
+        before, after = adjusted_counts.get(year - 1), adjusted_counts.get(year + 1)
+        if (before is None or after is None or current.value <= 0
+                or before.value <= 0 or after.value <= 0):
+            continue
+        reference = (before.value + after.value) / 2
+        if abs(before.value - after.value) / reference > Decimal("0.10"):
+            continue
+        factor = next((candidate for candidate in _SHARE_SCALE_FACTORS
+                       if abs(current.value * candidate - reference) / reference
+                       <= _SHARE_SCALE_TOLERANCE), None)
+        if factor is None:
+            continue
+        p = current.provenance
+        adjusted_counts[year] = Fact(
+            value=current.value * factor,
+            provenance=Provenance(
+                concept=f"{p.concept} (scaled {factor:g}x: adjacent fiscal years agree)",
+                tag=p.tag, fiscal_year=p.fiscal_year, form=p.form,
+                accession=p.accession, filed=p.filed, period_end=p.period_end,
+                period_start=p.period_start,
+                components=(p, before.provenance, after.provenance), segments=p.segments,
+            ),
+        )
+        scale_repairs.append((year, factor))
+    if scale_repairs:
+        caveats.append(
+            "the diluted share count carried an isolated table-scale value in "
+            + ", ".join(f"FY{year} ({factor:g}x)" for year, factor in scale_repairs)
+            + "; both adjacent split-adjusted fiscal years prove the exact unit correction")
+
+    for year in sorted(owner_years & set(adjusted_counts)):
+        facts = [flows[label][year] for label in required]
+        adjusted_count = adjusted_counts[year]
+        # A fiscal label alone is not evidence that differently dated statements
+        # describe the same year.  Keep missing/misaligned evidence missing.
+        ends = {fact.provenance.period_end for fact in (*facts, adjusted_count)
+                if fact.provenance.period_end is not None}
+        if len(ends) != 1 or adjusted_count.value <= 0:
+            continue
+        earnings_y, dep_y, capex_y = (fact.value for fact in facts)
+        capex_y = abs(capex_y)
+
+        latest = max(facts, key=lambda fact: fact.provenance.filed).provenance
+        floor_y = earnings_y + dep_y - capex_y
+        floor_fact = Fact(
+            value=floor_y,
+            provenance=Provenance(
+                concept="Owner-earnings all-capex floor",
+                tag=(f"{facts[0].provenance.tag} + {facts[1].provenance.tag} "
+                     f"- {facts[2].provenance.tag}"),
+                fiscal_year=year, form=latest.form, accession=latest.accession,
+                filed=latest.filed, period_end=latest.period_end,
+                period_start=latest.period_start,
+                components=tuple(fact.provenance for fact in facts),
+            ),
+        )
+        estimate_fact = Fact(
+            value=earnings_y,
+            provenance=Provenance(
+                concept="Owner-earnings estimate (maintenance capex assumed equal to D&A)",
+                tag=(f"{facts[0].provenance.tag} + {facts[1].provenance.tag} "
+                     f"- assumed maintenance capex ({facts[1].provenance.tag})"),
+                fiscal_year=year, form=latest.form, accession=latest.accession,
+                filed=latest.filed,
+                period_end=latest.period_end, period_start=latest.period_start,
+                components=(facts[0].provenance, facts[1].provenance),
+            ),
+        )
+
+        cash_flow_fact = None
+        cash_flow_source = operating_cash_flow.get(year)
+        if (cash_flow_source is not None
+                and _tag_of(facts[2]) in CASH_CAPEX_TAGS
+                and cash_flow_source.provenance.period_end == latest.period_end):
+            cash_latest = max((cash_flow_source, facts[2]),
+                              key=lambda fact: fact.provenance.filed).provenance
+            cash_flow_fact = Fact(
+                value=cash_flow_source.value - capex_y,
+                provenance=Provenance(
+                    concept="Free cash flow (operating cash flow less total capex)",
+                    tag=f"{cash_flow_source.provenance.tag} - {facts[2].provenance.tag}",
+                    fiscal_year=year, form=cash_latest.form, accession=cash_latest.accession,
+                    filed=cash_latest.filed, period_end=cash_latest.period_end,
+                    period_start=cash_latest.period_start,
+                    components=(cash_flow_source.provenance, facts[2].provenance),
+                ),
+            )
+
+        def per_share_fact(source: Fact, concept: str) -> Fact:
+            return Fact(
+                value=source.value / adjusted_count.value,
+                provenance=Provenance(
+                    concept=f"{concept} per diluted share (current security basis)",
+                    tag=f"{source.provenance.tag} / {adjusted_count.provenance.tag}",
+                    fiscal_year=year, form=source.provenance.form,
+                    accession=source.provenance.accession,
+                    filed=max(source.provenance.filed, adjusted_count.provenance.filed),
+                    period_end=source.provenance.period_end,
+                    period_start=source.provenance.period_start,
+                    components=(source.provenance, adjusted_count.provenance),
+                ),
+            )
+
+        annual[year] = AnnualOwnerEarnings(
+            all_capex_floor=floor_fact,
+            maintenance_estimate=estimate_fact,
+            free_cash_flow=cash_flow_fact,
+            diluted_shares=adjusted_count,
+            all_capex_floor_per_share=per_share_fact(floor_fact, "All-capex floor"),
+            maintenance_estimate_per_share=per_share_fact(
+                estimate_fact, "Maintenance-capex estimate"),
+            free_cash_flow_per_share=(
+                per_share_fact(cash_flow_fact, "Free cash flow")
+                if cash_flow_fact is not None else None),
+        )
+
+    return OwnerEarnings(
+        fiscal_year=fy,
+        all_capex_floor=all_capex_floor_fact,
+        maintenance_estimate=maintenance_estimate_fact,
+        free_cash_flow=cash_flow,
+        invested_capital=invested,
+        all_capex_return=all_capex_return,
+        maintenance_estimate_return=maintenance_estimate_return,
+        components=components,
+        free_cash_flow_components=cash_flow_components,
+        caveats=tuple(caveats),
+        annual=annual,
+    )
 
 
 _DERIVED_EPS_SHARE_LAG = 460  # a cover count this close to the year end counts that year
@@ -2773,6 +3460,56 @@ _DERIVED_EPS_SHARE_LAG = 460  # a cover count this close to the year end counts 
 _BASIS_TOLERANCE = Decimal("1.5")   # how far EPS x shares may sit from the filer's own income
 _SHARE_SCALE_TOLERANCE = Decimal("0.05")
 _SHARE_SCALE_FACTORS = (Decimal("1000"), Decimal("1000000"))
+_EPS_EXACT_SCALE_TOLERANCE = Decimal("0.01")
+_EPS_SCALED_RECONCILES = Decimal("0.10")
+
+
+def _eps_uses_total_income(fact: Fact) -> bool:
+    """Whether total parent income can legitimately be divided by this EPS.
+
+    Continuing-operations EPS omits discontinued operations, partnership-unit EPS
+    carries the allocation to that unit class, and investment-company operating
+    EPS excludes realised/unrealised results. None has total net income as its
+    numerator, so NI/EPS is neither a share count nor an identity check for them.
+    """
+    tag = fact.provenance.tag
+    return not any(scope in tag for scope in (
+        "ContinuingOperations", "LimitedPartnership", "InvestmentCompany",
+    ))
+
+
+def _depositary_dimension_conflict(
+    bare: dict[int, Fact], classed: dict[int, Fact], receipt: dict | None,
+) -> str | None:
+    """Detect a priced ADS whose ordinary-share ratio is still unknown.
+
+    The same filing can state undimensioned EPS per ordinary share and a second
+    value on ``ClassOfStock=AmericanDepositaryShare``. When they differ materially
+    and no cover ratio was recovered, choosing either basis silently makes P/E,
+    market cap and every per-share book value wrong by the ratio. AMRN states
+    roughly -$0.09 per ordinary share and -$1.87 per ADS in FY2025: evidence of a
+    20:1 basis, but not authority to guess the legal ratio. Withhold instead.
+    """
+    if (receipt or {}).get("ratio"):
+        return None
+    for year in sorted(set(bare) & set(classed), reverse=True):
+        ordinary, ads = bare[year], classed[year]
+        segments = (ads.provenance.segments or "").lower()
+        if not any(word in segments for word in ("depositary", "=adr", "shares=adr")):
+            continue
+        if (ordinary.value == 0 or ads.value == 0
+                or ordinary.provenance.tag != ads.provenance.tag
+                or ordinary.provenance.accession != ads.provenance.accession
+                or ordinary.provenance.period_end != ads.provenance.period_end):
+            continue
+        ratio = abs(ads.value / ordinary.value)
+        if ratio > _BASIS_TOLERANCE or ratio < 1 / _BASIS_TOLERANCE:
+            return (f"FY{year} reports {ordinary.value} per ordinary share and {ads.value} "
+                    f"per depositary share ({ratio:.2f}x apart), but the cover evidence "
+                    "carries no depositary ratio: the price and per-share figures cannot "
+                    "be put on one security basis")
+        return None
+    return None
 
 
 def _restate_onto_receipt(snapshot_parts: dict, ratio: Decimal, accn: str) -> None:
@@ -2800,6 +3537,10 @@ def _restate_onto_receipt(snapshot_parts: dict, ratio: Decimal, accn: str) -> No
     shares = snapshot_parts.get("shares")
     if shares is not None:
         snapshot_parts["shares"] = restated(shares, 1 / ratio, per_receipt)
+    snapshot_parts["annual_share_counts"] = {
+        y: restated(f, 1 / ratio, per_receipt)
+        for y, f in (snapshot_parts.get("annual_share_counts") or {}).items()
+    }
     for key in ("annual_eps",):
         snapshot_parts[key] = {y: restated(f, ratio, per_receipt)
                                for y, f in (snapshot_parts.get(key) or {}).items()}
@@ -2813,6 +3554,10 @@ def _restate_onto_receipt(snapshot_parts: dict, ratio: Decimal, accn: str) -> No
         value = snapshot_parts.get(key)
         if value is not None:
             snapshot_parts[key] = value * ratio
+    recurring = snapshot_parts.get("recurring_dividend_per_share")
+    if recurring is not None:
+        snapshot_parts["recurring_dividend_per_share"] = restated(
+            recurring, ratio, per_receipt)
 
 
 def _basis_conflict(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
@@ -2841,33 +3586,44 @@ def _basis_conflict(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
     if has_nci:
         return None
     counts = _annual_share_counts(gaap, dei, annual_eps, annual_ni, preferred)
-    for year in sorted(set(annual_eps) & set(annual_ni) & set(counts), reverse=True):
-        eps, ni, count = annual_eps[year], annual_ni[year], counts[year]
-        if eps.value == 0 or count.value <= 0 or year in preferred:
-            continue
-        if "ContinuingOperations" in eps.provenance.tag:
-            continue
-        stated = eps.value * count.value
-        if stated == 0 or ni.value == 0:
-            continue
-        ratio = ni.value / stated
-        if ratio > _BASIS_TOLERANCE or ratio < 1 / _BASIS_TOLERANCE:
-            return (f"FY{year} earnings per share of {eps.value} on {count.value / _MILLION:,.1f}M "
-                    f"weighted shares comes to {stated / _MILLION:,.0f}M against the "
-                    f"{ni.value / _MILLION:,.0f}M of net income the same filing reports: the "
-                    "two do not describe one security")
-        # The series can reconcile with its own year and still not describe the
-        # security being priced: SM Energy's earnings are struck on 115.0M weighted
-        # shares while the count every per-share figure divides by is 237.5M. A
-        # price against that pair mixes two bases, whichever of them is right.
-        if shares is not None and shares.value > 0:
-            drift = shares.value / count.value
-            if drift > _BASIS_TOLERANCE or drift < 1 / _BASIS_TOLERANCE:
-                return (f"FY{year} earnings are struck on {count.value / _MILLION:,.1f}M "
-                        f"weighted shares while the current count is "
-                        f"{shares.value / _MILLION:,.1f}M, {drift:.2f}x apart: a per-share "
-                        "figure cannot mix the two")
+    shared = sorted(set(annual_eps) & set(annual_ni) & set(counts), reverse=True)
+    if not shared:
         return None
+    # This is a current-security guard, so only the newest comparable fiscal year
+    # may answer it. Skipping an ineligible recent year and walking backward made
+    # ZWS compare today's 167M shares with FY2009's 69M, and did the same more than
+    # three years backward for 81 companies. Corporate actions make that a history
+    # lesson, not evidence that today's TTM EPS and today's price use different
+    # securities.
+    year = shared[0]
+    eps, ni, count = annual_eps[year], annual_ni[year], counts[year]
+    if (eps.value == 0 or count.value <= 0 or year in preferred
+            or not _eps_uses_total_income(eps)):
+        return None
+    stated = eps.value * count.value
+    if stated == 0 or ni.value == 0:
+        return None
+    ratio = ni.value / stated
+    if ratio > _BASIS_TOLERANCE or ratio < 1 / _BASIS_TOLERANCE:
+        return (f"FY{year} earnings per share of {eps.value} on {count.value / _MILLION:,.1f}M "
+                f"weighted shares comes to {stated / _MILLION:,.0f}M against the "
+                f"{ni.value / _MILLION:,.0f}M of net income the same filing reports: the "
+                "two do not describe one security")
+    # The series can reconcile with its own year and still not describe the
+    # security being priced: SM Energy's earnings are struck on 115.0M weighted
+    # shares while the count every per-share figure divides by is 237.5M. A
+    # price against that pair mixes two bases, whichever of them is right. The
+    # two counts must also be near enough in time for ordinary issuance, buybacks
+    # and splits not to explain the difference.
+    share_end, count_end = shares and shares.provenance.period_end, count.provenance.period_end
+    if (shares is not None and shares.value > 0 and share_end and count_end
+            and abs((share_end - count_end).days) <= _DERIVED_EPS_SHARE_LAG):
+        drift = shares.value / count.value
+        if drift > _BASIS_TOLERANCE or drift < 1 / _BASIS_TOLERANCE:
+            return (f"FY{year} earnings are struck on {count.value / _MILLION:,.1f}M "
+                    f"weighted shares while the current count is "
+                    f"{shares.value / _MILLION:,.1f}M, {drift:.2f}x apart: a per-share "
+                    "figure cannot mix the two")
     return None
 
 
@@ -2960,6 +3716,7 @@ def _annual_share_counts(gaap: dict, dei: dict,
                 components=tuple(f.provenance for f in evidence), segments=p.segments,
             ),
         )
+
     return dict(sorted(out.items()))
 
 
@@ -2986,7 +3743,7 @@ def _derived_annual_eps(gaap: dict, dei: dict, annual_eps: dict[int, Fact],
     for year, income in annual_ni.items():
         if year in annual_eps:
             continue
-        if has_nci and income.provenance.tag.endswith(":ProfitLoss"):
+        if has_nci and _tag_of(income) == "ProfitLoss":
             income = parent_ni.get(year)
             if income is None:
                 continue
@@ -3044,9 +3801,65 @@ def _tax_record(gaap: dict, fresh: date | None) -> dict | None:
 
 
 # A dimension answers "which slice of the company", and most slices are not the
-# company: a segment, a geography, a parent-only view. Only the share-class axis
-# names a security a ticker can be, so only it can supply a company's figure.
-_CLASS_AXES = frozenset(("ClassOfStock", "StatementClassOfStock", "EquityClassOfStock"))
+# company: a segment, a geography, a parent-only view. Only axes naming the class
+# of traded security may supply its figure. Partnerships call that security a
+# common unit and place it on LimitedPartnersCapitalAccountByClass; omitting that
+# standard axis hid PAA's filed per-unit EPS after 2016 (and five current series in
+# the cached universe) even though the cover identifies the listed unit class.
+_CLASS_AXES = frozenset((
+    "ClassOfStock", "StatementClassOfStock", "EquityClassOfStock",
+    "LimitedPartnersCapitalAccountByClass", "ClassesOfShareCapital",
+))
+
+
+def _dimensioned_statement_taxonomies(
+    dimensioned: dict, statement_basis: str | None = None,
+) -> list[dict]:
+    facts = dimensioned.get("facts", {}) or {}
+    if statement_basis == "us-gaap":
+        return [facts.get("us-gaap", {})] if facts.get("us-gaap") else []
+    if statement_basis == "ifrs-full":
+        return [
+            taxo for namespace, taxo in facts.items()
+            if namespace == "ifrs-full" or namespace.startswith("ext:ifrs/")
+        ]
+    return [
+        taxo for namespace, taxo in facts.items()
+        if namespace in ("us-gaap", "ifrs-full") or namespace.startswith("ext:ifrs/")
+    ]
+
+
+def _registered_class_title(ticker: str, receipt: dict | None) -> str | None:
+    """The cover's class title, or the class encoded in a ticker such as BH-A.
+
+    SEC's ticker mapping itself distinguishes Berkshire/BH Class A from Class B
+    even when no parsed cover record survived. A one-letter hyphen suffix is a
+    common-class identifier; preferred conventions such as ``-PB`` deliberately
+    do not match this fallback.
+    """
+    title = (receipt or {}).get("title")
+    if title:
+        # Older cover parsing stopped the trading-symbol cell at its first space.
+        # A preferred symbol such as "GLP pr B" consequently became "GLP" and
+        # overwrote the common row in SQLite; KKR suffered the same collision.
+        # A plain exchange ticker cannot identify that preferred/redeemable row.
+        # Ignore the contradictory cached title and let the sidecar's ordinary-
+        # class ambiguity rules decide; never reinterpret the preferred itself.
+        plain = bool(re.fullmatch(r"[A-Z0-9.]+", ticker or ""))
+        # "redeemable" alone is not enough: a listed SPAC unit legitimately says
+        # it contains a redeemable warrant, while its Class B founder count must
+        # still be rejected (BCSS/CPTKW). GLP's overwritten row is specifically a
+        # named redeemable Series B; KKR says Preferred outright.
+        noncommon = bool(
+            re.search(r"\bpreferred\b", title, re.I)
+            or (re.search(r"\bseries\b", title, re.I)
+                and re.search(r"\bredeemable\b", title, re.I))
+        )
+        if plain and noncommon:
+            return None
+        return title
+    match = re.search(r"-([A-Z])$", ticker or "")
+    return f"Class {match.group(1)} Common Stock" if match else None
 
 
 # Where a rendered cover cell ends and the next one begins. The reader takes the
@@ -3072,12 +3885,28 @@ def _class_member(title: str) -> frozenset[str]:
     # letter, and a pattern needing a lowercase tail dropped it, leaving the two
     # classes identical and every dual-class cover unmatchable
     words = re.findall(r"[A-Z][a-z]*|[a-z]+", re.sub(r"[^A-Za-z ]", " ", title))
-    return frozenset(w.lower() for w in words if w.lower() not in
-                     {"stock", "shares", "share", "par", "value", "per", "the", "of", "and",
-                      "one", "dollar", "no", "common"}) or frozenset({"common"})
+    kept = {w.lower() for w in words if w.lower() not in {
+        "stock", "shares", "share", "par", "value", "per", "the", "of", "and",
+        "one", "dollar", "no", "common", "voting", "vote",
+        # LP covers spell out "Common Units Representing Limited Partner
+        # Interests" while the taxonomy member compresses it to CommonUnits.
+        # These are the legal wrapper, not the class discriminator. Class A,
+        # subordinated, and Series B survive this reduction and remain distinct.
+        "unit", "units", "representing", "limited", "partner", "partners",
+        "partnership", "interest", "interests", "capital", "account", "equity",
+        "fixed", "rate", "cumulative", "redeemable",
+    }}
+    # Some covers shorten "Series B Preferred Units" to "Series B Fixed Rate
+    # Cumulative Redeemable". Once a series letter/number is present it is the
+    # discriminator; the optional word "preferred" must not defeat the match.
+    if "series" in kept:
+        kept.discard("preferred")
+    return frozenset(kept) or frozenset({"common"})
 
 
-def _dimensioned_class(dimensioned: dict, registered: str | None) -> str | None:
+def _dimensioned_class(
+    dimensioned: dict, registered: str | None, statement_basis: str | None = None,
+) -> str | None:
     """Which dimension member is the class the ticker registers, when it can be told.
 
     Hershey reports earnings per share for its Common Stock and its Class B
@@ -3091,7 +3920,8 @@ def _dimensioned_class(dimensioned: dict, registered: str | None) -> str | None:
         return None
     want = _class_member(registered)
     members = {p.split("=", 1)[1]
-               for data in (dimensioned.get("facts", {}).get("us-gaap", {}) or {}).values()
+               for taxo in _dimensioned_statement_taxonomies(dimensioned, statement_basis)
+               for data in taxo.values()
                for entries in (data.get("units") or {}).values()
                for e in entries
                for p in (e.get("segments") or "").split(";")
@@ -3120,7 +3950,25 @@ def _a_different_class(segments: str, chosen: str | None) -> bool:
     return member is not None and member != chosen
 
 
-def _unambiguous_dimensioned(dimensioned: dict | None, registered: str | None = None) -> dict:
+def _clearly_noncommon_class(segments: str) -> bool:
+    """A lone dimension member that cannot be the ordinary/common security.
+
+    With no usable cover, a single common class remains the conservative useful
+    fallback. A preferred, subordinated, founder or general-partner member does
+    not: ELDN's only dimensioned EPS is for unlisted Series X convertible
+    preferred stock, and treating "only one member" as "the ticker" would assign
+    that preferred security's earnings to ELDN common.
+    """
+    member = next((p.split("=", 1)[1] for p in (segments or "").split(";")
+                   if p and p.split("=", 1)[0] in _CLASS_AXES), "")
+    return bool(re.search(r"preferred|subordinated|founder|generalpartner", member, re.I))
+
+
+def _unambiguous_dimensioned(
+    dimensioned: dict | None,
+    registered: str | None = None,
+    statement_basis: str | None = None,
+) -> dict:
     """The dimensioned facts that can only mean one thing, shaped like the facts
     Company Facts returns so the ordinary chains can read them.
 
@@ -3132,9 +3980,21 @@ def _unambiguous_dimensioned(dimensioned: dict | None, registered: str | None = 
     """
     if not dimensioned:
         return {}
-    chosen = _dimensioned_class(dimensioned, registered)
+    chosen = _dimensioned_class(dimensioned, registered, statement_basis)
+    # A cover that names a class but matches no member is contradictory evidence,
+    # not permission to take whichever class happens to be the only one reported.
+    if registered and not chosen:
+        return {}
+    facts = dimensioned.get("facts", {}) or {}
+    taxo = facts.get("us-gaap", {}) if statement_basis != "ifrs-full" else {}
+    if not taxo:
+        combined_ifrs: dict[str, dict] = {}
+        for namespace, source in facts.items():
+            if namespace == "ifrs-full" or namespace.startswith("ext:ifrs/"):
+                combined_ifrs.update(source)
+        taxo = _ifrs_as_us_gaap(combined_ifrs)
     out: dict[str, dict] = {}
-    for tag, data in (dimensioned.get("facts", {}).get("us-gaap", {}) or {}).items():
+    for tag, data in taxo.items():
         for unit, entries in (data.get("units") or {}).items():
             by_period: dict[tuple, list[dict]] = {}
             for e in entries:
@@ -3146,6 +4006,8 @@ def _unambiguous_dimensioned(dimensioned: dict | None, registered: str | None = 
             keep = [e for group in by_period.values()
                     if len({g["segments"] for g in group}) == 1
                     and not _a_different_class(group[0]["segments"], chosen)
+                    and (chosen is not None
+                         or not _clearly_noncommon_class(group[0]["segments"]))
                     for e in group]
             if not keep and chosen:
                 # several classes, and the cover says which one the ticker is
@@ -3276,6 +4138,7 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
     multiple needs the price of that year, which lives in the price history at
     export time, not in the filings.
     """
+    gaap = _with_fiscal_calendar(gaap)
     # one reading of which year each date belongs to, for the balance sheets and the
     # earnings alike; see `_annual_balances`
     ends = fiscal_year_ends(gaap)
@@ -3292,8 +4155,7 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
     preferred = _annual_balances(gaap, ("PreferredStockLiquidationPreferenceValue",
                                         "PreferredStockValue", "PreferredStockValueOutstanding"),
                                  labels=labels)
-    goodwill = _annual_balances(gaap, ("Goodwill",), labels=labels)
-    intangibles = _annual_balances(gaap, ("IntangibleAssetsNetExcludingGoodwill",), labels=labels)
+    goodwill, intangibles = _annual_goodwill_and_intangibles(gaap, ends, years)
     if annual_eps is None:
         annual_eps = _annual_eps(gaap)
     counts = _annual_share_counts(gaap, {}, annual_eps, annual_ni)
@@ -3341,8 +4203,10 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
                 row["award_pct"] = float(sum(awards) / shares * 100)
             if equity is not None:
                 row["bvps"] = float(equity / shares)
-                tangible = equity - (at(goodwill, year) or 0) - (at(intangibles, year) or 0)
-                row["tbvps"] = float(tangible / shares)
+                goodwill_v, intangibles_v = at(goodwill, year), at(intangibles, year)
+                if goodwill_v is not None and intangibles_v is not None:
+                    tangible = equity - goodwill_v - intangibles_v
+                    row["tbvps"] = float(tangible / shares)
             if ca_v is not None and l_v is not None:
                 row["ncavps"] = float((ca_v - l_v - (at(preferred, year) or 0)
                                        - (at(minority, year) or 0)) / shares)
@@ -3353,6 +4217,109 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
             if year in ends:
                 out[year]["end"] = ends[year]
     return out
+
+
+def _prefer_reconciling_classed_eps(
+    gaap: dict, series: dict[int, Fact], classed: dict[int, Fact],
+) -> dict[int, Fact]:
+    """Use the listed class fact only when the filing proves the bare fact wrong.
+
+    An undimensioned figure normally wins because it describes the whole issuer.
+    A small group of filings, however, expose a mis-scaled bare EPS beside the
+    correctly scaled common-class EPS in the same accession. MOBX's FY2025 bare
+    value is -10.10, while its common-Class-A fact is -1.01 and the filing reports
+    a $46M loss on 45.5M weighted shares. The three figures prove the classed value;
+    neither tag priority nor a ticker-specific override is needed.
+
+    The substitution is deliberately narrower than ordinary class selection: same
+    tag, year, accession and period; total-income scope; bare value contradicts the
+    filing by more than 5%; classed value reconciles within 2%. Basic vs diluted,
+    continuing operations, LP allocations, ADR ratios, preferred dividends and
+    minority interests cannot cross this gate.
+    """
+    if not series or not classed:
+        return series
+    if _latest_instant(gaap, "nci", ("MinorityInterest",)) is not None:
+        return series
+    preferred = _annual_union(gaap, PREFERRED_DIVIDEND_TAGS)
+    income = _by_accession(gaap, NET_INCOME_TAGS, ("USD",))
+    # Income explicitly available to common is the numerator closest to EPS.
+    # MOBX FY2024 has a small preferred/attribution wedge against NetIncomeLoss;
+    # using the common line proves its Class A value while still requiring every
+    # input to come from the same filing below.
+    income.update(_by_accession(gaap, COMMON_INCOME_TAGS, ("USD",)))
+    diluted = _by_accession(
+        gaap, ("WeightedAverageNumberOfDilutedSharesOutstanding",), ("shares",))
+    basic = _by_accession(
+        gaap, ("WeightedAverageNumberOfSharesOutstandingBasic",), ("shares",))
+    out = dict(series)
+    for year in set(series) & set(classed):
+        chosen, candidate = series[year], classed[year]
+        chosen_tag = _tag_of(chosen)
+        candidate_tag = _tag_of(candidate)
+        if (year in preferred or chosen_tag != candidate_tag
+                or not _eps_uses_total_income(chosen)
+                or chosen.provenance.accession != candidate.provenance.accession
+                or chosen.provenance.period_end != candidate.provenance.period_end
+                or chosen.provenance.period_end is None):
+            continue
+        iso = chosen.provenance.period_end.isoformat()
+        counts = basic if "Basic" in chosen_tag and "Diluted" not in chosen_tag else diluted
+        ni = income.get((chosen.provenance.accession, iso))
+        count = counts.get((chosen.provenance.accession, iso))
+        if ni is None or not count:
+            continue
+        target = ni / count
+        if abs(target) < Decimal("0.01"):
+            continue
+        chosen_gap = abs(chosen.value - target) / abs(target)
+        candidate_gap = abs(candidate.value - target) / abs(target)
+        exact_scale = False
+        if candidate.value:
+            scale = abs(chosen.value / candidate.value)
+            exact_scale = any(
+                abs(scale - factor) / factor <= _EPS_EXACT_SCALE_TOLERANCE
+                for factor in (Decimal("10"), Decimal("100"), Decimal("1000"))
+            )
+        if (chosen_gap > _EPS_CONTRADICTS
+                and (candidate_gap <= _EPS_RECONCILES
+                     or (exact_scale and candidate_gap <= _EPS_SCALED_RECONCILES))):
+            out[year] = candidate
+    return out
+
+
+def _annual_goodwill_and_intangibles(
+    gaap: dict, ends: dict[int, str], years: int,
+) -> tuple[dict[int, Fact], dict[int, Fact]]:
+    """The current tangible-book deduction chain at each recent 10-K end.
+
+    Build one annual-only view per balance-sheet date in a single pass. Calling
+    `_goodwill_and_intangibles` on those views preserves all of the current
+    fallback identities and their provenance without allowing a later quarter to
+    leak backward into a historical column.
+    """
+    recent = dict(sorted(ends.items())[-years:])
+    labels = {end: year for year, end in recent.items()}
+    views: dict[int, dict] = {year: {} for year in recent}
+    for tag, data in gaap.items():
+        for unit, entries in (data.get("units") or {}).items():
+            for entry in entries:
+                year = labels.get(entry.get("end"))
+                if (year is None or "start" in entry
+                        or not entry.get("form", "").startswith(ANNUAL_FORMS)):
+                    continue
+                views[year].setdefault(tag, {"units": {}})["units"].setdefault(unit, []).append(entry)
+
+    goodwill: dict[int, Fact] = {}
+    intangibles: dict[int, Fact] = {}
+    for year, view in views.items():
+        end = date.fromisoformat(recent[year])
+        g, i = _goodwill_and_intangibles(view, end)
+        if g is not None:
+            goodwill[year] = g
+        if i is not None:
+            intangibles[year] = i
+    return goodwill, intangibles
 
 
 def _annual_balances(gaap: dict, tags: tuple[str, ...],
@@ -3370,7 +4337,7 @@ def _annual_balances(gaap: dict, tags: tuple[str, ...],
     way and its earnings the other pairs the wrong two together. GameStop and Kohl's
     had every retail year off by one, printing the same date against two years.
     """
-    labels = labels or {}
+    labels = _fiscal_labels(gaap) if labels is None else labels
     for tag in tags:
         out: dict[int, Fact] = {}
         for e in _entries(gaap, tag, unit):
@@ -3716,15 +4683,20 @@ def _implied_shares(gaap: dict, annual_eps: dict[int, Fact], annual_ni: dict[int
     from income and the NetIncomeLoss tag does not, so they come out first —
     GTN's implied count was 2.2x off until they did.
     """
-    for year in sorted(annual_eps, reverse=True):
-        eps, ni = annual_eps.get(year), annual_ni.get(year)
-        if eps is None or ni is None or eps.value == 0:
-            continue
-        preferred = (annual_preferred or {}).get(year)
-        common = ni.value - (preferred.value if preferred else Decimal(0))
-        implied = common / eps.value
-        if implied > 0:
-            return implied
+    shared = sorted(set(annual_eps) & set(annual_ni), reverse=True)
+    if not shared:
+        return None
+    # As with the basis check, an ineligible newest year is an abstention, not an
+    # invitation to compare today's security with a much older capital structure.
+    year = shared[0]
+    eps, ni = annual_eps[year], annual_ni[year]
+    if eps.value == 0 or not _eps_uses_total_income(eps):
+        return None
+    preferred = (annual_preferred or {}).get(year)
+    common = ni.value - (preferred.value if preferred else Decimal(0))
+    implied = common / eps.value
+    if implied > 0:
+        return implied
     return None
 
 
@@ -3763,6 +4735,22 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
     def ratio(a: Decimal, b: Decimal) -> Decimal:
         return max(a, b) / min(a, b)
 
+    # Company Facts can flatten a classed balance-sheet row onto the wrong
+    # comparative context. OMH's 2025 GAAP instant consequently carries 2.359M
+    # (its 2024 count), while the same 20-F's DEI cover fact carries 22.260M and
+    # its annual weighted count is 14.139M after substantial issuance. When the
+    # GAAP and DEI facts share an accession and date, and the independent
+    # weighted count agrees with DEI on the order of magnitude, the GAAP value
+    # is the contradicted fragment/comparative and the DEI fact stands.
+    if (cover is not None and weighted is not None
+            and cover.provenance.accession == chosen.provenance.accession
+            and cover.provenance.period_end == chosen.provenance.period_end
+            and ratio(chosen.value, cover.value) > Decimal("5")
+            and ratio(chosen.value, cover.value) < Decimal("10")
+            and ratio(chosen.value, weighted.value) > Decimal("5")
+            and ratio(cover.value, weighted.value) < Decimal("2")):
+        return cover
+
     if len(candidates) >= 3:
         if all(ratio(chosen.value, f.value) > 10 for f in others):
             return sorted(candidates, key=lambda f: f.value)[1]
@@ -3792,9 +4780,8 @@ def _sane_shares(chosen: Fact | None, gaap: dict, dei: dict, fresh: date | None,
         # The last-resort tags are fragments exactly when nothing corroborates
         # them (SUN's LP-unit instant is 51.5M of ~136M real units); with no
         # witness and a 2x earnings disagreement, missing beats wrong.
-        if not others and chosen.provenance.tag in (
-            "us-gaap:LimitedPartnersCapitalAccountUnitsOutstanding",
-            "us-gaap:SharesOutstanding",
+        if not others and _tag_of(chosen) in (
+            "LimitedPartnersCapitalAccountUnitsOutstanding", "SharesOutstanding",
         ) and max(chosen.value, implied) / min(chosen.value, implied) > 2:
             return None
     return chosen
@@ -3880,7 +4867,7 @@ def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None,
     # Visa, Exxon — showing that they pay without saying how much. Every chained
     # element is tried, per-share ones first: those need no share count, so they
     # cannot inherit an error from it.
-    chosen = dividend.provenance.tag.split(":", 1)[1]
+    chosen = _tag_of(dividend)
     ordered = sorted(
         DIVIDEND_TAGS,
         key=lambda pair: (pair[0] != chosen, "USD/shares" not in pair[1]),
@@ -3912,18 +4899,134 @@ def _dividend_per_share(gaap: dict, dividend: Fact | None, shares: Fact | None,
     return None
 
 
+_RECURRING_DIVIDEND_TAGS = (
+    "CommonStockDividendsPerShareDeclared",
+    "CommonStockDividendsPerShareCashPaid",
+)
+_QUARTER_DAYS = range(80, 101)
+_RECURRING_HISTORY_DAYS = 300
+_RECURRING_FRESH_DAYS = 120
+_SPECIAL_MULTIPLE = Decimal("1.5")
+_RECURRING_STABILITY = Decimal("0.25")
+
+
+def _recurring_dividend_per_share(gaap: dict, asof: date | None) -> Fact | None:
+    """Latest ordinary quarterly common-dividend rate, annualized.
+
+    The trailing cash total intentionally remains a separate figure: an annual or
+    TTM total cannot say how much was regular and how much was special. A recurring
+    rate is therefore published only when the filer supplies at least three recent,
+    direct per-share quarterly facts. If the newest quarter jumps above the recent
+    run, it is treated as special-inclusive and the latest ordinary-sized quarter
+    is used instead. Partnerships and investment companies are excluded because
+    their standard per-unit facts commonly include variable or supplemental
+    distributions that cannot be separated into a recurring rate.
+    """
+    by_period: dict[str, tuple[str, dict]] = {}
+    for tag in _RECURRING_DIVIDEND_TAGS:
+        for e in _entries(gaap, tag, ("USD/shares",)):
+            if ("start" not in e or not _is_financial_form(e.get("form", ""))
+                    or _days(e) not in _QUARTER_DAYS or _dec(e["val"]) <= 0):
+                continue
+            # One economic quarter has one end date. Duplicate contexts with a
+            # one-day start-date difference must not manufacture extra history.
+            key = e["end"]
+            prior = by_period.get(key)
+            # A later filing supersedes an earlier one for the exact quarter.
+            # On a tie, declared is the more direct statement of the rate.
+            if (prior is None or e.get("filed", "") > prior[1].get("filed", "")
+                    or (e.get("filed", "") == prior[1].get("filed", "")
+                        and tag == _RECURRING_DIVIDEND_TAGS[0])):
+                by_period[key] = (tag, e)
+    if not by_period:
+        return None
+
+    quarters = sorted(by_period.values(), key=lambda item: item[1]["end"], reverse=True)
+    latest_end = date.fromisoformat(quarters[0][1]["end"])
+    if asof is not None and not 0 <= (asof - latest_end).days <= _RECURRING_FRESH_DAYS:
+        return None
+
+    recent = [item for item in quarters
+              if (latest_end - date.fromisoformat(item[1]["end"])).days
+              <= _RECURRING_HISTORY_DAYS]
+    if len(recent) < 3:
+        return None
+
+    chosen_tag, chosen = recent[0]
+    prior_values = sorted(_dec(e["val"]) for _, e in recent[1:5])
+    if len(prior_values) >= 2:
+        middle = len(prior_values) // 2
+        prior_median = (prior_values[middle] if len(prior_values) % 2
+                        else (prior_values[middle - 1] + prior_values[middle]) / 2)
+        stable = [value for value in prior_values
+                  if abs(value / prior_median - 1) <= _RECURRING_STABILITY]
+        if len(stable) < 2:
+            return None
+        if _dec(chosen["val"]) > prior_median * _SPECIAL_MULTIPLE:
+            ordinary = next(
+                ((tag, e) for tag, e in recent[1:]
+                 if abs(_dec(e["val"]) / prior_median - 1) <= _RECURRING_STABILITY),
+                None,
+            )
+            if ordinary is None:
+                return None
+            chosen_tag, chosen = ordinary
+
+    reported = _fact("RecurringDividendPerShare", chosen_tag, chosen)
+    p = reported.provenance
+    return Fact(value=reported.value * 4, provenance=Provenance(
+        concept="RecurringDividendPerShare (latest quarterly rate annualized x4)",
+        tag=p.tag, fiscal_year=p.fiscal_year, form=p.form,
+        accession=p.accession, filed=p.filed, period_end=p.period_end,
+        period_start=p.period_start, segments=p.segments,
+    ))
+
+
 def _dividend_record(gaap: dict) -> dict | None:
     """Which calendar years the filer actually paid a common dividend, from the
     chained tags' own facts. XBRL history only begins around 2009-2011, so the
     start of the record is part of the answer: "paid since 2011" can mean "paid
     for longer than the record can show" — display must say when the record begins."""
     totals: dict[int, Decimal] = {}
+    aggregate_entries = [
+        e for tag, unit in DIVIDEND_TAGS if tag in _AGGREGATE_DIVIDEND_TAGS
+        for e in _entries(gaap, tag, unit)
+        if "start" in e and _is_financial_form(e.get("form", ""))
+    ]
+    settlement_periods = {
+        (e["start"], e["end"]) for e in aggregate_entries
+        if _dec(e["val"]) > 0 and _settles_prior_dividend_payable(gaap, e)
+    }
+    payable_ends = {
+        payable["end"]
+        for payable_tag in ("DividendsPayableCurrent", "DividendsPayable")
+        for payable in _entries(gaap, payable_tag, ("USD",))
+        if "start" not in payable and _dec(payable["val"]) > 0
+    }
+    aggregate_annual_zeros = [
+        e for e in aggregate_entries if _dec(e["val"]) == 0
+        and _is_annual_form(e.get("form", "")) and _days(e) in _ANNUAL_DAYS
+        and e["end"] in payable_ends
+    ] if settlement_periods else []
     for tag, unit in DIVIDEND_TAGS:
-        for e in _entries(gaap, tag, unit):
-            if "start" in e and _is_financial_form(e.get("form", "")) \
-                    and _dec(e["val"]) > 0:
-                year = int(e["end"][:4])
-                totals[year] = max(totals.get(year, Decimal(0)), _dec(e["val"]))
+        entries = [e for e in _entries(gaap, tag, unit)
+                   if "start" in e and _is_financial_form(e.get("form", ""))]
+        annual_zeros = aggregate_annual_zeros if tag in _AGGREGATE_DIVIDEND_TAGS else []
+        for e in entries:
+            if _dec(e["val"]) <= 0:
+                continue
+            # A later filed full-year zero contradicts an earlier positive YTD
+            # value for the exact same cumulative period. This is deliberately
+            # narrower than preferring annual facts by calendar year: doing that
+            # moved real payment years for non-December filers.
+            if any(z["start"] == e["start"] and z["end"] >= e["end"]
+                   and z["filed"] >= e["filed"] for z in annual_zeros):
+                continue
+            if (tag in _AGGREGATE_DIVIDEND_TAGS
+                    and (e["start"], e["end"]) in settlement_periods):
+                continue
+            year = int(e["end"][:4])
+            totals[year] = max(totals.get(year, Decimal(0)), _dec(e["val"]))
     if not totals:
         return None
     # Graham's twenty years is a record of *paying*, and a company that cut its
@@ -3955,6 +5058,64 @@ def _is_all_preferred(gaap: dict, e: dict) -> bool:
     return False
 
 
+def _settles_prior_dividend_payable(gaap: dict, e: dict) -> bool:
+    """Whether an aggregate cash-flow payment merely clears an old payable.
+
+    PFHO paid a 2015 dividend liability in 2025, mostly by escheating unclaimed
+    funds to a state administrator. ``PaymentsOfDividends`` therefore says
+    $37,000 even though no current dividend was declared. Require a current and
+    prior payable, an exact-period aggregate matching their decline, and no
+    common-specific payment for that period before treating the aggregate as a
+    legacy settlement rather than criterion-5 evidence.
+    """
+    start, end = e.get("start"), e.get("end")
+    if not start or not end:
+        return False
+    for tag, unit in DIVIDEND_TAGS:
+        if tag in _AGGREGATE_DIVIDEND_TAGS:
+            continue
+        if any(other.get("start") == start and other.get("end") == end
+               and _dec(other["val"]) > 0 for other in _entries(gaap, tag, unit)):
+            return False
+    aggregates = [other for tag, unit in DIVIDEND_TAGS
+                  if tag in _AGGREGATE_DIVIDEND_TAGS
+                  for other in _entries(gaap, tag, unit)
+                  if other.get("start") == start and other.get("end") == end
+                  and _dec(other["val"]) > 0]
+    if not aggregates:
+        return False
+    payment = max(_dec(other["val"]) for other in aggregates)
+    payable_entries = [other for tag in ("DividendsPayableCurrent", "DividendsPayable")
+                       for other in _entries(gaap, tag, ("USD",))
+                       if "start" not in other and _is_financial_form(other.get("form", ""))]
+    current = [other for other in payable_entries if other.get("end") == end]
+    # Compare the opening liability with the closing one. Interim instants inside
+    # the payment period merely show the settlement happening in stages (PFHO's
+    # $37,000 became $36,375 and then $36,250 before reaching zero).
+    prior = [other for other in payable_entries if other.get("end", "") < start
+             and (date.fromisoformat(end) - date.fromisoformat(other["end"])).days <= _STALE_DAYS]
+    if not current or not prior:
+        return False
+    current_value = _dec(max(current, key=lambda other: other["filed"])["val"])
+    prior_end = max(other["end"] for other in prior)
+    prior_value = _dec(max((other for other in prior if other["end"] == prior_end),
+                           key=lambda other: other["filed"])["val"])
+    decline = prior_value - current_value
+    tolerance = max(Decimal(1), payment * Decimal("0.01"))
+    period_start = date.fromisoformat(start)
+    # A normal dividend declared near year-end is payable at the opening date
+    # and paid promptly; that is a real current payout even if the cash payment
+    # happens to equal the payable's decline. PFHO's decade-old unclaimed amount
+    # remained more than 90% outstanding through midyear, then was escheated.
+    lingered = any(
+        start < other.get("end", "") < end
+        and (date.fromisoformat(other["end"]) - period_start).days >= 150
+        and _dec(other["val"]) >= prior_value * Decimal("0.90")
+        for other in payable_entries
+    )
+    return decline > 0 and lingered and abs(payment - decline) <= tolerance
+
+
 def _dividend(gaap: dict, reference: date | None) -> tuple[bool | None, Fact | None]:
     if reference is None:
         return None, None
@@ -3971,6 +5132,8 @@ def _dividend(gaap: dict, reference: date | None) -> tuple[bool | None, Fact | N
         # the whole of a payment is the preferred's, it is not evidence that the
         # common is paid.
         if tag in _AGGREGATE_DIVIDEND_TAGS and _is_all_preferred(gaap, e):
+            continue
+        if tag in _AGGREGATE_DIVIDEND_TAGS and _settles_prior_dividend_payable(gaap, e):
             continue
         if (reference - date.fromisoformat(e["end"])).days <= _days(e) + _DIVIDEND_LAG_DAYS:
             concept = ("Dividends (aggregate — may include preferred and noncontrolling)"

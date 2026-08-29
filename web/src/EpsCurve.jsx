@@ -74,11 +74,6 @@ export default function EpsCurve({ annualEps, ttmEps }) {
       <div className="criteria-title">
         <div>
           <h3>Earnings per share</h3>
-          <p>
-            {points[0].label}–{points[points.length - 1].label}, as filed.
-            {tail ? " The dashed step is the trailing twelve months, not a completed fiscal year." : ""}
-            {losses ? ` ${losses} of ${audited.length} fiscal ${losses === 1 ? "year is" : "years are"} a loss.` : ""}
-          </p>
         </div>
       </div>
       <svg className="eps-curve-svg" viewBox={`0 0 ${W} ${H}`} role="img"

@@ -151,6 +151,44 @@ def test_frameless_end_filled_from_nearest_framed_neighbor():
     assert sorted(build(gaap).annual_eps) == [2022, 2023]
 
 
+def test_current_filer_fy_realigns_an_old_calendar_frame_deck_style():
+    """An obsolete calendar-year anchor must not label a new March FY2026 as
+    FY2025. The current 10-K's credible fy is the common anchor across tags."""
+    eps = [
+        {**dur("2024-01-01", "2024-12-31", 2.0, accn="old", filed="2025-02-15"),
+         "fy": 2024, "frame": "CY2024"},
+        {**dur("2025-04-01", "2026-03-31", 3.0, accn="k26", filed="2026-05-29"),
+         "fy": 2026},
+    ]
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", eps)
+    s = build(gaap)
+    assert 2026 in s.annual_eps and 2025 not in s.annual_eps
+    assert s.annual_eps[2026].provenance.period_end == date(2026, 3, 31)
+
+
+def test_comparative_filing_fy_never_invents_a_future_year_googl_style():
+    comparative = [{
+        **dur("2014-01-01", "2014-12-31", 1.25, accn="k15", filed="2015-02-15"),
+        "fy": 2015,
+    }]
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", comparative)
+    s = build(gaap)
+    assert sorted(s.annual_eps) == [2014]
+
+
+def test_march_period_ignores_stale_prior_year_fy_crus_style():
+    entries = [{
+        **dur("2009-04-01", "2010-03-31", 1.0, accn="k10", filed="2010-06-01"),
+        "fy": 2009,
+    }]
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", entries)
+    s = build(gaap)
+    assert sorted(s.annual_eps) == [2010]
+
+
 def test_retail_fiscal_years_use_filers_own_fy_labels():
     # Target-style calendar: year end floats across the Jan/Feb boundary. A pure
     # calendar heuristic mislabels the Feb-ending years; the fy field must win.
@@ -234,7 +272,7 @@ def test_depreciation_series_survives_a_tag_change_midway():
         dur("2025-01-01", "2025-12-31", 3e9, accn="k25", filed="2026-02-15")])
     oe = build(gaap).owner_earnings
     assert oe.fiscal_year == 2025          # not 2021, where the combined tag stopped
-    assert float(oe.owner_earnings) == 80e9  # 100 + (9+3) - 20 - 12
+    assert float(oe.all_capex_floor.value) == 70e9  # 70 + (9+3) - 12
 
 
 def test_non_december_filer_keeps_its_own_fiscal_year_label():
@@ -261,6 +299,88 @@ def test_non_december_filer_keeps_its_own_fiscal_year_label():
     for y in (2024, 2025, 2026):
         implied = float(s.annual_net_income[y].value) / float(s.annual_eps[y].value)
         assert 38e6 < implied < 46e6, f"FY{y} implies {implied:,.0f} shares"
+
+
+def test_january_filer_uses_one_filing_declared_calendar_across_every_series():
+    """Veeva pattern: its January close belongs to the year it ends in, while SEC
+    calendar frames call the same periods one year earlier on only some tags. The
+    filing's FY declaration must align every series and the historical table."""
+    def annual(end_year, value, tag_frame=False):
+        end = f"{end_year}-01-31"
+        entry = dur(f"{end_year - 1}-02-01", end, value,
+                    accn=f"k{end_year}", filed=f"{end_year}-03-15")
+        return {**entry, "fy": end_year,
+                **({"frame": f"CY{end_year - 1}"} if tag_frame else {})}
+
+    eps = [annual(2024, 3.22, True), annual(2025, 4.32, True),
+           annual(2026, 5.44, True)]
+    income = [annual(2024, 525.705e6), annual(2025, 714.138e6),
+              annual(2026, 908.906e6)]
+    revenue = [annual(2024, 2.36e9), annual(2025, 2.75e9), annual(2026, 3.10e9)]
+    operating = [annual(2024, 500e6), annual(2025, 620e6), annual(2026, 760e6)]
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", eps),
+        "NetIncomeLoss": tagdata("USD", income),
+        "Revenues": tagdata("USD", revenue),
+        "OperatingIncomeLoss": tagdata("USD", operating),
+        "Assets": tagdata("USD", [
+            {**inst(f"{y}-01-31", 5e9 + y, form="10-K", accn=f"k{y}",
+                    filed=f"{y}-03-15"), "fy": y}
+            for y in (2024, 2025, 2026)]),
+        "AssetsCurrent": tagdata("USD", [
+            {**inst(f"{y}-01-31", 2e9, form="10-K", accn=f"k{y}",
+                    filed=f"{y}-03-15"), "fy": y}
+            for y in (2024, 2025, 2026)]),
+        "LiabilitiesCurrent": tagdata("USD", [
+            {**inst(f"{y}-01-31", 1e9, form="10-K", accn=f"k{y}",
+                    filed=f"{y}-03-15"), "fy": y}
+            for y in (2024, 2025, 2026)]),
+    }
+
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_operating_income,
+        _annual_revenue, annual_ratios, fiscal_year_ends,
+    )
+    annual_eps = _annual_eps(gaap)
+    annual_income = _annual_net_income(gaap)
+    annual_sales = _annual_revenue(gaap)
+    annual_op = _annual_operating_income(gaap)
+
+    assert sorted(annual_eps) == [2024, 2025, 2026]
+    assert sorted(annual_income) == [2024, 2025, 2026]
+    assert sorted(annual_sales) == [2024, 2025, 2026]
+    assert sorted(annual_op) == [2024, 2025, 2026]
+    assert fiscal_year_ends(gaap)[2025] == "2025-01-31"
+    ratios = annual_ratios(gaap, annual_income, annual_sales, annual_op,
+                           annual_eps=annual_eps)
+    assert ratios[2025]["end"] == "2025-01-31"
+    assert ratios[2025]["net_margin"] == round(714.138e6 / 2.75e9 * 100, 4)
+
+
+def test_current_january_convention_overrides_inconsistent_old_sec_fy_metadata():
+    entries = [
+        {**dur("2021-02-01", "2022-01-31", 1.0, accn="k22", filed="2022-03-15"),
+         "fy": 2021},
+        {**dur("2022-02-01", "2023-01-31", 2.0, accn="k23", filed="2023-03-15"),
+         "fy": 2022},
+        {**dur("2025-02-01", "2026-01-31", 5.0, accn="k26", filed="2026-03-15"),
+         "fy": 2026, "frame": "CY2025"},
+    ]
+    from screener.normalize import _annual_eps
+    series = _annual_eps({"EarningsPerShareDiluted": tagdata("USD/shares", entries)})
+    assert sorted(series) == [2022, 2023, 2026]
+
+
+def test_current_retail_convention_labels_january_with_the_prior_year():
+    entries = [
+        {**dur("2023-01-29", "2024-01-27", 2.0, accn="k23", filed="2024-03-15"),
+         "fy": 2023},
+        {**dur("2025-02-02", "2026-01-31", 3.0, accn="k25", filed="2026-03-15"),
+         "fy": 2025},
+    ]
+    from screener.normalize import _annual_eps
+    series = _annual_eps({"EarningsPerShareDiluted": tagdata("USD/shares", entries)})
+    assert sorted(series) == [2023, 2025]
 
 
 def test_split_rebases_years_the_filer_never_restated():
@@ -464,8 +584,8 @@ def test_da_part_sum_keeps_amortization_only_years_and_names_both_tags():
         dur("2025-01-01", "2025-12-31", 3e9, accn="k25", filed="2026-02-15")])
     s = build(gaap)
     oe = s.owner_earnings
-    # 2025 (latest shared year): 100 op + (9+3) D&A - 20 tax - 12 capex
-    assert float(oe.owner_earnings) == 80e9
+    # 2025 (latest shared year): 70 reported earnings + (9+3) D&A - 12 capex
+    assert float(oe.all_capex_floor.value) == 70e9
     da = dict(oe.components)["+ depreciation & amortisation"]
     assert float(da) == 12e9
 
@@ -596,6 +716,69 @@ def test_a_lone_share_class_is_the_companys_own_figure_kkr_style():
     assert s.annual_eps[2025].provenance.segments == "ClassOfStock=CommonStock;"
 
 
+def test_a_listed_lp_unit_class_supplies_the_reported_eps_paa_style():
+    """PAA reports per-unit EPS only on the standard partnership class axis.
+    Company Facts drops it, but the cover names Common Units and the DERA sidecar
+    carries the exact filed figure. A preferred cover must not inherit it."""
+    from screener.normalize import _annual_eps, _unambiguous_dimensioned
+
+    sidecar = {"facts": {"us-gaap": {
+        "NetIncomeLossNetOfTaxPerOutstandingLimitedPartnershipUnitDiluted": {
+            "units": {"USD/shares": [dict(
+                dur("2025-01-01", "2025-12-31", 1.66, accn="paa-k25",
+                    filed="2026-02-27"),
+                segments="LimitedPartnersCapitalAccountByClass=CommonUnits;",
+            )]}},
+        # A member elsewhere in the same filing lets the cover prove that Series
+        # B is a different listed security, even though EPS itself has only common.
+        "ProfitLoss": {"units": {"USD": [dict(
+            dur("2025-01-01", "2025-12-31", 10, accn="paa-k25",
+                filed="2026-02-27"),
+            segments="LimitedPartnersCapitalAccountByClass=SeriesBPreferredUnits;",
+        )]}},
+    }}}
+
+    common = _annual_eps(_unambiguous_dimensioned(sidecar, "Common Units"))
+    assert float(common[2025].value) == 1.66
+    assert common[2025].provenance.segments.endswith("=CommonUnits;")
+
+    preferred = _annual_eps(_unambiguous_dimensioned(
+        sidecar, "9.50% Series B Fixed Rate Cumulative Redeemable"))
+    assert preferred == {}
+
+
+def test_continuing_operations_eps_never_falls_back_to_an_ancient_share_basis():
+    """ZWS's current EPS is continuing-operations income. Skipping it and walking
+    back to FY2009 compared a 17-year-old 69M count with today's 167M, blocking a
+    valid current TTM P/E. An ineligible newest year is an abstention."""
+    gaap = {
+        "IncomeLossFromContinuingOperationsPerDilutedShare": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 1.12, accn="k25", filed="2026-02-09")]),
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2009-01-01", "2009-12-31", 0.50, accn="k09", filed="2010-02-09")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2009-01-01", "2009-12-31", 34.6e6, accn="k09", filed="2010-02-09"),
+            dur("2025-01-01", "2025-12-31", 107e6, accn="k25", filed="2026-02-09"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2009-01-01", "2009-12-31", 69.2e6, accn="k09", filed="2010-02-09"),
+            dur("2025-01-01", "2025-12-31", 171.258e6, accn="k25", filed="2026-02-09"),
+        ]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _basis_conflict, _implied_shares,
+    )
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    shares = build_snapshot("ZWS", "0001439288", facts_doc({
+        **gaap,
+        "Assets": tagdata("USD", [inst("2026-06-30", 1e9)]),
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2026-06-30", 167e6)]),
+    })).shares_outstanding
+
+    assert _basis_conflict(gaap, {}, eps, income, {}, False, shares) is None
+    assert _implied_shares(gaap, eps, income) is None
+
+
 def test_a_consolidated_figure_always_outranks_a_classed_one():
     dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
         classed_entry("2025-01-01", "2025-12-31", 99.0, "ClassOfStock=CommonStock;")])
@@ -675,6 +858,10 @@ def test_a_receipt_rebases_every_per_security_figure_and_no_dollar_total():
     together, while entity income and preferred dividends remain company totals."""
     gaap = dict(GAAP)
     gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-03-31", 0.25, form="10-Q", accn="q125"),
+        dur("2025-04-01", "2025-06-30", 0.25, form="10-Q", accn="q225"),
+        dur("2025-07-01", "2025-09-30", 0.25, form="10-Q", accn="q325"),
+        dur("2025-10-01", "2025-12-31", 0.25, accn="k25", filed="2026-02-15"),
         dur("2025-01-01", "2025-12-31", 1.25, accn="k25", filed="2026-02-15")])
     facts = facts_doc(gaap)
     ordinary = build_snapshot("ADR", "0000000001", facts)
@@ -687,11 +874,50 @@ def test_a_receipt_rebases_every_per_security_figure_and_no_dollar_total():
     assert receipt.ttm_eps == ordinary.ttm_eps * 2
     assert receipt.annual_eps[2025].value == ordinary.annual_eps[2025].value * 2
     assert receipt.dividend_per_share == ordinary.dividend_per_share * 2
+    assert (receipt.recurring_dividend_per_share.value
+            == ordinary.recurring_dividend_per_share.value * 2)
     assert receipt.ttm_eps_vintage == {k: v * 2 for k, v in ordinary.ttm_eps_vintage.items()}
     assert [f.value for f in receipt.ttm_eps_inputs] == [
         f.value * 2 for f in ordinary.ttm_eps_inputs]
     assert receipt.ttm_net_income == ordinary.ttm_net_income
     assert receipt.ttm_preferred_dividends == ordinary.ttm_preferred_dividends
+
+
+def test_a_fractional_receipt_ratio_rebases_in_the_same_direction():
+    """HKD-style receipts can represent less than one ordinary share; the same
+    underlying-shares-per-receipt identity still applies."""
+    facts = facts_doc(GAAP)
+    ordinary = build_snapshot("ADR", "0000000001", facts)
+    receipt = build_snapshot(
+        "ADR", "0000000001", facts,
+        receipt={"ratio": "0.4", "accn": "cover-1",
+                 "title": "ADS, each representing 0.4 ordinary shares"},
+    )
+
+    assert receipt.shares_outstanding.value == ordinary.shares_outstanding.value / Decimal("0.4")
+    assert receipt.ttm_eps == ordinary.ttm_eps * Decimal("0.4")
+    assert receipt.annual_eps[2025].value == ordinary.annual_eps[2025].value * Decimal("0.4")
+
+
+def test_an_ads_dimension_without_a_ratio_withholds_the_security_basis():
+    """AMRN states both ordinary-share and ADS EPS, about 20x apart, while its
+    tagged cover names only the symbol. The difference detects the problem but
+    does not authorize guessing the legal receipt ratio."""
+    gaap = dict(GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        dur("2025-01-01", "2025-12-31", -0.09, accn="k25", filed="2026-03-02")])
+    dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [dict(
+        dur("2025-01-01", "2025-12-31", -1.87, accn="k25", filed="2026-03-02"),
+        segments="ClassOfStock=AmericanDepositaryShare;",
+    )])
+
+    s = build_snapshot(
+        "AMRN", "0000897448", facts_doc(gaap), dimensioned=dim,
+        receipt={"symbol": "AMRN", "title": "", "ratio": None, "accn": "k25"},
+    )
+
+    assert "per ordinary share" in s.basis_conflict
+    assert "per depositary share" in s.basis_conflict
 
 
 def test_fiscal_years_end_when_the_company_says_they_do():
@@ -760,6 +986,49 @@ def test_a_real_restatement_moves_the_income_with_it_and_is_kept():
     }
     from screener.normalize import _annual_eps
     assert float(_annual_eps(gaap)[2022].value) == 0.03
+
+
+def test_a_common_class_eps_replaces_a_proven_mis_scaled_bare_fact():
+    """MOBX's FY2025 bare EPS is -10.10, but the same filing reports a $46M
+    loss on 45.5M shares and -1.01 for listed Class A. The filing's arithmetic,
+    not the dimension by itself, proves which same-tag value is usable."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2023-10-01", "2024-09-30", -7.50, accn="k25",
+                filed="2026-01-13"),
+            dur("2025-01-01", "2025-12-31", -10.10, accn="k25",
+                filed="2026-01-13")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2023-10-01", "2024-09-30", -20_034_000, accn="k25",
+                filed="2026-01-13"),
+            dur("2025-01-01", "2025-12-31", -45_919_754, accn="k25",
+                filed="2026-01-13")]),
+        "NetIncomeLossAvailableToCommonStockholdersBasic": tagdata("USD", [
+            dur("2023-10-01", "2024-09-30", -20_695_000, accn="k25",
+                filed="2026-01-13")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2023-10-01", "2024-09-30", 29_483_021, accn="k25",
+                filed="2026-01-13"),
+            dur("2025-01-01", "2025-12-31", 45_465_103, accn="k25",
+                filed="2026-01-13")]),
+        "Assets": tagdata("USD", [inst("2025-12-31", 100e6, form="10-K", accn="k25")]),
+        "CommonStockSharesOutstanding": tagdata("shares", [inst("2025-12-31", 45e6)]),
+    }
+    dim = dimensioned("EarningsPerShareDiluted", "USD/shares", [
+        dict(dur("2023-10-01", "2024-09-30", -0.75, accn="k25",
+                 filed="2026-01-13"), segments="ClassOfStock=CommonClassA;"),
+        dict(dur("2025-01-01", "2025-12-31", -1.01, accn="k25",
+                 filed="2026-01-13"), segments="ClassOfStock=CommonClassA;"),
+    ])
+
+    s = build_snapshot(
+        "MOBX", "0001855467", facts_doc(gaap), dimensioned=dim,
+        receipt={"title": "Class A Common Stock, par value $0.00001 per share"},
+    )
+
+    assert float(s.annual_eps[2024].value) == -0.75
+    assert float(s.annual_eps[2025].value) == -1.01
+    assert s.annual_eps[2025].provenance.segments == "ClassOfStock=CommonClassA;"
 
 
 def test_a_preferred_dividend_is_not_a_contradiction():
@@ -895,6 +1164,60 @@ def test_revenue_takes_the_total_over_its_own_contract_component():
     assert float(_annual_revenue(gaap)[2025].value) == 8908e6
 
 
+def test_regulated_utility_revenue_continues_after_generic_tag_stops():
+    """ONE Gas stopped tagging `Revenues` after FY2022 and continued the same
+    consolidated top line as `RegulatedOperatingRevenue`. The utility tag must
+    carry FY2023-FY2025 into both historical margin denominators."""
+    gaap = {
+        "Revenues": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", value, accn=f"k{y}",
+                filed=f"{y+1}-02-20")
+            for y, value in ((2020, 1530268e3), (2021, 1808597e3), (2022, 2578005e3))
+        ]),
+        "RegulatedOperatingRevenue": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", value, accn=f"k{y}",
+                filed=f"{y+1}-02-20")
+            for y, value in (
+                (2020, 1530268e3), (2021, 1808597e3), (2022, 2578005e3),
+                (2023, 2371990e3), (2024, 2083558e3), (2025, 2427428e3),
+            )
+        ]),
+    }
+    from screener.normalize import _annual_revenue
+    series = _annual_revenue(gaap)
+
+    assert {year: float(series[year].value) for year in (2023, 2024, 2025)} == {
+        2023: 2371990e3,
+        2024: 2083558e3,
+        2025: 2427428e3,
+    }
+    assert series[2025].provenance.tag == "us-gaap:RegulatedOperatingRevenue"
+
+
+def test_regulated_and_unregulated_total_outranks_its_regulated_part():
+    """DTE's regulated-only component has more history than the utility group's
+    combined top line. Scope outranks that extra depth when both reach today."""
+    gaap = {
+        "RegulatedAndUnregulatedOperatingRevenue": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 15e9, accn=f"k{y}",
+                filed=f"{y+1}-02-20")
+            for y in range(2016, 2026)
+        ]),
+        "RegulatedOperatingRevenue": tagdata("USD", [
+            dur(f"{y}-01-01", f"{y}-12-31", 9e9, accn=f"k{y}",
+                filed=f"{y+1}-02-20")
+            for y in range(2013, 2026)
+        ]),
+    }
+    from screener.normalize import _annual_revenue
+    series = _annual_revenue(gaap)
+
+    assert float(series[2025].value) == 15e9
+    assert series[2025].provenance.tag == (
+        "us-gaap:RegulatedAndUnregulatedOperatingRevenue"
+    )
+
+
 def test_and_the_other_way_round_when_the_umbrella_tag_is_the_narrow_one():
     """Ares files the reverse: $5,601M of contract revenue against a $4,756M
     `Revenues` covering less than its own statement's "Total revenues". Whichever
@@ -1013,6 +1336,38 @@ def test_a_retail_year_is_labelled_the_way_its_own_filer_labels_it():
     assert ends[2025] == end and ends[2024] == prior
     # ...and one date is claimed by one year only, never by two
     assert len(set(ends.values())) == len(ends)
+
+
+def test_old_calendar_dates_do_not_shift_the_current_filing_calendar():
+    """MAMA retains two old December periods alongside its January fiscal years.
+    They cannot all fit in the company map, but their absence must not make the
+    operating-income tag abandon the current filing's FY2024/FY2025 labels."""
+    from screener.normalize import _FiscalTaxonomy, _annual_series
+
+    current = [
+        {**dur("2023-02-01", "2024-01-31", 8.890e6,
+               accn="k26", filed="2026-04-14"), "fy": 2026, "frame": "CY2023"},
+        {**dur("2024-02-01", "2025-01-31", 4.877e6,
+               accn="k26", filed="2026-04-14"), "fy": 2026, "frame": "CY2024"},
+        {**dur("2025-02-01", "2026-01-31", 7.112e6,
+               accn="k26", filed="2026-04-14"), "fy": 2026, "frame": "CY2025"},
+    ]
+    gaap = _FiscalTaxonomy({"OperatingIncomeLoss": tagdata("USD", [
+        dur("2011-01-01", "2011-12-31", 1e6, accn="old11"),
+        dur("2012-01-01", "2012-12-31", 2e6, accn="old12"),
+        *current,
+    ])})
+    gaap.fiscal_labels = {
+        "2024-01-31": 2024,
+        "2025-01-31": 2025,
+        "2026-01-31": 2026,
+    }
+
+    series = _annual_series(gaap, "OperatingIncomeLoss", unit=("USD",))
+
+    assert float(series[2024].value) == 8.890e6
+    assert float(series[2025].value) == 4.877e6
+    assert float(series[2026].value) == 7.112e6
 
 
 def test_the_balance_sheet_follows_the_earnings_labelling():

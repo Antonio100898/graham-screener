@@ -1,8 +1,14 @@
 """Layer 4: FastAPI wiring. Serialisation only; no business logic."""
 from __future__ import annotations
 
+import json
+import sqlite3
+from contextlib import asynccontextmanager
+from datetime import datetime
 from decimal import Decimal
+from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -11,14 +17,24 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, evidence, jobs, pricestats, store
+from . import auth, evidence, jobs, portfolio, pricestats, store
 from .models import CriterionResult, Fact, FinancialSnapshot, ScreenResult
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import evaluate
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError, UnknownTickerError
 from .sources.prices import YahooPriceProvider
 
-app = FastAPI(title="Graham Enterprising Screener", version="1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    jobs.start_hourly_quotes()
+    try:
+        yield
+    finally:
+        jobs.stop_hourly_quotes()
+
+
+app = FastAPI(title="Graham Enterprising Screener", version="1.0", lifespan=_lifespan)
 # no-op unless SCREENER_TOKEN is set, which is how a tunnelled instance is run
 app.middleware("http")(auth.require_token)
 # The dashboard payload is one 35MB JSON document of mostly repeated keys; it
@@ -105,7 +121,7 @@ STATIC = Path(__file__).parent / "static"
 
 
 class SyncRequest(BaseModel):
-    command: str  # bootstrap | bulk | daily | derive | export
+    command: str  # bootstrap | bulk | daily | derive | quotes | export
     days: int = 7
 
 
@@ -163,6 +179,212 @@ def tracked_remove(cik: str):
         if not store.untrack(conn, cik):
             raise HTTPException(404, f"{cik} is not tracked")
         return {"tracked": False, "cik": cik}
+    finally:
+        conn.close()
+
+
+class PortfolioRequest(BaseModel):
+    name: str
+    base_currency: str = "USD"
+
+
+class PortfolioTradeRequest(BaseModel):
+    cik: str
+    side: Literal["BUY", "SELL"] = "BUY"
+    quantity: Decimal
+    price: Decimal
+    fees: Decimal = Decimal("0")
+    currency: str = "USD"
+    executed_at: datetime
+    broker: str | None = None
+    account_label: str | None = None
+    external_id: str | None = None
+    note: str | None = None
+
+
+@lru_cache(maxsize=2)
+def _dashboard_payload_cached(path: str, modified_ns: int) -> dict:
+    # `modified_ns` is deliberately part of the key: a completed export becomes
+    # visible to portfolio P&L without restarting the API process.
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _dashboard_payload() -> dict:
+    path = STATIC / "dashboard.json"
+    if not path.exists():
+        raise HTTPException(404, "dashboard.json not built — run: python -m screener.sync export")
+    return _dashboard_payload_cached(str(path), path.stat().st_mtime_ns)
+
+
+def _portfolio_rows() -> tuple[dict, dict[str, dict]]:
+    dashboard = _dashboard_payload()
+    return dashboard, {row["cik"]: row for row in dashboard.get("rows", [])}
+
+
+def _portfolio_response(conn, selected: dict) -> dict:
+    _, rows = _portfolio_rows()
+    trades = store.portfolio_trades(conn, selected["id"])
+    try:
+        result = portfolio.build_portfolio(selected, trades, rows)
+        # Portfolio and Research deliberately share this one immutable snapshot.
+        # Universe refresh replaces it atomically once all quotes are ready.
+        result["quote_refresh"] = None
+        return result
+    except portfolio.PortfolioError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.get("/portfolios")
+def portfolio_list():
+    conn = store.connect()
+    try:
+        if not store.portfolios(conn):
+            store.ensure_portfolio(conn)
+        return {"portfolios": store.portfolios(conn)}
+    finally:
+        conn.close()
+
+
+@app.post("/portfolios")
+def portfolio_create(req: PortfolioRequest):
+    name = req.name.strip()
+    currency = req.base_currency.strip().upper()
+    if not name:
+        raise HTTPException(422, "portfolio name is required")
+    if len(currency) != 3 or not currency.isalpha():
+        raise HTTPException(422, "base currency must be a three-letter code")
+    conn = store.connect()
+    try:
+        try:
+            return store.create_portfolio(conn, name, currency)
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, f"portfolio {name!r} already exists")
+    finally:
+        conn.close()
+
+
+@app.get("/portfolio")
+def portfolio_default():
+    conn = store.connect()
+    try:
+        selected = store.ensure_portfolio(conn)
+        return _portfolio_response(conn, selected)
+    finally:
+        conn.close()
+
+
+@app.get("/portfolio/{portfolio_id}")
+def portfolio_get(portfolio_id: int):
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        return _portfolio_response(conn, selected)
+    finally:
+        conn.close()
+
+
+@app.post("/portfolio/{portfolio_id}/trades")
+def portfolio_trade_add(portfolio_id: int, req: PortfolioTradeRequest):
+    if req.executed_at.tzinfo is None or req.executed_at.utcoffset() is None:
+        raise HTTPException(422, "execution time must include a timezone")
+    try:
+        quantity = portfolio.decimal_value(req.quantity, "quantity", positive=True)
+        price = portfolio.decimal_value(req.price, "price", positive=True)
+        fees = portfolio.decimal_value(req.fees, "fees", nonnegative=True)
+    except portfolio.PortfolioError as exc:
+        raise HTTPException(422, str(exc))
+
+    currency = req.currency.strip().upper()
+    dashboard, rows = _portfolio_rows()
+    row = rows.get(req.cik)
+    if row is None:
+        raise HTTPException(404, f"CIK {req.cik} is not in the current dashboard")
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        if currency != selected["base_currency"]:
+            raise HTTPException(
+                422,
+                f"{selected['name']} is a {selected['base_currency']} portfolio; "
+                "FX conversion is not implemented, so another currency cannot be totalled safely",
+            )
+        snapshot = portfolio.decision_snapshot(dashboard, row, price)
+        candidate = {
+            "id": 0,
+            "portfolio_id": portfolio_id,
+            "cik": req.cik,
+            "ticker": row["ticker"],
+            "side": req.side,
+            "quantity": portfolio.canonical_decimal(quantity),
+            "price": portfolio.canonical_decimal(price),
+            "fees": portfolio.canonical_decimal(fees),
+            "currency": currency,
+            "executed_at": req.executed_at.isoformat(),
+            "broker": req.broker,
+            "account_label": req.account_label,
+            "external_id": req.external_id,
+            "note": req.note,
+            "decision_snapshot": snapshot,
+            "created_at": datetime.now(req.executed_at.tzinfo).isoformat(),
+        }
+        if req.side == "SELL":
+            hypothetical = store.portfolio_trades(conn, portfolio_id) + [candidate]
+            hypothetical.sort(key=lambda trade: (trade["executed_at"], trade["id"]))
+            try:
+                portfolio.build_portfolio(selected, hypothetical, rows)
+            except portfolio.PortfolioError as exc:
+                raise HTTPException(409, str(exc))
+        try:
+            trade = store.add_portfolio_trade(
+                conn,
+                portfolio_id=portfolio_id,
+                cik=req.cik,
+                ticker=row["ticker"],
+                side=req.side,
+                quantity=portfolio.canonical_decimal(quantity),
+                price=portfolio.canonical_decimal(price),
+                fees=portfolio.canonical_decimal(fees),
+                currency=currency,
+                executed_at=req.executed_at.isoformat(),
+                broker=req.broker,
+                account_label=req.account_label,
+                external_id=req.external_id,
+                note=req.note,
+                decision_snapshot=snapshot,
+            )
+        except sqlite3.IntegrityError as exc:
+            if req.external_id:
+                raise HTTPException(409, f"execution {req.external_id!r} was already imported")
+            raise HTTPException(409, f"trade could not be saved: {exc}")
+        return {"trade": trade, "portfolio": _portfolio_response(conn, selected)}
+    finally:
+        conn.close()
+
+
+@app.delete("/portfolio/{portfolio_id}/trades/{trade_id}")
+def portfolio_trade_remove(portfolio_id: int, trade_id: int):
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        trades = store.portfolio_trades(conn, portfolio_id)
+        if not any(trade["id"] == trade_id for trade in trades):
+            raise HTTPException(404, f"trade {trade_id} not found")
+        _, rows = _portfolio_rows()
+        remaining = [trade for trade in trades if trade["id"] != trade_id]
+        try:
+            portfolio.build_portfolio(selected, remaining, rows)
+        except portfolio.PortfolioError as exc:
+            raise HTTPException(409, f"cannot remove this trade: {exc}")
+        store.delete_portfolio_trade(conn, portfolio_id, trade_id)
+        return {"deleted": True, "trade_id": trade_id,
+                "portfolio": _portfolio_response(conn, selected)}
     finally:
         conn.close()
 
@@ -234,6 +456,11 @@ def _screen_dict(r: ScreenResult) -> dict:
             "price": _num(r.quote.price),
             "asof": r.quote.asof.isoformat(),
             "source": r.quote.source,
+            "session": r.quote.session,
+            "market_state": r.quote.market_state,
+            "market_timezone": r.quote.market_timezone,
+            "market_state_asof": (r.quote.market_state_asof.isoformat()
+                                    if r.quote.market_state_asof else None),
         }
         if r.quote
         else None,
@@ -284,6 +511,7 @@ def _snapshot_dict(s: FinancialSnapshot) -> dict:
         "dividend": opt(s.dividend),
         "pays_dividend": s.pays_dividend,
         "dividend_per_share": _num(s.dividend_per_share),
+        "recurring_dividend_per_share": opt(s.recurring_dividend_per_share),
         "assumed_zero": sorted(s.assumed_zero),
         "earnings_quality": list(s.earnings_quality),
     }

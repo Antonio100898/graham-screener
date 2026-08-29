@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from .ch13 import _avg3
+from .sources import cover
 
 # Annual XBRL filing became mandatory for every filer size by fiscal 2011; a
 # record that begins later marks a genuinely short public history, not a gap in
@@ -199,10 +200,15 @@ def depositary_note(row: dict) -> str | None:
         return None
     where = receipt.get("accn") or "the latest annual filing"
     if not receipt["title"]:
-        return (f"The cover of {where} names this symbol and tags no class title, so there is no "
-                "depositary ratio or second class to read there: the share count in the "
-                "statements is the one the price belongs to.")
+        return (f"The cover of {where} names this symbol but tags no security title. It therefore "
+                "does not establish whether the price belongs to an ordinary share or a "
+                "depositary receipt, or what ratio would join that price to the statement "
+                "share count.")
     if not receipt.get("ratio"):
+        if cover.is_depositary_security(receipt["title"]):
+            return (f"The cover of {where} registers this symbol as \u201c{receipt['title']}\u201d, but "
+                    "does not state a ratio the parser can resolve. The price and statement "
+                    "share count therefore cannot safely be put on one security basis.")
         return (f"The cover of {where} registers this symbol as \u201c{receipt['title']}\u201d — "
                 "one class, no depositary ratio, so the share count in the statements is the "
                 "one the price belongs to.")
@@ -228,7 +234,7 @@ def foreign_listing_note(row: dict) -> str | None:
     Share represents thirteen ordinary shares" — and prose is exactly what an XBRL
     feed does not carry. So this says what to go and read, rather than guessing.
     """
-    if row.get("receipt"):
+    if (row.get("receipt") or {}).get("title"):
         return None          # the cover has been read; depositary_note says what it said
     code, _, name = (row.get("incorporation") or "").partition("|")
     # SEC codes US states with two letters and every foreign jurisdiction with a
@@ -680,7 +686,7 @@ def prose_gaps(row: dict) -> list[dict]:
 
     # A cover that has been read answers both questions below — the class the
     # symbol belongs to is named, and any ratio has already been applied here.
-    if row.get("receipt"):
+    if (row.get("receipt") or {}).get("title"):
         return gaps
 
     if foreign:

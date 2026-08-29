@@ -5,14 +5,14 @@ from decimal import Decimal
 
 import pytest
 
-from screener.normalize import UnsupportedFilerError, _fy_label, build_snapshot
+from screener.normalize import (PendingFilingFactsError, UnsupportedFilerError,
+                                _fy_label, build_snapshot)
 from helpers import *  # noqa: F403 — the shared fixtures, by design
 from helpers import EPS, GAAP, build, dur, facts_doc, inst, tagdata, texts
 from helpers import _dimensioned, _reported, _shares, _years, _yr  # underscored, so `import *` skips them
 
 
-def test_filer_currently_on_foreign_forms_is_rejected():
-    """Even with US-GAAP facts: foreign balance sheets trail the domestic cadence."""
+def _foreign_gaap():
     foreign_gaap = {
         tag: tagdata(unit, [
             {**entry, "form": "20-F" if entry["form"].startswith("10-K") else "6-K"}
@@ -21,16 +21,178 @@ def test_filer_currently_on_foreign_forms_is_rejected():
         for tag, data in GAAP.items()
         for unit, entries in data["units"].items()
     }
-    with pytest.raises(UnsupportedFilerError, match="foreign"):
-        build(foreign_gaap)
+    return foreign_gaap
 
 
-def test_foreign_ifrs_facts_remain_explicitly_unsupported():
+def _foreign_ifrs(*, currency="USD", filed="2026-03-25", accn="ifrs25"):
+    annual = lambda value: dur(  # noqa: E731 - compact filing-shaped fixture
+        "2025-01-01", "2025-12-31", value, form="20-F", accn=accn, filed=filed)
+    instant = lambda value: inst(  # noqa: E731
+        "2025-12-31", value, form="20-F", accn=accn, filed=filed)
+    return {
+        "Assets": tagdata(currency, [instant(1_000_000_000)]),
+        "EquityAndLiabilities": tagdata(currency, [instant(1_000_000_000)]),
+        "CurrentAssets": tagdata(currency, [instant(400_000_000)]),
+        "CurrentLiabilities": tagdata(currency, [instant(200_000_000)]),
+        "Equity": tagdata(currency, [instant(500_000_000)]),
+        "EquityAttributableToOwnersOfParent": tagdata(currency, [instant(450_000_000)]),
+        "NoncontrollingInterests": tagdata(currency, [instant(50_000_000)]),
+        "LongtermBorrowings": tagdata(currency, [instant(100_000_000)]),
+        "ShorttermBorrowings": tagdata(currency, [instant(20_000_000)]),
+        "LeaseLiabilities": tagdata(currency, [instant(30_000_000)]),
+        "Goodwill": tagdata(currency, [instant(10_000_000)]),
+        "IntangibleAssetsOtherThanGoodwill": tagdata(currency, [instant(5_000_000)]),
+        "NumberOfSharesOutstanding": tagdata("shares", [instant(100_000_000)]),
+        "WeightedAverageShares": tagdata("shares", [annual(100_000_000)]),
+        "DilutedEarningsLossPerShare": tagdata("USD/shares", [annual(2.0)]),
+        "ProfitLossAttributableToOwnersOfParent": tagdata(currency, [annual(200_000_000)]),
+        "ProfitLoss": tagdata(currency, [annual(210_000_000)]),
+        "ProfitLossAttributableToNoncontrollingInterests": tagdata(
+            currency, [annual(10_000_000)]),
+        "Revenue": tagdata(currency, [annual(1_000_000_000)]),
+        "ProfitLossFromOperatingActivities": tagdata(currency, [annual(250_000_000)]),
+        "ProfitLossBeforeTax": tagdata(currency, [annual(240_000_000)]),
+        "DividendsPaidClassifiedAsFinancingActivities": tagdata(
+            currency, [annual(20_000_000)]),
+    }
+
+
+def test_foreign_us_gaap_filer_requires_an_exact_cover_security():
+    with pytest.raises(UnsupportedFilerError, match="security title"):
+        build(_foreign_gaap())
+
+
+def test_new_foreign_annual_without_statements_is_pending_not_unsupported():
+    from screener.sync import _derive
+
+    filed = (date.today() - timedelta(days=1)).isoformat()
+    facts = facts_doc(_foreign_gaap(), {
+        "EntityCommonStockSharesOutstanding": tagdata("shares", [
+            inst("2026-06-30", 100_000_000, form="20-F", accn="new26",
+                 filed=filed)]),
+    })
+    receipt = {"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+               "accn": "k25"}
+
+    with pytest.raises(PendingFilingFactsError) as raised:
+        build_snapshot("TEST", "0000000001", facts, receipt=receipt)
+    assert raised.value.filing == (filed, "new26")
+
+    status, row = _derive("0000000001", "TEST", facts, receipt=receipt)
+    assert status == "pending_facts"
+    assert row["cik"] == "0000000001"
+    assert row["data_pending"]["accession"] == "new26"
+    assert row["sources"]["total_assets"]["accn"] != "new26"
+
+
+def test_cover_verified_foreign_ordinary_share_is_supported():
+    snapshot = build_snapshot(
+        "TEST", "0000000001", facts_doc(_foreign_gaap()),
+        receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+                 "accn": "k25"},
+    )
+    assert snapshot.balance_sheet_date == date(2026, 3, 31)
+
+
+def test_foreign_depositary_share_without_a_ratio_is_rejected():
+    with pytest.raises(UnsupportedFilerError, match="ratio"):
+        build_snapshot(
+            "TEST", "0000000001", facts_doc(_foreign_gaap()),
+            receipt={"symbol": "TEST", "title": "American Depositary Shares",
+                     "ratio": None, "accn": "k25"},
+        )
+
+
+def test_foreign_security_identity_must_come_from_the_current_annual_cover():
+    with pytest.raises(UnsupportedFilerError, match="current annual cover"):
+        build_snapshot(
+            "TEST", "0000000001", facts_doc(_foreign_gaap()),
+            receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+                     "accn": "k24"},
+        )
+
+
+def test_foreign_noncommon_security_is_rejected_even_when_the_symbol_matches():
+    with pytest.raises(UnsupportedFilerError, match="common equity"):
+        build_snapshot(
+            "TEST", "0000000001", facts_doc(_foreign_gaap()),
+            receipt={"symbol": "TEST", "title": "Preferred shares, par value $0.01",
+                     "ratio": None, "accn": "k25"},
+        )
+
+
+def test_current_ifrs_report_uses_its_own_basis_not_old_us_gaap_history():
+    facts = facts_doc(_foreign_gaap())
+    facts["facts"]["ifrs-full"] = _foreign_ifrs(filed="2027-03-01", accn="ifrs25")
+    snapshot = build_snapshot(
+        "TEST", "0000000001", facts,
+        receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+                 "accn": "ifrs25"},
+    )
+    assert snapshot.total_assets.value == Decimal("1000000000")
+    assert snapshot.total_assets.provenance.tag == "ifrs-full:Assets"
+
+
+def test_non_usd_foreign_statements_are_not_compared_to_a_us_price():
+    gaap = _foreign_gaap()
+    gaap["AssetsCurrent"] = tagdata("CAD", [
+        inst("2025-12-31", 280e9, form="20-F", accn="k25", filed="2026-02-15")])
+    with pytest.raises(UnsupportedFilerError, match="non-USD"):
+        build_snapshot(
+            "TEST", "0000000001", facts_doc(gaap),
+            receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+                     "accn": "k25"},
+        )
+
+
+def test_foreign_ifrs_without_a_usd_balance_anchor_remains_unsupported():
     facts = {"facts": {"ifrs-full": {
         "Revenue": tagdata("USD", [dur("2025-01-01", "2025-12-31", 1.0, form="20-F")])
     }}}
-    with pytest.raises(UnsupportedFilerError, match="IFRS taxonomy"):
+    with pytest.raises(UnsupportedFilerError, match="supported USD"):
         build_snapshot("IFRS", "0000000002", facts)
+
+
+def test_cover_verified_usd_ifrs_filer_uses_equivalent_concepts_with_original_provenance():
+    from screener.sync import _derive
+
+    facts = {"facts": {"ifrs-full": _foreign_ifrs()}}
+    receipt = {"symbol": "IFRS", "title": "Class A common shares",
+               "ratio": None, "accn": "ifrs25"}
+    snapshot = build_snapshot(
+        "IFRS", "0000000002", facts, receipt=receipt,
+    )
+    assert snapshot.current_assets.value == Decimal("400000000")
+    assert snapshot.current_liabilities.value == Decimal("200000000")
+    assert snapshot.total_liabilities.value == Decimal("500000000")
+    assert snapshot.annual_revenue[2025].value == Decimal("1000000000")
+    assert snapshot.annual_net_income[2025].value == Decimal("200000000")
+    assert snapshot.annual_operating_income[2025].value == Decimal("250000000")
+    assert snapshot.annual_eps[2025].value == Decimal("2.0")
+    assert snapshot.shares_outstanding.value == Decimal("100000000")
+    assert snapshot.long_term_debt.value == Decimal("100000000")
+    assert snapshot.short_term_debt.value == Decimal("20000000")
+    assert snapshot.long_term_debt.provenance.tag == "ifrs-full:LongtermBorrowings"
+    assert snapshot.total_liabilities.provenance.tag == (
+        "ifrs-full:EquityAndLiabilities - ifrs-full:Equity")
+    # IFRS 16's generic lease total is context, not silently finance debt.
+    assert snapshot.long_term_debt.value != Decimal("130000000")
+
+    status, row = _derive("0000000002", "IFRS", facts, receipt=receipt)
+    assert status == "ok"
+    assert row["annual_ratios"][2025]["current_ratio"] == 2.0
+    assert row["annual_ratios"][2025]["net_margin"] == 20.0
+    assert row["sources"]["eps"]["tag"] == "ifrs-full:DilutedEarningsLossPerShare"
+
+
+def test_non_usd_ifrs_statements_are_not_compared_to_a_us_price():
+    facts = {"facts": {"ifrs-full": _foreign_ifrs(currency="EUR")}}
+    with pytest.raises(UnsupportedFilerError, match="non-USD"):
+        build_snapshot(
+            "IFRS", "0000000002", facts,
+            receipt={"symbol": "IFRS", "title": "Ordinary Shares",
+                     "ratio": None, "accn": "ifrs25"},
+        )
 
 
 def test_dividend_recent_positive_payment():
@@ -110,11 +272,11 @@ def test_widened_dividend_chain_tag_detected():
     assert build(gaap).pays_dividend is True
 
 
-def test_foreign_ifrs_filer_rejected():
+def test_foreign_ifrs_filer_requires_an_exact_cover_security():
     facts = {"facts": {"ifrs-full": {
         "Assets": tagdata("USD", [inst("2025-12-31", 1e9, form="20-F")])
     }}}
-    with pytest.raises(UnsupportedFilerError, match="IFRS taxonomy"):
+    with pytest.raises(UnsupportedFilerError, match="security title"):
         build_snapshot("IFRS", "0000000003", facts)
 
 
@@ -131,23 +293,22 @@ def test_fiscal_year_label_january_end_belongs_to_prior_year():
     assert _fy_label(date(2025, 9, 27)) == 2025
 
 
-def test_pretax_income_stands_in_when_no_operating_subtotal():
+def test_pretax_income_never_replaces_reported_owner_earnings():
     gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
         tagdata("USD", [dur("2025-01-01", "2025-12-31", 90e9, accn="k25", filed="2026-02-15")])
     oe = build(gaap).owner_earnings
-    assert float(oe.owner_earnings) == 70e9  # 90 + 12 - 20 - 12
-    assert any("pre-tax" in c for c in oe.caveats)
+    assert float(oe.all_capex_floor.value) == 70e9  # 70 reported + 12 D&A - 12 capex
+    assert not any("pre-tax" in c for c in oe.caveats)
 
 
-def test_income_tax_benefit_is_added_back_not_charged():
-    """IncomeTaxExpenseBenefit is signed; a net-benefit year files it negative. Forcing
-    it positive charged Uber for a benefit it received, twice over."""
+def test_income_tax_is_not_deducted_twice_from_reported_net_income():
+    """Net income is already after tax; changing the tax line must not change this lens."""
     gaap = dict(OE_GAAP)
     gaap["IncomeTaxExpenseBenefit"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", -20e9, accn="k25", filed="2026-02-15")])
     oe = build(gaap).owner_earnings
-    assert float(oe.owner_earnings) == 120e9   # 100 + 12 - (-20) - 12
+    assert float(oe.all_capex_floor.value) == 70e9
 
 
 def test_dividend_record_streak_and_interruption():
@@ -160,6 +321,30 @@ def test_dividend_record_streak_and_interruption():
     s = build(gaap)
     assert s.dividend_record == {"first": 2020, "latest": 2025,
                                  "streak_from": 2023, "paid_years": 5}
+
+
+def test_legacy_dividend_payable_settlement_is_not_a_current_dividend_pfho_style():
+    gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
+    gaap["PaymentsOfDividends"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 37_000, accn="k25", filed="2026-03-13")])
+    gaap["DividendsCash"] = tagdata("USD", [
+        dur("2023-01-01", "2023-03-31", 1_000, form="10-Q", accn="q23",
+            filed="2023-05-01"),
+        dur("2024-01-01", "2024-03-31", 1_000, form="10-Q", accn="q24",
+            filed="2024-05-01"),
+        dur("2024-01-01", "2024-12-31", 0, accn="k24", filed="2025-03-14"),
+        dur("2025-01-01", "2025-12-31", 750, accn="k25", filed="2026-03-13"),
+    ])
+    gaap["DividendsPayableCurrent"] = tagdata("USD", [
+        inst("2024-12-31", 37_000, form="10-K", accn="k25", filed="2026-03-13"),
+        inst("2025-06-30", 36_375, form="10-Q", accn="q25", filed="2025-08-04"),
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-03-13"),
+    ])
+    s = build(gaap)
+    assert s.pays_dividend is False
+    assert s.dividend is None
+    assert s.dividend_record == {"first": 2023, "latest": 2023,
+                                 "streak_from": 2023, "paid_years": 1}
 
 
 def test_lp_distributions_count_as_the_common_payout_epd_style():
@@ -254,8 +439,8 @@ def test_segment_capex_fills_only_missing_years_schl_style():
         dur("2024-01-01", "2024-12-31", 99e9, accn="k24", filed="2025-02-15"),  # loses to payments
         dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15")])  # fills the dead year
     s = build(gaap)
-    # latest shared year 2025 uses the segment figure: 100 + 12 - 20 - 12
-    assert float(s.owner_earnings.owner_earnings) == 80e9
+    # latest shared year 2025 uses the segment figure: 70 + 12 - 12
+    assert float(s.owner_earnings.all_capex_floor.value) == 70e9
 
 
 def test_context_notes_flag_weak_cash_conversion():
@@ -280,23 +465,23 @@ def test_context_notes_flag_thin_interest_cover():
     assert "2.0x" in note
 
 
-def test_domestic_pretax_alone_never_becomes_owner_earnings():
-    """The domestic figure is one geography, not the consolidated company."""
+def test_domestic_pretax_never_overrides_reported_owner_earnings():
     gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15")])
-    assert build(gaap).owner_earnings is None
+    oe = build(gaap).owner_earnings
+    assert float(oe.maintenance_estimate.value) == 70e9
 
 
-def test_domestic_and_foreign_pretax_sum_to_a_consolidated_figure():
+def test_geographic_pretax_sum_never_overrides_reported_owner_earnings():
     gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15")])
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 70e9, accn="k25", filed="2026-02-15")])
     oe = build(gaap).owner_earnings
-    assert float(dict(oe.components)["operating profit"]) == 100e9
-    assert any("domestic and foreign" in c for c in oe.caveats)
+    assert float(dict(oe.components)["reported earnings attributable to owners"]) == 70e9
+    assert not any("domestic and foreign" in c for c in oe.caveats)
 
 
 def test_receivables_outrunning_sales_are_stated():

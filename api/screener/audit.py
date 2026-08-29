@@ -30,9 +30,10 @@ import argparse
 import json
 import re
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
-from .normalize import _is_financial_form
+from .normalize import _is_annual_form, _is_financial_form
 from .sources import statements
 from .sources.edgar import EdgarClient
 from .sync import DASHBOARD_JSON
@@ -120,20 +121,59 @@ def _fact_in_filing(facts: dict, source: dict) -> float | None:
 
 
 def _values_in_filing(facts: dict, ns: str, tag: str, source: dict) -> list[float]:
-    """Every value the named filing reports for that concept at that period end.
+    """Every value the named filing reports for that exact period context.
 
     Usually one. But a weighted-average share count is a DURATION fact, and a
     quarterly report states several for the same end date — the three months, the
-    six, the year to date — and the provenance records only the end. So the
-    question this check can honestly ask is whether the displayed figure is one of
-    the numbers the filing states, not whether it is the first of them.
+    six, the year to date. Existing compact sources record only the end, so for
+    those the check asks whether the figure is one of the numbers in the filing.
+    New duration sources that carry a start are matched to that exact context.
     """
     out = []
-    for units in (facts.get("facts", {}).get(ns, {}).get(tag) or {}).get("units", {}).values():
+    available_units = (facts.get("facts", {}).get(ns, {}).get(tag) or {}).get("units", {})
+    selected_units = ({source["unit"]: available_units.get(source["unit"], [])}
+                      if source.get("unit") else available_units)
+    for units in selected_units.values():
         for e in units:
-            if e.get("accn") == source.get("accn") and e.get("end") == source.get("end"):
+            if (e.get("accn") == source.get("accn")
+                    and e.get("end") == source.get("end")
+                    and (source.get("start") is None
+                         or e.get("start") == source.get("start"))):
                 out.append(float(e["val"]))
     return out
+
+
+def _source_values(facts: dict, source: dict) -> list[float]:
+    """Every filed value a provenance tree can represent.
+
+    Foreign reports commonly tag the same concept in both their presentation
+    currency and USD. A summed figure therefore has several legitimate component
+    combinations; retaining all candidates lets the audit verify the USD value the
+    engine selected instead of silently taking whichever unit appears first.
+    """
+    tag_text = source.get("tag") or ""
+    parts = source.get("components") or ()
+    operator = " + " if " + " in tag_text else " - " if " - " in tag_text else None
+    operands = list(parts)
+    if operator and len(operands) < 2:
+        operands = [
+            {"tag": tag, "accn": source.get("accn"), "end": source.get("end")}
+            for tag in tag_text.split(operator, 1)
+        ]
+    if len(operands) > 1 and operator:
+        totals = [0.0]
+        for index, part in enumerate(operands):
+            values = _source_values(facts, part)
+            if not values:
+                return []
+            sign = -1 if operator == " - " and index else 1
+            totals = [total + sign * value for total in totals for value in values]
+        return totals
+    if " - " not in tag_text and " + " not in tag_text:
+        ns, _, tag = tag_text.partition(":")
+        return _values_in_filing(facts, ns or "us-gaap", tag, source)
+    value = _fact_in_filing(facts, source)
+    return [] if value is None else [value]
 
 
 # The panel rounds a displayed ratio to two decimals, so 0.0669 is shown as 0.07.
@@ -575,7 +615,7 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     confirm at all.
     """
     source = (row.get("sources") or {}).get("eps") or {}
-    if not (source.get("form") or "").startswith("10-K"):
+    if not _is_annual_form(source.get("form") or ""):
         return []                       # only an annual report prints annual columns
     try:
         (printed, tagged), _, headings, why = _read_statement(row, edgar, "income")
@@ -678,12 +718,15 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
 # What each series is tagged as, for asking whether a later filing revised it.
 _CONCEPT_TAGS = {
     "revenue": ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-                "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"),
+                "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet",
+                "Revenue", "RevenueFromContractsWithCustomers"),
     "net_income": ("NetIncomeLoss", "ProfitLoss",
-                   "NetIncomeLossAvailableToCommonStockholdersBasic"),
+                   "NetIncomeLossAvailableToCommonStockholdersBasic",
+                   "ProfitLossAttributableToOwnersOfParent"),
     "eps": ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted",
-            "IncomeLossFromContinuingOperationsPerDilutedShare"),
-    "operating_income": ("OperatingIncomeLoss",),
+            "IncomeLossFromContinuingOperationsPerDilutedShare",
+            "DilutedEarningsLossPerShare", "BasicEarningsLossPerShare"),
+    "operating_income": ("OperatingIncomeLoss", "ProfitLossFromOperatingActivities"),
 }
 
 
@@ -711,13 +754,18 @@ def _split_since(facts: dict, heading, shown: float, printed: float) -> bool:
     # end the filer reports twice — not only at this column's. Mueller's doubled
     # count stands against 2025-12-27 and the panel adjusts 2023 and 2024 with it.
     by_end: dict[str, set] = {}
-    for tag in ("CommonStockSharesOutstanding",
-                "WeightedAverageNumberOfDilutedSharesOutstanding"):
-        for units in (facts.get("facts", {}).get("us-gaap", {}).get(tag) or {}).get("units", {}).values():
-            for e in units:
-                value = float(e.get("val") or 0)
-                if value > 0 and e.get("end"):
-                    by_end.setdefault(e["end"], set()).add(value)
+    for namespace, tags in (
+        ("us-gaap", ("CommonStockSharesOutstanding",
+                     "WeightedAverageNumberOfDilutedSharesOutstanding")),
+        ("ifrs-full", ("NumberOfSharesOutstanding", "AdjustedWeightedAverageShares",
+                       "WeightedAverageShares")),
+    ):
+        for tag in tags:
+            for units in (facts.get("facts", {}).get(namespace, {}).get(tag) or {}).get("units", {}).values():
+                for e in units:
+                    value = float(e.get("val") or 0)
+                    if value > 0 and e.get("end"):
+                        by_end.setdefault(e["end"], set()).add(value)
     return any(abs(big / small - factor) <= 0.02 * factor
                for counts in by_end.values()
                for small in counts for big in counts if small)
@@ -736,14 +784,15 @@ def _restated_since(facts: dict, field: str, heading, shown: float) -> bool:
     a LATER filing for the same period.
     """
     end = heading.isoformat()
-    for tag in _CONCEPT_TAGS.get(field, ()):
-        for units in (facts.get("facts", {}).get("us-gaap", {}).get(tag) or {}).get("units", {}).values():
-            for e in units:
-                if e.get("end") != end or "start" not in e:
-                    continue
-                value = float(e["val"])
-                if abs(shown - value) <= FILING_TOLERANCE * max(abs(shown), abs(value), 1e-9):
-                    return True
+    for namespace in ("us-gaap", "ifrs-full"):
+        for tag in _CONCEPT_TAGS.get(field, ()):
+            for units in (facts.get("facts", {}).get(namespace, {}).get(tag) or {}).get("units", {}).values():
+                for e in units:
+                    if e.get("end") != end or "start" not in e:
+                        continue
+                    value = float(e["val"])
+                    if abs(shown - value) <= FILING_TOLERANCE * max(abs(shown), abs(value), 1e-9):
+                        return True
     return False
 
 
@@ -758,32 +807,32 @@ def _agrees(shown: float, printed_value: float, label: str) -> bool:
             <= FILING_TOLERANCE * max(abs(shown), abs(printed_value), 1e-9))
 
 
-# What owner earnings is built from, and the concept each component is tagged with
-# on the cash flow statement. Operating profit comes from the income statement and
-# income tax from the same, so only these two are read here.
+# Cash-flow-statement components behind the explicitly labelled all-capex floor.
+# Reported earnings comes from the income statement, so only these are read here.
 CASH_FLOW = {
+    "operating cash flow": (
+        "us-gaap_NetCashProvidedByUsedInOperatingActivities",
+        "us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        "ifrs-full_CashFlowsFromUsedInOperatingActivities"),
     "+ depreciation & amortisation": (
         "us-gaap_DepreciationDepletionAndAmortization",
         "us-gaap_DepreciationAmortizationAndAccretionNet",
         "us-gaap_DepreciationAndAmortization",
-        "us-gaap_DepreciationDepletionAndAmortizationExcludingAmortizationOfDeferredFinancingFeesAndDebtDiscounts"),
-    "- capital expenditure": (
+        "us-gaap_DepreciationDepletionAndAmortizationExcludingAmortizationOfDeferredFinancingFeesAndDebtDiscounts",
+        "ifrs-full_AdjustmentsForDepreciationAndAmortisationExpense"),
+    "- total capital expenditure": (
         "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
         "us-gaap_PaymentsToAcquireProductiveAssets",
-        "us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment"),
+        "us-gaap_PaymentsToAcquireOtherPropertyPlantAndEquipment",
+        "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities"),
 }
 
 
 def against_cash_flow(row: dict, edgar) -> list[tuple]:
-    """The owner-earnings components against the statement they were taken from.
-
-    Owner earnings is the one figure on the panel assembled from three statements
-    at once — operating profit and tax from the income statement, depreciation and
-    capital expenditure from the cash flow — and it had never been checked against
-    any of them.
-    """
+    """The all-capex-floor components against the cash-flow statement."""
     earnings = row.get("owner_earnings") or {}
     components = dict(earnings.get("components") or [])
+    components.update(dict(earnings.get("free_cash_flow_components") or []))
     if not components:
         return []
     try:
@@ -791,10 +840,10 @@ def against_cash_flow(row: dict, edgar) -> list[tuple]:
     except Exception:
         return []
     if printed is None:
-        return [("FILING?", "owner earnings", None, None, why)]
+        return [("FILING?", "all-capex evidence", None, None, why)]
     # the column for the year the figure was struck in, which is not always one the
     # filing prints: Berkshire's per-share provenance points at a 2017 report, and
-    # its owner earnings are a recent year's
+    # its all-capex evidence is a recent year's
     year = str(earnings.get("fiscal_year"))
     # by the date the panel says that year ended, not by the calendar year the date
     # falls in: Walmart's fiscal 2025 ends 2026-01-31, and matching on the year
@@ -804,7 +853,7 @@ def against_cash_flow(row: dict, edgar) -> list[tuple]:
     wanted = ends.get(year)
     columns = [i for i, heading in enumerate(headings) if heading.isoformat() == wanted]
     if not columns:
-        return [("FILING?", "owner earnings", None, None,
+        return [("FILING?", "all-capex evidence", None, None,
                  f"FY{year} is not among this statement's columns")]
 
     out = []
@@ -816,13 +865,13 @@ def against_cash_flow(row: dict, edgar) -> list[tuple]:
                   for col in columns if col < len(tagged[concept])
                   for v in (float(tagged[concept][col]),)]
         if not values:
-            out.append(("FILING?", f"owner earnings {name}", shown, None,
+            out.append(("FILING?", f"all-capex evidence {name}", shown, None,
                         "the statement tags no such concept"))
             continue
         # capital expenditure is a payment, so its sign is the filer's convention
         if any(abs(abs(shown) - abs(v)) <= FILING_TOLERANCE * max(abs(shown), abs(v), 1e-9)
                for v in values):
-            out.append(("FILING-OK", f"owner earnings {name}", shown, shown, None))
+            out.append(("FILING-OK", f"all-capex evidence {name}", shown, shown, None))
         else:
             # A filer may tag several depreciation concepts of overlapping scope and
             # print one of them: Vistra states $1,986M of depreciation, depletion and
@@ -830,7 +879,7 @@ def against_cash_flow(row: dict, edgar) -> list[tuple]:
             # depreciation. XPO's cash flow line includes $58M of intangible
             # amortisation the panel's element excludes. A choice of definition, and
             # the panel's is the narrower and more conservative one.
-            out.append(("FILING?", f"owner earnings {name}", shown, values[0],
+            out.append(("FILING?", f"all-capex evidence {name}", shown, values[0],
                         "the statement adds back a wider depreciation concept"))
     return out
 
@@ -859,9 +908,14 @@ def _one_moment(row: dict, facts: dict) -> list[tuple]:
             if not end or end >= parent:
                 continue
             ns, _, bare = tag.partition(":")
-            entries = [e for units in
-                       (facts.get("facts", {}).get(ns or "us-gaap", {}).get(bare) or {})
-                       .get("units", {}).values() for e in units]
+            units = ((facts.get("facts", {}).get(ns or "us-gaap", {}).get(bare) or {})
+                     .get("units", {}))
+            preferred_unit = (
+                "shares" if name in ("shares", "options", "rsus", "cover_shares")
+                else "USD/shares" if name == "eps"
+                else "USD"
+            )
+            entries = list(units.get(preferred_unit, ()))
             # only forms the engine itself reads. Cycurion's line of credit has a
             # newer figure, but it stands in an S-1 — a registration statement, not
             # a periodic report — and the engine deliberately reads neither, so its
@@ -888,7 +942,15 @@ def _rounding_slack(numerator: float, denominator: float) -> float:
     # on the displayed multiple and cannot be ignored.
     numerator_error = 0.00005 / abs(denominator)
     denominator_error = abs(numerator / denominator) * (0.00005 / abs(denominator))
-    return numerator_error + denominator_error
+    continuous = numerator_error + denominator_error
+    # A ratio exactly on a half-cent boundary can round either way once the hidden
+    # fifth decimal of either serialized input is restored. TATT stores 5.3000 /
+    # 8.4800 = 0.625, while the unrounded close lies just above it: 0.63 is valid
+    # even though recomputing from the payload alone uses banker's rounding to 0.62.
+    centre = round(numerator / denominator, 2)
+    low = round((numerator - 0.00005) / (denominator + 0.00005), 2)
+    high = round((numerator + 0.00005) / (denominator - 0.00005), 2)
+    return max(continuous, abs(low - centre), abs(high - centre))
 
 
 def _derived_series(row: dict) -> list[tuple]:
@@ -912,8 +974,12 @@ def _derived_series(row: dict) -> list[tuple]:
         latest = stats["latest_fy"]
         recent = [eps[y] for y in range(latest - 2, latest + 1) if y in eps]
         if len(recent) == 3:
+            # The engine averages Decimal filing values, then converts once for
+            # display. Summing binary payload floats first can land on the other
+            # side of a half-cent boundary (VTEX: exact 0.035 -> 0.04).
+            exact_mean = sum(Decimal(str(v)) for v in recent) / Decimal(3)
             check("ch13.avg_recent", stats.get("avg_recent"),
-                  round(sum(recent) / 3, 2), "mean of the last three years' EPS")
+                  round(float(exact_mean), 2), "mean of the last three years' EPS")
         window = [eps[y] for y in range(latest - 9, latest + 1) if y in eps]
         if window:
             check("ch13.ten_year_present", stats.get("ten_year_present"), len(window),
@@ -924,14 +990,44 @@ def _derived_series(row: dict) -> list[tuple]:
                   sum(1 for v in window if v > 0), "how many of those earned something")
 
     earnings = row.get("owner_earnings") or {}
-    parts = [v for _, v in (earnings.get("components") or [])]
-    if parts and earnings.get("owner_earnings") is not None:
-        check("owner_earnings", earnings["owner_earnings"], sum(parts),
-              "its own components, added")
-    if earnings.get("roic") is not None and earnings.get("invested_capital"):
-        check("roic", earnings["roic"],
-              earnings["owner_earnings"] / earnings["invested_capital"] * 100,
-              "owner earnings over invested capital")
+    component_map = dict(earnings.get("components") or [])
+    parts = list(component_map.values())
+    if parts and earnings.get("all_capex_floor") is not None:
+        check("owner_earnings.all_capex_floor", earnings["all_capex_floor"], sum(parts),
+              "reported earnings plus D&A less total capex")
+    reported = component_map.get("reported earnings attributable to owners")
+    if reported is not None and earnings.get("maintenance_estimate") is not None:
+        check("owner_earnings.maintenance_estimate", earnings["maintenance_estimate"],
+              reported, "reported earnings when maintenance capex is assumed equal to D&A")
+    cash_parts = [value for _, value in (earnings.get("free_cash_flow_components") or [])]
+    if cash_parts and earnings.get("free_cash_flow") is not None:
+        check("owner_earnings.free_cash_flow", earnings["free_cash_flow"],
+              sum(cash_parts), "operating cash flow less total capex")
+    capital = earnings.get("invested_capital")
+    if earnings.get("all_capex_return") is not None and capital:
+        check("owner_earnings.all_capex_return", earnings["all_capex_return"],
+              earnings["all_capex_floor"] / capital * 100,
+              "all-capex floor over invested capital")
+    if earnings.get("maintenance_estimate_return") is not None and capital:
+        check("owner_earnings.maintenance_estimate_return",
+              earnings["maintenance_estimate_return"],
+              earnings["maintenance_estimate"] / capital * 100,
+              "maintenance≈D&A estimate over invested capital")
+    for year, cell in (earnings.get("annual_per_share") or {}).items():
+        if not isinstance(cell, dict):
+            continue
+        shares = cell.get("diluted_shares")
+        for total_key, share_key, label in (
+            ("all_capex_floor", "all_capex_floor_per_share", "all-capex floor"),
+            ("maintenance_estimate", "maintenance_estimate_per_share",
+             "maintenance≈D&A estimate"),
+            ("free_cash_flow", "free_cash_flow_per_share", "free cash flow"),
+        ):
+            total = cell.get(total_key)
+            if total is not None and shares:
+                check(f"owner_earnings.annual_per_share.{year}.{share_key}",
+                      cell.get(share_key), total / shares,
+                      f"{label} over diluted weighted shares")
 
     for year, cell in (row.get("annual_ratios") or {}).items():
         if not isinstance(cell, dict):
@@ -1002,8 +1098,7 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 continue
             ns, _, bare = (source.get("tag") or "").partition(":")
             ratio = _ratio(row) if field in ("shares", "cover_shares") else 1
-            candidates = [v / ratio for v in
-                          _values_in_filing(facts, ns or "us-gaap", bare, source)]
+            candidates = [v / ratio for v in _source_values(facts, source)]
             if not candidates:                      # a derived or summed provenance
                 one = _fact_in_filing(facts, source)
                 candidates = [] if one is None else [one / ratio]
@@ -1019,6 +1114,25 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 totals["sourced_bad"] += 1
                 lines.append(("SOURCED", field, shown, filed,
                               f"{source['tag']} {source['end']} {source['accn']}"))
+        # The recurring dividend is the filing's direct quarterly per-share fact
+        # annualized fourfold (and, for an ADR, put onto the receipt basis). It is
+        # derived, but its one source still has to name the exact filing quarter.
+        recurring = row.get("recurring_dividend_per_share")
+        recurring_source = sources.get("recurring_dividend_per_share")
+        if recurring is not None:
+            raw = (_fact_in_filing(facts, recurring_source)
+                   if recurring_source and recurring_source.get("accn") else None)
+            expected = None if raw is None else raw * 4 * _ratio(row)
+            if expected is None:
+                totals["unchecked"] += 1
+                lines.append(("UNCHECKED", "recurring_dividend_per_share", recurring,
+                              None, "quarterly dividend provenance is unavailable"))
+            elif _close(recurring, expected):
+                totals["sourced_ok"] += 1
+            else:
+                totals["sourced_bad"] += 1
+                lines.append(("SOURCED", "recurring_dividend_per_share", recurring,
+                              expected, "quarterly filing rate x 4"))
         for name, shown, expected, formula, *slack in _identities(row) + _derived_series(row):
             if _close(shown, expected, slack[0] if slack else 0.0):
                 totals["derived_ok"] += 1

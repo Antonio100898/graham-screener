@@ -19,7 +19,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from .normalize import _annual_eps, _unambiguous_dimensioned
+from .normalize import _annual_eps, _registered_class_title, _unambiguous_dimensioned
 from .sources import dera
 
 DASHBOARD = Path(__file__).parent / "static" / "dashboard.json"
@@ -44,7 +44,12 @@ def compare() -> dict:
         sidecar = dera.load_sidecar(CACHE, row["cik"])
         if not sidecar:
             continue
-        classed = _unambiguous_dimensioned(sidecar)
+        # The cover distinguishes the listed common/Class A unit from preferred,
+        # subordinated, founder, and other classes in the same sidecar. Omitting
+        # it here made the audit less strict than production and could compare a
+        # ticker with a different security issued by the same filer.
+        classed = _unambiguous_dimensioned(
+            sidecar, _registered_class_title(row["ticker"], row.get("receipt")))
         if not classed:
             continue
         reported = _annual_eps(classed)

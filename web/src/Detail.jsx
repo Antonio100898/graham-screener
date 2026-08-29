@@ -1,9 +1,12 @@
 import { useEffect } from "react";
 import { awardOverhang, totalCapitalisation, workingCapitalToDebt } from "./capital.js";
-import { byN, pe3 } from "./screen.js";
+import { byN, pe3, recurringDividendPresentation, reportedRate } from "./screen.js";
 import { profileMeta } from "./Alignment.jsx";
 import AnnualFinancialHistory from "./AnnualFinancialHistory.jsx";
 import EpsCurve from "./EpsCurve.jsx";
+import { ownerEarningsTrend } from "./ownerEarnings.js";
+import { payloadWarnings } from "./warnings.js";
+import { quoteStatus, quoteTitle } from "./quote.js";
 
 const ENTERPRISING = {
   1: { label: "Earnings valuation", rule: "P/E < 10.0" },
@@ -16,7 +19,7 @@ const ENTERPRISING = {
 
 /** A compact investment snapshot: current market and financial facts first,
  * then the two Graham frameworks without trend charts or audit-trail clutter. */
-export default function Detail({ row, onClose, tracked = false, onToggleTracked }) {
+export default function Detail({ row, onClose, tracked = false, onToggleTracked, onRecordTrade }) {
   useEffect(() => {
     const esc = (event) => event.key === "Escape" && onClose();
     window.addEventListener("keydown", esc);
@@ -60,6 +63,9 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked 
             <p className="sub">{row.name}</p>
           </div>
           <div className="detail-head-actions">
+            {onRecordTrade && (
+              <button className="trade-button" onClick={onRecordTrade}>Record trade</button>
+            )}
             {onToggleTracked && (
               <button className={`track-btn ${tracked ? "on" : ""}`} onClick={onToggleTracked}
                       aria-pressed={tracked}
@@ -71,10 +77,15 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked 
           </div>
         </header>
 
+        <DataWarnings row={row} />
+
         <section className="snapshot-section" aria-label="Market and financial snapshot">
           <h3>Market &amp; financial snapshot</h3>
           <div className="snapshot-grid">
-            <Metric label="Price" value={moneyPrice(row.price)} />
+            <Metric label="Price" sub={quoteStatus(row)} value={moneyPrice(row.price)}
+                    title={quoteTitle(row)} />
+            <Metric label="TTM EPS" sub={row.ttm_basis ?? "trailing twelve months"}
+                    value={moneyPrice(row.ttm_eps)} />
             <Metric label="52-week high" sub="weekly close" value={moneyPrice(row.price_stats?.high_52w)} />
             <Metric label="Current vs 3Y avg" sub={row.price_stats?.average_3y == null ? undefined : `3Y avg ${moneyPrice(row.price_stats.average_3y)}`} value={signedPercent(row.price_stats?.pct_vs_3y_average)} />
             <Metric label="Market cap" value={money(marketCap)} />
@@ -97,21 +108,13 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked 
 
         <CriteriaSection
           title="Enterprising criteria"
-          subtitle="Chapter 15 industrial low-multiplier method"
           verdict={enterprising?.verdict}
-          rows={row.criteria.map((criterion) => ({
-            label: ENTERPRISING[criterion.n]?.label ?? `Criterion ${criterion.n}`,
-            rule: ENTERPRISING[criterion.n]?.rule ?? "—",
-            value: enterprisingValue(criterion),
-            status: criterion.status,
-            note: criterion.note,
-          }))}
+          rows={row.criteria.map(enterprisingRow)}
           extra={enterprising?.growth_modern_4fy && <ModernGrowth growth={enterprising.growth_modern_4fy} />}
         />
 
         <CriteriaSection
           title="Defensive criteria"
-          subtitle="Chapter 14 evidence; dividend continuity remains incomplete unless the record itself proves 20 years"
           verdict={defensive?.verdict}
           rows={defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook })}
         />
@@ -125,11 +128,34 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked 
                notes={row.earnings_quality} />
         <ProseGaps row={row} />
         <AnnualFinancialHistory annualEps={row.annual_eps} annualNetIncome={row.annual_net_income}
-                                preferred={row.annual_preferred_dividends} />
+                                weightedShares={row.annual_weighted_shares} />
         <SeriesMix mix={row.series_mix} />
         <Provenance row={row} />
       </aside>
     </>
+  );
+}
+
+function DataWarnings({ row }) {
+  const warnings = payloadWarnings(row);
+  if (!warnings.length) return null;
+  return (
+    <section className="data-warnings" aria-label="Data freshness warnings">
+      {warnings.map((warning) => {
+        const filingUrl = warning.accession && edgarUrl(row.cik, warning.accession);
+        return (
+          <p key={`${warning.kind}-${warning.accession ?? "history"}`}>
+            <b>{warning.kind}</b>
+            <span>{warning.text}</span>
+            {filingUrl && (
+              <a href={filingUrl} target="_blank" rel="noreferrer">
+                Open filing{warning.filed ? ` filed ${warning.filed}` : ""}
+              </a>
+            )}
+          </p>
+        );
+      })}
+    </section>
   );
 }
 
@@ -155,7 +181,9 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
     { label: "Equity awards", sub: `${row.awards_basis ?? "options and restricted stock"} \u00b7 % of shares`,
       now: awards, key: "award_pct", fmt: rateOrDash },
     { label: "Net margin", sub: "profit per $ of sales", now: prof.net, key: "net_margin", fmt: rateOrDash },
-    { label: "Operating margin", now: prof.operating, key: "operating_margin", fmt: rateOrDash },
+    { label: "Operating margin", sub: "reported operating income / sales", now: prof.operating,
+      key: "operating_margin", fmt: reportedRate,
+      missing: "No same-period, filing-reported operating income and revenue pair is available; the screener does not invent an operating-profit subtotal from differently scoped lines." },
     { label: "Return on book value", sub: "earnings on common equity", now: prof.on_book, key: "return_on_book", fmt: rateOrDash },
   ];
   if (!years.length && lines.every((line) => line.now == null)) return null;
@@ -164,10 +192,6 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
       <div className="criteria-title">
         <div>
           <h3>Ratios</h3>
-          <p>Today, and at each of the last five fiscal year ends &mdash; the company&rsquo;s own,
-             which for a June or September filer is not December. Every past column is struck on
-             that year&rsquo;s own report and the price on the day it closed, so none of them mixes
-             a past balance sheet with a later market.</p>
         </div>
       </div>
       <div className="annual-history-scroll">
@@ -187,9 +211,12 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
             {lines.map((line) => (
               <tr key={line.label + (line.sub ?? "")}>
                 <td><b>{line.label}</b>{line.sub && <small>{line.sub}</small>}</td>
-                <td className="num current">{line.fmt(line.now)}</td>
+                <td className="num current" title={line.now == null ? line.missing : undefined}>
+                  {line.fmt(line.now)}
+                </td>
                 {years.map((y) => (
-                  <td key={y} className="num">
+                  <td key={y} className="num"
+                    title={line.key && history[y]?.[line.key] == null ? line.missing : undefined}>
                     {line.key ? line.fmt(history[y]?.[line.key]) : <span className="dim">{"—"}</span>}
                   </td>
                 ))}
@@ -216,14 +243,14 @@ function priceToNcav(row) {
   return ratio > 1000 ? null : ratio;
 }
 
-function Metric({ label, sub, value, emphasis = false }) {
-  return <div className="metric"><span>{label}{sub && <em>{sub}</em>}</span><b className={emphasis ? "ok" : ""}>{value}</b></div>;
+function Metric({ label, sub, value, emphasis = false, title }) {
+  return <div className="metric" title={title}><span>{label}{sub && <em>{sub}</em>}</span><b className={emphasis ? "ok" : ""}>{value}</b></div>;
 }
 
-function CriteriaSection({ title, subtitle, verdict, rows, extra }) {
+function CriteriaSection({ title, verdict, rows, extra }) {
   return (
     <section className="criteria-section">
-      <div className="criteria-title"><div><h3>{title}</h3><p>{subtitle}</p></div><Status value={verdict} /></div>
+      <div className="criteria-title"><div><h3>{title}</h3></div><Status value={verdict} /></div>
       <table className="criteria-clean">
         <thead><tr><th>Test</th><th>Rule</th><th className="num">Current</th><th>Status</th></tr></thead>
         <tbody>{rows.map((item) => <CriteriaRow key={item.label} {...item} />)}</tbody>
@@ -289,39 +316,90 @@ function enterprisingValue(criterion) {
     const v = shown(criterion);
     return v == null ? "—" : `${v}×`;
   }
-  if (criterion.n === 5) return criterion.value == null ? "—" : `${number(criterion.value)}% yield`;
+  if (criterion.n === 5) return recurringDividendPresentation(criterion.value, criterion.note).value;
   return criterion.value == null ? "—" : number(criterion.value);
 }
 
-/** Owner earnings over invested capital — the Davis Funds measure Zweig sets
- * against earnings per share. Not a Graham criterion: it ranks what already
- * passed, so it sits beside the verdict rather than inside it. */
+function enterprisingRow(criterion) {
+  const cash = criterion.n === 5
+    ? recurringDividendPresentation(criterion.value, criterion.note)
+    : null;
+  return {
+    label: ENTERPRISING[criterion.n]?.label ?? `Criterion ${criterion.n}`,
+    rule: ENTERPRISING[criterion.n]?.rule ?? "—",
+    value: cash?.value ?? enterprisingValue(criterion),
+    status: criterion.status,
+    note: cash?.note ?? criterion.note,
+  };
+}
+
+/** Separately labelled evidence around Buffett owner earnings. Not a Graham criterion. */
 function OwnerEarnings({ oe }) {
   if (!oe) return null;
   const rate = (value) => (value == null ? "—" : `${number(value)}%`);
+  const trend = ownerEarningsTrend(oe);
+  const latest = trend?.rows.find((row) => row.fiscalYear === oe.fiscal_year);
   return (
     <section className="criteria-section">
       <div className="criteria-title">
-        <div><h3>Return on invested capital</h3>
-          <p>FY{oe.fiscal_year} owner earnings ÷ invested capital — 10% attractive, 6% acceptable behind a strong brand</p></div>
-        <b className={oe.roic >= 10 ? "ok" : ""}>{rate(oe.roic)}</b>
+        <div><h3>Owner earnings evidence</h3></div>
+        <b>Estimate only</b>
       </div>
+      {trend && (
+        <div className="snapshot-grid owner-earnings-summary">
+          <Metric label={`FY${oe.fiscal_year} maintenance≈D&A estimate / share`}
+                  value={moneyPrice(latest?.perShare)} />
+          <Metric label={`FY${trend.firstFiscalYear}–FY${trend.latestFiscalYear} CAGR`}
+                  value={rate(trend.cagr)} />
+          <Metric label="Years increased"
+                  value={trend.comparableSteps ? `${trend.yearsIncreased}/${trend.comparableSteps}` : "—"} />
+          <Metric label="Years growing at least 6%"
+                  value={trend.rateSteps ? `${trend.yearsAtLeastSix}/${trend.rateSteps}` : "—"} />
+          <Metric label="History available"
+                  value={`${trend.yearsPresent}/${trend.yearsExpected} years`} />
+        </div>
+      )}
       <table className="criteria-clean">
         <thead><tr><th>Component</th><th className="num">FY{oe.fiscal_year}</th></tr></thead>
         <tbody>
           {oe.components.map(([label, value]) => (
             <tr key={label}><td><b>{label}</b></td><td className="num">{money(value)}</td></tr>
           ))}
-          <tr><td><b>Owner earnings</b></td><td className="num">{money(oe.owner_earnings)}</td></tr>
-          <tr><td><b>Invested capital</b><small>assets less cash, short-term investments and non-interest-bearing current liabilities</small></td>
+          <tr><td><b>All-capex floor</b></td>
+              <td className="num">{money(oe.all_capex_floor)}</td></tr>
+          <tr><td><b>Maintenance≈D&amp;A estimate</b></td>
+              <td className="num">{money(oe.maintenance_estimate)}</td></tr>
+          <tr><td><b>Standard free cash flow</b></td>
+              <td className="num">{money(oe.free_cash_flow)}</td></tr>
+          <tr><td><b>Invested capital</b></td>
               <td className="num">{money(oe.invested_capital)}</td></tr>
-          <tr><td><b>Return on invested capital</b></td><td className="num">{rate(oe.roic)}</td></tr>
-          <tr><td><b>…with maintenance capex assumed equal to depreciation</b></td>
-              <td className="num">{rate(oe.roic_maintenance)}</td></tr>
+          <tr><td><b>All-capex floor / invested capital</b></td>
+              <td className="num">{rate(oe.all_capex_return)}</td></tr>
+          <tr><td><b>Maintenance≈D&amp;A estimate / invested capital</b></td>
+              <td className="num">{rate(oe.maintenance_estimate_return)}</td></tr>
         </tbody>
       </table>
-      {oe.caveats?.length > 0 && (
-        <ul className="disclosure-notes">{oe.caveats.map((c, i) => <li key={i}>{c}</li>)}</ul>
+      {trend && (
+        <div className="annual-history-scroll owner-earnings-history">
+          <table className="annual-history-table">
+            <thead><tr><th>Fiscal year</th><th className="num">Maintenance≈D&amp;A estimate / share</th>
+              <th className="num">YoY</th><th className="num">All-capex floor / share</th>
+              <th className="num">FCF / share</th>
+              <th className="num">Diluted shares</th></tr></thead>
+            <tbody>
+              {trend.rows.map(({ fiscalYear, cell, perShare, yoy }) => (
+                <tr key={fiscalYear} className={perShare != null && perShare < 0 ? "loss" : ""}>
+                  <td><b>FY{fiscalYear}</b>{fiscalYear === oe.fiscal_year && <small>latest completed</small>}</td>
+                  <td className="num">{moneyPrice(perShare)}</td>
+                  <td className="num">{signedPercent(yoy)}</td>
+                  <td className="num">{moneyPrice(cell?.all_capex_floor_per_share)}</td>
+                  <td className="num">{moneyPrice(cell?.free_cash_flow_per_share)}</td>
+                  <td className="num">{shareCount(cell?.diluted_shares)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </section>
   );
@@ -353,6 +431,7 @@ const SOURCE_LABELS = {
   preferred_stock: "Preferred stock", temporary_equity: "Temporary equity",
   noncontrolling_interest: "Noncontrolling interest", shares: "Shares outstanding",
   dividend: "Dividend paid (tagged period)",
+  recurring_dividend_per_share: "Recurring dividend / share (annualized)",
 };
 
 /** The filing's index page, which names its primary document — not the bare
@@ -497,4 +576,10 @@ function moneyPrice(value) {
   const absolute = Math.abs(value);
   if (absolute < 1) return `${sign}$${absolute.toFixed(3)}`;
   return `${sign}$${absolute.toFixed(2)}`;
+}
+function shareCount(value) {
+  if (!(value > 0)) return "—";
+  for (const [divisor, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]])
+    if (value >= divisor) return `${number(value / divisor)}${suffix}`;
+  return number(value);
 }

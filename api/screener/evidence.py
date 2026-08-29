@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass
 
 from . import store
-from .sources import dera
+from .sources import cover, dera
 
 
 @dataclass(frozen=True)
@@ -44,16 +44,42 @@ class EvidenceLoader:
             for security in securities
         }
 
+    def identity(self, cik: str, ticker: str | None) -> tuple[str, dict | None]:
+        """Resolve the priced security without reading the large fact files.
+
+        Bulk derivation can do this small lookup in the parent process, then send
+        only immutable identity data to process workers.
+        """
+        ticker = ticker or self._stored_tickers.get(cik) or cik
+        receipt = self._covers.get((cik, ticker))
+        title = (receipt or {}).get("title") or ""
+        # Parser bugs used to let a note/debt row overwrite the common cover
+        # (HON/PPG), or an unlisted starred ordinary row overwrite the ADS (LX).
+        # Those cached descriptions contradict the security being priced; they
+        # are missing evidence, not authority to use the wrong share basis.
+        if receipt and title and (not cover.is_common_equity_security(title)
+                                  or cover.is_untraded_underlying(title)):
+            receipt = None
+        if receipt and not receipt.get("ratio"):
+            # Parser improvements must apply to the title already preserved in
+            # SQLite; repairing code may not refetch immutable filings. AMBO's
+            # stored title says one ADS represents twenty ordinary shares, but an
+            # older grammar missed the parenthetical wording and persisted NULL.
+            inferred = cover.depositary_ratio(receipt.get("title") or "")
+            if inferred:
+                receipt = {**receipt, "ratio": str(inferred)}
+        return ticker, receipt
+
     def load(self, cik: str, ticker: str | None,
              facts: dict | None = None) -> EvidenceBundle:
         if facts is None:
             path = self.edgar.cache_dir / f"companyfacts_{cik}.json"
             facts = json.loads(path.read_text()) if path.exists() else self.edgar.company_facts(cik)
-        ticker = ticker or self._stored_tickers.get(cik) or cik
+        ticker, receipt = self.identity(cik, ticker)
         return EvidenceBundle(
             cik=cik,
             ticker=ticker,
             facts=facts,
             dimensioned=dera.load_sidecar(self.edgar.cache_dir, cik),
-            receipt=self._covers.get((cik, ticker)),
+            receipt=receipt,
         )

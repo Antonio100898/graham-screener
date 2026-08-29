@@ -1,9 +1,15 @@
 """Store and price-application tests — no network."""
 import json
-
-from screener import store
-from screener.sync import apply_price, material_events, _restate_historical_ratios
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+
+import pytest
+
+from screener import store, sync
+from screener.models import Quote
+from screener.sources.prices import YahooPriceProvider
+from screener.sync import (apply_price, material_events, _restate_historical_ratios,
+                           _validated_price_history)
 
 
 def row(ttm=5.0, tbvps=10.0, others="PASS"):
@@ -23,6 +29,12 @@ def test_receipt_rebases_historical_per_share_books_only():
     _restate_historical_ratios(ratios, Decimal("3"))
     assert ratios[2025] == {"bvps": 12.0, "tbvps": 9.0, "ncavps": 3.0,
                             "return_on_book": 12.0, "award_pct": 5.0}
+
+
+def test_fractional_receipt_rebases_historical_books_too():
+    ratios = {2025: {"bvps": 4.0, "tbvps": 3.0, "ncavps": 1.0}}
+    _restate_historical_ratios(ratios, Decimal("0.4"))
+    assert ratios[2025] == pytest.approx({"bvps": 1.6, "tbvps": 1.2, "ncavps": 0.4})
 
 
 def test_price_settles_valuation_criteria():
@@ -56,13 +68,19 @@ def test_missing_price_leaves_criteria_unknown():
 
 def test_unlisted_security_refuses_a_quote_for_its_old_symbol():
     r = row(ttm=5.0, tbvps=40.0)
-    r.update(listed=None, price=40.0, price_asof="2026-08-23T12:00:00+00:00")
+    r.update(
+        listed=None, price=40.0, price_asof="2026-08-23T12:00:00+00:00",
+        price_session="PRE", market_state="PRE", market_timezone="America/New_York",
+        market_state_asof="2026-08-23T12:01:00+00:00", price_source="yahoo",
+    )
 
     out = apply_price(r, price=40.0)
 
     by_n = {c["n"]: c for c in out["criteria"]}
     assert "price" not in out
     assert "price_asof" not in out
+    assert not ({"price_session", "market_state", "market_timezone",
+                 "market_state_asof", "price_source"} & set(out))
     assert by_n[1]["status"] == "INSUFFICIENT_DATA" and by_n[1]["value"] is None
     assert by_n[7]["status"] == "INSUFFICIENT_DATA" and by_n[7]["value"] is None
     assert out["verdict"] == "INDETERMINATE"
@@ -90,6 +108,291 @@ def test_store_roundtrip_and_staleness(tmp_path):
     # snapshots below the current engine version are recomputed, not refetched
     conn.execute("UPDATE snapshot SET engine_version = 0")
     assert store.needs_recompute(conn) == ["0000000001"]
+
+
+def test_pending_filing_keeps_recomputed_last_complete_snapshot_and_retries(tmp_path):
+    conn = store.connect(tmp_path / "pending.db")
+    store.upsert_company(conn, "0000000001", "TEST", "Test company",
+                         last_filing="2026-08-27", facts_synced=True)
+    pending = {
+        "cik": "0000000001", "ticker": "TEST", "criteria": [],
+        "data_pending": {
+            "kind": "SEC_FACTS_PENDING", "filed": "2026-08-27",
+            "accession": "new26", "note": "structured facts pending",
+        },
+    }
+
+    store.put_snapshot(conn, "0000000001", "pending_facts", pending)
+    stored = conn.execute(
+        "SELECT status, engine_version, data FROM snapshot WHERE cik = ?",
+        ("0000000001",)).fetchone()
+    assert stored["status"] == "ok"
+    assert stored["engine_version"] == store.ENGINE_VERSION
+    assert json.loads(stored["data"])["data_pending"]["accession"] == "new26"
+    assert store.needs_refetch(conn) == ["0000000001"]
+
+    settled = {"cik": "0000000001", "ticker": "TEST", "criteria": []}
+    store.put_snapshot(conn, "0000000001", "ok", settled)
+    assert store.needs_refetch(conn) == []
+    assert conn.execute("SELECT COUNT(*) FROM pending_filing").fetchone()[0] == 0
+
+
+def test_zero_and_non_usd_provider_quotes_are_missing_not_prices():
+    now = int(datetime.now(tz=timezone.utc).timestamp())
+    assert YahooPriceProvider._quote_from({
+        "meta": {"regularMarketPrice": 0, "regularMarketTime": now, "currency": "USD"}
+    }) is None
+    assert YahooPriceProvider._quote_from({
+        "meta": {"regularMarketPrice": 10, "regularMarketTime": now, "currency": "EUR"}
+    }) is None
+    assert YahooPriceProvider._quote_from({
+        "meta": {"regularMarketPrice": 10, "regularMarketTime": now, "currency": "USD"}
+    }).price == Decimal("10")
+
+
+def test_provider_prefers_newer_premarket_bar_and_discloses_market_state():
+    pre_start = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc)
+    pre_end = datetime(2026, 8, 28, 13, 30, tzinfo=timezone.utc)
+    regular_end = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+    post_end = datetime(2026, 8, 29, 0, 0, tzinfo=timezone.utc)
+    regular_quote = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+    premarket_bar = datetime(2026, 8, 28, 13, 5, tzinfo=timezone.utc)
+    result = {
+        "meta": {
+            "regularMarketPrice": 61.47,
+            "regularMarketTime": int(regular_quote.timestamp()),
+            "currency": "USD",
+            "exchangeTimezoneName": "America/New_York",
+            "currentTradingPeriod": {
+                "pre": {"start": int(pre_start.timestamp()), "end": int(pre_end.timestamp())},
+                "regular": {"start": int(pre_end.timestamp()), "end": int(regular_end.timestamp())},
+                "post": {"start": int(regular_end.timestamp()), "end": int(post_end.timestamp())},
+            },
+        },
+        "timestamp": [int(premarket_bar.timestamp())],
+        "indicators": {"quote": [{"close": [52.75]}]},
+    }
+
+    quote = YahooPriceProvider._quote_from(
+        result, now=datetime(2026, 8, 28, 13, 10, tzinfo=timezone.utc)
+    )
+
+    assert quote.price == Decimal("52.75")
+    assert quote.asof == premarket_bar
+    assert quote.session == "PRE"
+    assert quote.market_state == "PRE"
+    assert quote.market_timezone == "America/New_York"
+    assert quote.market_state_asof == datetime(2026, 8, 28, 13, 10, tzinfo=timezone.utc)
+
+
+def test_closed_market_keeps_last_after_hours_price_but_says_closed():
+    start = datetime(2026, 8, 28, 13, 30, tzinfo=timezone.utc)
+    regular_end = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+    post_end = datetime(2026, 8, 29, 0, 0, tzinfo=timezone.utc)
+    result = {
+        "meta": {
+            "regularMarketPrice": 50,
+            "regularMarketTime": int(regular_end.timestamp()) - 1,
+            "currency": "USD",
+            "currentTradingPeriod": {
+                "pre": {"start": int(start.timestamp()) - 60, "end": int(start.timestamp())},
+                "regular": {"start": int(start.timestamp()), "end": int(regular_end.timestamp())},
+                "post": {"start": int(regular_end.timestamp()), "end": int(post_end.timestamp())},
+            },
+        },
+        "timestamp": [int(post_end.timestamp()) - 60],
+        "indicators": {"quote": [{"close": [51.25]}]},
+    }
+
+    quote = YahooPriceProvider._quote_from(
+        result, now=datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc)
+    )
+
+    assert quote.price == Decimal("51.25")
+    assert quote.session == "POST"
+    assert quote.market_state == "CLOSED"
+
+
+def test_no_extended_trade_keeps_regular_quote_while_premarket_is_open():
+    pre_start = datetime(2026, 8, 28, 8, 0, tzinfo=timezone.utc)
+    regular_start = datetime(2026, 8, 28, 13, 30, tzinfo=timezone.utc)
+    regular_end = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+    regular_quote = datetime(2026, 8, 27, 20, 0, tzinfo=timezone.utc)
+    result = {
+        "meta": {
+            "regularMarketPrice": 10,
+            "regularMarketTime": int(regular_quote.timestamp()),
+            "currency": "USD",
+            "currentTradingPeriod": {
+                "pre": {"start": int(pre_start.timestamp()), "end": int(regular_start.timestamp())},
+                "regular": {"start": int(regular_start.timestamp()), "end": int(regular_end.timestamp())},
+            },
+        },
+        "timestamp": [],
+        "indicators": {"quote": [{"close": []}]},
+    }
+
+    quote = YahooPriceProvider._quote_from(
+        result, now=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+    )
+
+    assert quote.price == Decimal("10")
+    assert quote.session == "REGULAR"
+    assert quote.market_state == "PRE"
+
+
+def test_provider_carries_declared_split_events_with_the_price_history(monkeypatch):
+    stamp = int(datetime(2026, 8, 22, tzinfo=timezone.utc).timestamp())
+    provider = YahooPriceProvider()
+    monkeypatch.setattr(provider, "_chart", lambda *_, **__: {
+        "meta": {"regularMarketPrice": 10, "regularMarketTime": stamp, "currency": "USD"},
+        "timestamp": [stamp],
+        "indicators": {"quote": [{"close": [10]}]},
+        "events": {"splits": {str(stamp): {
+            "date": stamp, "numerator": 1, "denominator": 10,
+        }}},
+    })
+
+    history = provider.history("TEST")
+    provider._http.close()
+
+    assert history.splits == ((date(2026, 8, 22), Decimal("10")),)
+
+
+def test_history_requests_extended_bars_only_for_intraday_quote(monkeypatch):
+    stamp = int(datetime(2026, 8, 28, tzinfo=timezone.utc).timestamp())
+    calls = []
+    provider = YahooPriceProvider()
+
+    def fake_chart(ticker, range_, interval, include_pre_post=False):
+        calls.append((range_, interval, include_pre_post))
+        return {
+            "meta": {"regularMarketPrice": 10, "regularMarketTime": stamp, "currency": "USD"},
+            "timestamp": [stamp],
+            "indicators": {"quote": [{"close": [10]}]},
+        }
+
+    monkeypatch.setattr(provider, "_chart", fake_chart)
+    history = provider.history("TEST")
+    provider._http.close()
+
+    assert history is not None
+    assert calls == [("5y", "1wk", False), ("1d", "5m", True)]
+
+
+def test_quote_only_export_updates_all_rows_and_retains_a_dated_quote_on_failure(
+        tmp_path, monkeypatch):
+    dashboard = tmp_path / "dashboard.json"
+    dashboard.write_text(json.dumps({"rows": [
+        {"cik": "1", "price": 1, "price_asof": "2026-08-27T20:00:00+00:00",
+         "index_memberships": ["S&P 500"]},
+        {"cik": "2", "price": 2, "price_asof": "2026-08-27T20:00:00+00:00",
+         "index_memberships": ["Nasdaq Comp"]},
+    ]}), encoding="utf-8")
+    rows = [
+        {"cik": "1", "ticker": "ONE", "listed": "y"},
+        {"cik": "2", "ticker": "TWO", "listed": "y"},
+    ]
+    states = {}
+
+    class Connection:
+        def commit(self):
+            pass
+
+    class Provider:
+        closed = False
+
+        def quote(self, ticker):
+            if ticker == "TWO":
+                return None
+            stamp = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+            return Quote(price=Decimal("10"), asof=stamp, source="test",
+                         session="REGULAR", market_state="CLOSED",
+                         market_timezone="America/New_York", market_state_asof=stamp)
+
+        def history(self, ticker):
+            raise AssertionError("hourly refresh must not fetch five-year history")
+
+        def close(self):
+            self.closed = True
+
+    provider = Provider()
+    monkeypatch.setattr(sync, "DASHBOARD_JSON", dashboard)
+    monkeypatch.setattr(sync, "YahooPriceProvider", lambda: provider)
+    monkeypatch.setattr(sync.store, "needs_recompute", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(sync.store, "dashboard_rows", lambda _conn: rows)
+    monkeypatch.setattr(sync.store, "price_history", lambda *_args: [])
+    monkeypatch.setattr(sync.store, "set_state", lambda _conn, key, value: states.__setitem__(key, value))
+    monkeypatch.setattr(sync, "apply_price", lambda row_, _price: row_)
+    monkeypatch.setattr(sync, "_price_stats_row", lambda _row, _closes: None)
+    monkeypatch.setattr(sync, "_mark_peer_efficiency", lambda _rows: None)
+    monkeypatch.setattr(sync.profiles, "enrich", lambda _row: {})
+    monkeypatch.setattr(sync, "_price_the_ratio_history", lambda _row, _closes: None)
+
+    sync.quotes(Connection(), progress=lambda *_args: None)
+
+    payload = json.loads(dashboard.read_text(encoding="utf-8"))
+    by_cik = {row_["cik"]: row_ for row_ in payload["rows"]}
+    assert by_cik["1"]["price"] == 10
+    assert by_cik["1"]["index_memberships"] == ["S&P 500"]
+    assert "quote_refresh_warning" not in by_cik["1"]
+    assert by_cik["2"]["price"] == 2
+    assert by_cik["2"]["price_asof"] == "2026-08-27T20:00:00+00:00"
+    assert by_cik["2"]["index_memberships"] == ["Nasdaq Comp"]
+    assert by_cik["2"]["quote_refresh_warning"]["kind"] == "QUOTE_REFRESH_FAILED"
+    assert states["last_quote_refresh_updated"] == "1"
+    assert states["last_quote_refresh_failed"] == "1"
+    assert provider.closed is True
+    assert not dashboard.with_suffix(".json.tmp").exists()
+
+
+def test_history_rejects_unexplained_rescaling_and_truncation():
+    fetched = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    old = tuple((date(2026, 1, 1) + timedelta(days=7 * i), Decimal("10"))
+                for i in range(30))
+    rescaled = tuple((day, value * 10) for day, value in old)
+    accepted, warning = _validated_price_history(fetched, old, rescaled)
+    assert accepted is None and "without matching split" in warning
+
+    accepted, warning = _validated_price_history(fetched, old, old[-5:])
+    assert accepted is None and ("oldest coverage" in warning or "observations" in warning)
+
+
+def test_history_accepts_a_corroborated_reverse_split_restatement():
+    fetched = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    split_day = date(2026, 8, 22)
+    old = tuple((date(2026, 7, 1) + timedelta(days=7 * i), Decimal("2"))
+                for i in range(8))
+    new = tuple((day, value * (10 if day < split_day else 1)) for day, value in old)
+
+    accepted, warning = _validated_price_history(
+        fetched, old, new, ((split_day, Decimal("10")),))
+
+    assert warning is None
+    assert accepted == new
+
+
+def test_routine_recompute_defers_ineligible_cache_rows_until_they_can_surface(tmp_path):
+    conn = store.connect(tmp_path / "t.db")
+    companies = (
+        ("0000000001", "ACTIVE"),
+        ("0000000002", None),
+        ("0000000003", "PREF-PA"),
+    )
+    for cik, ticker in companies:
+        store.upsert_company(conn, cik, ticker, f"Company {cik}")
+        store.put_snapshot(conn, cik, "ok", {"cik": cik})
+    conn.execute("UPDATE snapshot SET engine_version = 0")
+
+    assert store.needs_recompute(conn) == [cik for cik, _ in companies]
+    assert store.needs_recompute(conn, eligible_only=True) == ["0000000001"]
+
+    # A later SEC mapping makes the deferred filer actionable before export.
+    store.upsert_company(conn, "0000000002", "NEW", "Newly listed")
+    assert store.needs_recompute(conn, eligible_only=True) == [
+        "0000000001", "0000000002"]
+    assert store.stats(conn)["stale"] == 2
+    assert store.stats(conn)["deferred_stale"] == 1
 
 
 def test_known_ticker_without_filings_is_not_queued(tmp_path):
@@ -213,12 +516,28 @@ def test_row_carries_per_figure_provenance_and_series_mix():
         if not e["start"].startswith("2021")])
     gaap["EarningsPerShareBasicAndDiluted"] = tagdata("USD/shares", [
         dur("2021-01-01", "2021-12-31", 3.0, accn="k21", filed="2022-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2024-01-01", "2024-12-31", 9.8e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 9.6e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
+        dur("2025-07-01", "2025-09-30", 0.20, form="10-Q", accn="q325"),
+        dur("2025-10-01", "2025-12-31", 0.20, accn="k25"),
+        dur("2026-01-01", "2026-03-31", 0.20, form="10-Q", accn="q126"),
+    ])
     status, row = _derive("0000000001", "TEST", facts_doc(gaap))
     assert status == "ok"
     src = row["sources"]["total_assets"]
     assert src["tag"] == "us-gaap:Assets"
     assert src["form"] and src["accn"] and src["end"]
     assert row["sources"]["goodwill"]["tag"] == "us-gaap:Goodwill"
+    assert row["annual_weighted_shares"]["2025"] == 9.6e9
+    assert row["sources"]["weighted_shares"]["tag"] == (
+        "us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding")
+    recurring = row["sources"]["recurring_dividend_per_share"]
+    assert recurring["start"] == "2026-01-01"
+    assert recurring["end"] == "2026-03-31"
+    assert recurring["unit"] == "USD/shares"
     mix = row["series_mix"]["eps"]
     assert mix["us-gaap:EarningsPerShareBasicAndDiluted"] == [2021]
     assert 2025 in mix["us-gaap:EarningsPerShareDiluted"]
@@ -321,10 +640,24 @@ def test_a_yield_above_par_is_not_published():
     """29 rows shipped a yield over 100%, topping at 2,240,506%. The engine refuses
     them; the export pass was publishing them regardless."""
     r = row(ttm=5.0, tbvps=10.0)
-    r["dividend_per_share"] = 1770000.0
+    r["recurring_dividend_per_share"] = 1770000.0
     out = apply_price(r, price=79.0)
     c5 = {x["n"]: x for x in out["criteria"]}[5]
     assert c5["value"] is None and "not meaningful" in c5["note"]
+
+
+def test_price_uses_recurring_dividend_and_discloses_special_inclusive_cash():
+    r = row(ttm=5.0, tbvps=10.0)
+    r["dividend_per_share"] = 4.40
+    r["recurring_dividend_per_share"] = 1.40
+    r["sources"] = {"recurring_dividend_per_share": {"end": "2026-05-02"}}
+
+    out = apply_price(r, price=43.48)
+
+    c5 = {x["n"]: x for x in out["criteria"]}[5]
+    assert c5["value"] == 3.22
+    assert "special dividends excluded" in c5["note"]
+    assert "trailing cash was $4.40" in c5["note"]
 
 
 def test_profitability_is_grahams_two_ratios_on_one_fiscal_year():
@@ -388,15 +721,61 @@ def test_the_cover_parser_reads_the_ratio_the_data_cannot_carry():
         "American Depositary Shares, each representing three ordinary shares") == 3
     assert cover.depositary_ratio(
         "American Depository Shares, each representing 2,000 Ordinary Shares") == 2000
+    assert cover.depositary_ratio(
+        "American depositary shares (one American depositary share representing "
+        "twenty Class A Ordinary Shares, par value $0.003 per share)") == 20
+    assert cover.depositary_ratio(
+        "Series B common shares, in the form of American Depositary Shares each "
+        "representing one Series B share") == 1
+    assert cover.depositary_ratio(
+        "American Depositary Shares (as evidenced by American Depositary Receipts), "
+        "each representing 2,000 shares of Common Stock") == 2000
+    assert cover.depositary_ratio(
+        "American Depositary Shares each representing 1 share") == 1
     # an ordinary class says nothing about a ratio, which is the answer for most filers
     assert cover.depositary_ratio("Common Stock, $0.25 Par Value") is None
     assert cover.depositary_ratio("1.875% Notes Due 2026") is None
+    assert cover.is_depositary_security("American Depositary Shares") is True
+    assert cover.is_depositary_security("American Depository Receipts") is True
+    assert cover.is_depositary_security("Ordinary Shares") is False
+    assert cover.is_common_equity_security("Class A shares, no par value") is True
+    assert cover.is_common_equity_security("Common Units representing limited partner interests") is True
+    assert cover.is_common_equity_security("Credit Suisse Gold Shares ETNs due 2033") is False
+    assert cover.is_common_equity_security("Preferred shares, par value $0.01") is False
 
     page = ("Title of each class American Depositary Shares, each representing 13 Ordinary "
             "Shares, par value $0.0001 per share Trading Symbol(s) ONC Name of each exchange")
     assert cover.securities(page) == [
         {"title": "American Depositary Shares, each representing 13 Ordinary Shares, "
                   "par value $0.0001 per share", "symbol": "ONC"}]
+
+    # NYSE renders preferred tickers with spaces. Truncating "GLP pr B" to GLP
+    # made this second class overwrite the common-unit cover record.
+    multi = (
+        "Title of 12(b) Security Common Units representing limited partner interests "
+        "Trading Symbol GLP Security Exchange Name NYSE "
+        "Title of 12(b) Security 9.50% Series B Fixed Rate Cumulative Redeemable "
+        "Trading Symbol GLP pr B Security Exchange Name NYSE"
+    )
+    assert cover.securities(multi) == [
+        {"title": "Common Units representing limited partner interests", "symbol": "GLP"},
+        {"title": "9.50% Series B Fixed Rate Cumulative Redeemable", "symbol": "GLP pr B"},
+    ]
+
+    # LX's 20-F repeats the ADS symbol on the unlisted ordinary-share row. The
+    # database can hold only one exact symbol, and the ADS is what NASDAQ prices.
+    duplicate = (
+        "Title of 12(b) Security American depositary shares (one American "
+        "depositary share representing two Class A ordinary shares) "
+        "Trading Symbol LX Security Exchange Name NASDAQ "
+        "Title of 12(b) Security Class A ordinary shares* "
+        "Trading Symbol LX Security Exchange Name NASDAQ"
+    )
+    assert cover.securities(duplicate) == [{
+        "title": ("American depositary shares (one American depositary share "
+                  "representing two Class A ordinary shares)"),
+        "symbol": "LX",
+    }]
 
 
 def test_an_award_total_says_which_kinds_it_contains():
@@ -683,6 +1062,21 @@ def test_a_registration_statement_does_not_supersede_a_periodic_report():
     # ...but a 10-Q carrying the same period does supersede it
     facts["facts"]["us-gaap"]["LineOfCredit"]["units"]["USD"][1]["form"] = "10-Q"
     assert len(_one_moment(row, facts)) == 1
+
+
+def test_a_newer_non_usd_fact_does_not_supersede_the_selected_usd_component():
+    from screener.audit import _one_moment
+    facts = {"facts": {"us-gaap": {"FinanceLeaseLiabilityCurrent": {"units": {
+        "USD": [{"end": "2024-12-31", "val": 10, "accn": "a", "form": "20-F"}],
+        "CNY": [{"end": "2025-12-31", "val": 70, "accn": "b", "form": "20-F"}],
+    }}}}}
+    row = {"sources": {"short_term_debt": {
+        "end": "2025-12-31",
+        "components": [{"tag": "us-gaap:FinanceLeaseLiabilityCurrent",
+                        "end": "2024-12-31"}],
+    }}}
+
+    assert _one_moment(row, facts) == []
 
 
 def test_a_declared_scale_the_statement_contradicts_is_not_a_wrong_figure():

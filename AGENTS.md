@@ -30,8 +30,16 @@ dasd
   failures -> `NEAR-PASS`/`CLOSE`. A measured `FAIL` outranks `INDETERMINATE`.
 - Refetch only for new filings. For engine changes, bump `store.ENGINE_VERSION`
   and run `make derive`; do not refetch to repair a code defect.
+- Routine derive/export recomputes every ticker-eligible snapshot and defers
+  tickerless or preferred-only cache rows until they can enter the dashboard.
+  Use `make derive-all` only for exhaustive cache maintenance.
 - Instant facts more than 400 days older than the balance sheet are missing.
   Fundamentals more than 450 days older than the quote withhold price criteria.
+- Current 20-F/40-F filers enter only when the annual filing carries a USD US-GAAP
+  or standard IFRS balance sheet and its current cover exactly matches the ticker
+  to supported common equity. A depositary security also requires a positive
+  filing-backed underlying-shares-per-receipt ratio; non-USD statements stay
+  unsupported.
 - Every extracted figure carries provenance: tag, form, accession, and period end.
   New figures must preserve it. Disclose assumptions and weaker tags in the
   payload rather than silently guessing.
@@ -72,7 +80,8 @@ before treating it as release-ready.
 ```sh
 make install   # create api/.venv and install Python and Node dependencies
 make test      # Python and web tests
-make derive    # recompute snapshots after an engine change, without refetching
+make derive    # recompute dashboard-eligible snapshots, without refetching
+make derive-all # recompute every cached snapshot, including deferred filers
 make export    # add live prices and rebuild dashboard.json
 make dev       # FastAPI on :8000 and Vite on :5173
 ```

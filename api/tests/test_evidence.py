@@ -1,5 +1,6 @@
 """Evidence assembly and invalidation — the boundary shared by every pipeline."""
 import json
+import zipfile
 
 from screener import evidence, store
 from screener.sources import dera
@@ -51,6 +52,55 @@ def test_loader_uses_stored_symbol_when_current_sec_mapping_is_absent(tmp_path):
     assert bundle.receipt["title"] == "Class A common stock"
 
 
+def test_loader_reinterprets_a_stored_cover_title_without_refetching(tmp_path):
+    """A parser repair applies to immutable evidence already in SQLite. AMBO's
+    title always said 20 ordinary shares per ADS; only the old grammar missed it."""
+    cik, ticker = "0000000001", "AMBO"
+    facts = {"facts": {"us-gaap": {}}}
+    conn = store.connect(tmp_path / "store.db")
+    store.set_cover(conn, cik, [{
+        "symbol": ticker,
+        "title": ("American depositary shares (one American depositary share "
+                  "representing twenty Class A Ordinary Shares)"),
+        "ratio": None,
+    }], "accn-1")
+
+    bundle = evidence.EvidenceLoader(conn, EdgarStub(tmp_path)).load(cik, ticker, facts)
+
+    assert bundle.receipt["ratio"] == "20"
+
+
+def test_store_prefers_the_priced_equity_when_cover_rows_share_a_symbol(tmp_path):
+    conn = store.connect(tmp_path / "store.db")
+    store.set_cover(conn, "0000000001", [
+        {"symbol": "LX", "title": "Class A ordinary shares*", "ratio": None},
+        {"symbol": "LX", "title": "American Depositary Shares, each representing "
+         "2 Class A ordinary shares", "ratio": 2},
+    ], "accn-1")
+
+    saved = store.cover_for(conn, "0000000001", "LX")
+    assert saved["ratio"] == "2"
+    assert saved["title"].startswith("American Depositary")
+
+
+def test_loader_rejects_stale_noncommon_or_unlisted_cover_collisions(tmp_path):
+    conn = store.connect(tmp_path / "store.db")
+    # Insert directly to reproduce rows damaged by the pre-fix parser; the fixed
+    # set_cover() would no longer persist either collision over the priced class.
+    conn.execute(
+        "INSERT INTO security_cover (cik, symbol, accn, title, read_at) VALUES (?, ?, ?, ?, ?)",
+        ("0000000001", "HON", "a1", "2.800% Senior Notes due 2030", store._now()),
+    )
+    conn.execute(
+        "INSERT INTO security_cover (cik, symbol, accn, title, read_at) VALUES (?, ?, ?, ?, ?)",
+        ("0000000002", "LX", "a2", "Class A ordinary shares*", store._now()),
+    )
+
+    loader = evidence.EvidenceLoader(conn, EdgarStub(tmp_path))
+    assert loader.identity("0000000001", "HON")[1] is None
+    assert loader.identity("0000000002", "LX")[1] is None
+
+
 def test_changed_cover_invalidates_current_snapshot_until_recomputed(tmp_path):
     cik = "0000000001"
     conn = store.connect(tmp_path / "store.db")
@@ -79,3 +129,28 @@ def test_dera_merge_reports_only_real_evidence_changes(tmp_path):
 
     assert dera.merge_into_sidecars(harvested, tmp_path, quarter) == {cik}
     assert dera.merge_into_sidecars(harvested, tmp_path, quarter) == set()
+
+
+def test_dera_recognizes_ifrs_version_as_standard_and_keeps_per_share_fact(tmp_path):
+    archive = tmp_path / "2026q1.zip"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr(
+            "sub.txt",
+            "adsh\tcik\tform\tfiled\nifrs-1\t1\t20-F\t20260325\n",
+        )
+        z.writestr(
+            "num.txt",
+            "adsh\ttag\tversion\tcoreg\tvalue\tddate\tqtrs\tuom\tsegments\n"
+            "ifrs-1\tBasicEarningsLossPerShare\tifrs/2024\t\t1.25\t"
+            "20251231\t4\tUSD\tClassesOfShareCapital=ClassA;\n",
+        )
+
+    harvested = dera.harvest(
+        archive, {"0000000001"}, frozenset({"BasicEarningsLossPerShare"}),
+        frozenset({"BasicEarningsLossPerShare"}),
+    )
+
+    entries = harvested["0000000001"]["facts"]["ifrs-full"] \
+        ["BasicEarningsLossPerShare"]["units"]["USD/shares"]
+    assert entries[0]["val"] == 1.25
+    assert entries[0]["segments"] == "ClassesOfShareCapital=ClassA;"

@@ -1,12 +1,9 @@
 /** Annual accounting history, intentionally kept separate from TTM valuation data. */
-export default function AnnualFinancialHistory({ annualEps, annualNetIncome, preferred }) {
+export default function AnnualFinancialHistory({ annualEps, annualNetIncome, weightedShares }) {
   const eps = annualEps ?? {};
   const income = annualNetIncome ?? {};
-  // Earnings per share are struck on what is left for the common; the net income
-  // tag is not. Dividing one by the other without removing the preferred's share
-  // printed 3,509.6M implied shares for Occidental against a reported 999.7M.
-  const pref = preferred ?? {};
-  const years = [...new Set([...Object.keys(eps), ...Object.keys(income)])]
+  const shares = weightedShares ?? {};
+  const years = [...new Set([...Object.keys(eps), ...Object.keys(income), ...Object.keys(shares)])]
     .map(Number).filter(Number.isFinite).sort((a, b) => b - a);
   if (!years.length) return null;
   return (
@@ -14,27 +11,25 @@ export default function AnnualFinancialHistory({ annualEps, annualNetIncome, pre
       <div className="criteria-title">
         <div>
           <h3>Annual financial history</h3>
-          <p>Completed fiscal years only. Share count is implied by net income ÷ EPS and is shown as a cross-check, not a reported share-count fact.</p>
+          <p>Completed fiscal years only. Weighted shares are the reported EPS denominator, diluted where available and restated onto the priced receipt when applicable.</p>
         </div>
       </div>
       <div className="annual-history-scroll">
         <table className="annual-history-table">
           <thead>
-            <tr><th>Fiscal year</th><th className="num">EPS</th><th className="num">Net income</th><th className="num">Implied shares</th></tr>
+            <tr><th>Fiscal year</th><th className="num">EPS</th><th className="num">Net income</th><th className="num">Weighted shares</th></tr>
           </thead>
           <tbody>
             {years.map((year) => {
               const e = eps[year];
               const ni = income[year];
-              const common = ni == null ? null : ni - (pref[year] ?? 0);
-              const shares = e != null && e !== 0 && common != null ? common / e : null;
-              const validShares = shares != null && shares > 0;
+              const count = shares[year];
               return <tr key={year} className={(e != null && e < 0) || (ni != null && ni < 0) ? "loss" : ""}>
                 <td><b>FY{year}</b></td>
                 <td className="num">{e == null ? "—" : number(e)}</td>
                 <td className="num">{ni == null ? "—" : money(ni)}</td>
-                <td className="num" title={validShares ? "Earnings available to common (net income less preferred dividends) divided by EPS; this is an implied weighted share count." : "Cannot infer a meaningful share count when EPS or net income is missing, zero, or of a different sign."}>
-                  {validShares ? `${(shares / 1e6).toFixed(1)}M` : "—"}
+                <td className="num" title={count > 0 ? "Weighted-average security count behind this fiscal year's EPS; diluted where available and restated for any depositary ratio." : "No reported weighted share count for this fiscal year."}>
+                  {count > 0 ? `${(count / 1e6).toFixed(1)}M` : "—"}
                 </td>
               </tr>;
             })}

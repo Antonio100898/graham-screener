@@ -376,6 +376,33 @@ def test_a_foreign_issuer_is_told_to_read_its_cover_page():
     assert "cover" in note["text"]
 
 
+def test_a_bare_symbol_on_the_cover_does_not_answer_the_receipt_question():
+    """AMRN's cover tags its symbol but no security title. That is not evidence
+    that its statement share count and ADS price use the same basis."""
+    row = screen_row()
+    row.update(
+        incorporation="X0|United Kingdom",
+        receipt={"symbol": "AMRN", "title": "", "ratio": None, "accn": "k25"},
+    )
+    enriched = enrich(row)
+
+    note = next(n for n in enriched["context_notes"] if n["kind"] == "Depositary receipt")
+    assert "does not establish" in note["text"]
+    assert any("depositary receipt" in gap["what"] for gap in enriched["prose_gaps"])
+
+
+def test_an_unresolved_depositary_title_does_not_claim_one_to_one():
+    row = screen_row()
+    row["receipt"] = {
+        "symbol": "ADS", "title": "American Depositary Shares", "ratio": None,
+        "accn": "cover-1",
+    }
+    note = next(n for n in enrich(row)["context_notes"]
+                if n["kind"] == "Depositary receipt")
+    assert "cannot safely" in note["text"]
+    assert "one class, no depositary ratio" not in note["text"]
+
+
 def test_a_cover_count_and_a_statement_count_far_apart_name_both():
     """Zai Lab's cover states 88.6M receipts while its statements count 1,122.4M
     ordinary shares — the gap is the depositary ratio, and the note says so."""

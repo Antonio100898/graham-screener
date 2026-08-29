@@ -138,7 +138,12 @@ def harvest(zip_path: Path, ciks: set[str], tags: frozenset[str],
                 if not value:
                     continue
                 tag, version = row["tag"], row.get("version", "")
-                standard = version.startswith(("us-gaap", "dei", "srt", "ifrs-full"))
+                # DERA writes the IFRS taxonomy version as ``ifrs/2024`` while
+                # Company Facts calls the same standard namespace ``ifrs-full``.
+                # Treating ``ifrs/`` as an issuer extension dropped every small
+                # per-share fact at the extension materiality floor.
+                is_ifrs = version.startswith(("ifrs/", "ifrs-full"))
+                standard = version.startswith(("us-gaap", "dei", "srt")) or is_ifrs
                 if standard:
                     if tag not in tags:
                         continue
@@ -158,7 +163,8 @@ def harvest(zip_path: Path, ciks: set[str], tags: frozenset[str],
                          "segments": row.get("segments", "")}
                 if start is not None:
                     entry["start"] = start
-                namespace = version.split("/", 1)[0] if standard else f"ext:{version}"
+                namespace = ("ifrs-full" if is_ifrs else version.split("/", 1)[0]
+                             if standard else f"ext:{version}")
                 facts = out.setdefault(cik, {"facts": {}})["facts"]
                 entries = facts.setdefault(namespace, {}).setdefault(tag, {"units": {}}) \
                                .setdefault("units", {}).setdefault(unit, [])

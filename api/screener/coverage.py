@@ -37,7 +37,7 @@ from pathlib import Path
 from . import evidence, store
 from .normalize import (
     COMMON_INCOME_TAGS, UnsupportedFilerError, build_snapshot,
-    _annual_dollar_series, _is_financial_form,  # noqa: F401
+    _annual_dollar_series, _eps_uses_total_income, _is_financial_form,  # noqa: F401
 )
 from .sources.edgar import EdgarClient
 
@@ -67,11 +67,11 @@ RECENT_DAYS = 400
 # stuff": a family may only live here with a reason a reviewer can reject.
 OUT_OF_SCOPE = (
     (r"^NetCashProvidedByUsedIn|^CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncrease|^CashPeriodIncrease|^EffectOfExchangeRateOn",
-     "cash-flow-statement totals: no CRITERION consumes OCF (owner earnings is built from parts with provenance); operating cash flow is read for the cash-conversion context note"),
+     "cash-flow-statement totals: no CRITERION consumes OCF; operating cash flow is read for the standard-FCF lens and cash-conversion context note"),
     (r"OperatingLease|LesseeOperating|RightOfUse|LesseeDisclosure|SubleaseIncome|LeaseCost|LesseeFinanceLease|FinanceLeaseRightOfUse|FinanceLeaseInterest|FinanceLeasePrincipal|OperatingAndFinanceLease",
      "ASC 842 leases: rentals are not borrowed money under criterion 3; current portion already in LiabilitiesCurrent"),
     (r"DeferredTax|DeferredIncomeTax|IncomeTaxReconciliation|EffectiveIncomeTaxRate|UnrecognizedTaxBenefit|TaxCreditCarryforward|OperatingLossCarryforward|IncomeTaxesPaid|TaxesPayable|AccruedIncomeTaxes|IncomeTaxExaminationPenalties|TaxationExpense|TaxCutsAndJobs",
-     "tax detail: the expense line feeds owner earnings, and the deferred expense, gross/net "
+     "tax detail: the expense line and deferred expense, gross/net "
      "deferred assets and valuation allowance feed context notes; positions, carryforwards and "
      "rate reconciliations remain analysis prose"),
     (r"DefinedBenefitPlan|DefinedContributionPlan|PensionAndOtherPostretirement|OtherPostretirement|MultiemployerPlan|DeferredCompensation",
@@ -231,6 +231,9 @@ OUT_OF_SCOPE = (
      "debt components: each is read as a fallback where the filer reports no rollup, and is "
      "a part of one where it does — P&G's OtherLongTermDebt of 5,265M sits inside the 22,842M "
      "LongTermDebtNoncurrent the chain already takes, and adding both would double count"),
+    (r"^NotesPayableToBank(?:Current|Noncurrent)?$",
+     "debt components: VSTD's combined NotesPayableToBank equals its current plus noncurrent "
+     "parts and the same-date LongTermDebt total; adding any of them would double count"),
     (r"^OtherBorrowings$",
      "never-fallback registry (TAGS.md 2.3): bank-only cohort with no classified balance sheet "
      "to rescue, rejected with a counterexample and not to be re-proposed without new evidence"),
@@ -532,7 +535,13 @@ def audit_payload() -> list[str]:
                 if parent in added and child in added:
                     problems.append(f"{ticker}: {name} adds {child} to {parent}, which contains it")
             components = source.get("components") or []
-            if components:
+            # Share-basis repairs retain the reported share fact plus the EPS
+            # and income facts that prove its scale.  The latter two are audit
+            # witnesses, not arithmetic leaves named by the resulting figure.
+            witness_components = (
+                "reconciled to EPS and income" in (source.get("concept") or "")
+            )
+            if components and not witness_components:
                 leaf_tags = sorted(t for c in components
                                    for t in re.split(r" [+/-] ", c.get("tag", "")))
                 named = sorted(source.get("tag", "").split(" + "))
@@ -613,6 +622,23 @@ def _audit_constructions(ticker: str, snap) -> list[str]:
             if end and abs(end.year - year) > 1:
                 problems.append(f"{ticker}: {series_name}[{year}] carries a fact ending {end}")
     return problems
+
+
+def _identity_implied_shares(snap, common_income: dict, year: int) -> Decimal | None:
+    """Share count implied by a compatible income/EPS numerator pair.
+
+    Continuing-operations, partnership-unit and investment-company EPS do not
+    divide total net income.  Comparing those differently scoped figures made
+    HWNI and MCOM look like share-basis failures even though the validator had
+    no valid identity to test.
+    """
+    eps_fact = snap.annual_eps[year]
+    if not _eps_uses_total_income(eps_fact) or eps_fact.value == 0:
+        return None
+    common = (common_income[year].value if year in common_income else
+              snap.annual_net_income[year].value
+              - snap.annual_preferred_dividends.get(year, Decimal(0)))
+    return common / eps_fact.value
 
 
 def verify(limit: int | None = None) -> dict:
@@ -728,11 +754,7 @@ def verify(limit: int | None = None) -> dict:
             # income window with an older annual-only EPS (GIPR). EPS nets that
             # year's preferred dividends from income; the NI tag does not.
             year = shared_years[-1]
-            eps = snap.annual_eps[year].value
-            common = (common_income[year].value if year in common_income else
-                      snap.annual_net_income[year].value
-                      - snap.annual_preferred_dividends.get(year, Decimal(0)))
-            implied = common / eps if eps else None
+            implied = _identity_implied_shares(snap, common_income, year)
             actual = snap.shares_outstanding.value
             if (implied is not None and actual > 0
                     and not (Decimal("0.5") <= implied / actual <= Decimal("2"))):

@@ -50,6 +50,13 @@ class Quote:
     price: Decimal
     asof: datetime
     source: str
+    # Session which produced `price`, and the exchange state when it was fetched.
+    # They differ after the bell: the last price can be AFTER_HOURS while the
+    # market itself is now CLOSED.
+    session: str = "REGULAR"
+    market_state: str = "UNKNOWN"
+    market_timezone: str | None = None
+    market_state_asof: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -57,26 +64,54 @@ class PriceHistory:
     """Weekly closes behind the quote, oldest first — the input to pricestats."""
     quote: Quote
     closes: tuple[tuple[date, Decimal], ...]
+    # (effective date, factor applied to pre-event prices). A 2:1 forward split
+    # carries 0.5; a 1:10 reverse split carries 10.
+    splits: tuple[tuple[date, Decimal], ...] = ()
+
+
+@dataclass(frozen=True)
+class AnnualOwnerEarnings:
+    """Owner-earnings evidence for one audited year on today's share basis.
+
+    SEC XBRL normally reports total capital expenditure, not the maintenance
+    portion Buffett's definition requires.  The floor and the explicitly named
+    maintenance≈D&A estimate therefore remain separate; neither is serialized as
+    a definitive owner-earnings figure.
+    """
+    all_capex_floor: Fact
+    maintenance_estimate: Fact
+    free_cash_flow: Fact | None
+    diluted_shares: Fact
+    all_capex_floor_per_share: Fact
+    maintenance_estimate_per_share: Fact
+    free_cash_flow_per_share: Fact | None
 
 
 @dataclass(frozen=True)
 class OwnerEarnings:
-    """Buffett's owner earnings over the invested capital that produced them.
+    """Evidence around owner earnings over the capital that produced it.
 
     Never a criterion — Graham's requirements do not measure return on capital at all.
-    This is a quality lens for ranking the survivors: two companies can clear the
-    same balance-sheet tests while one compounds at 20% and the other at 4%.
+    A definitive Buffett figure requires maintenance capital expenditure and required
+    additional working capital. Primary XBRL normally supplies neither, so the model
+    carries a total-capex floor, a maintenance≈D&A estimate, and standard free cash
+    flow as three separately labelled observations instead of pretending one is exact.
     """
     fiscal_year: int
-    owner_earnings: Decimal
+    all_capex_floor: Fact
+    maintenance_estimate: Fact
+    free_cash_flow: Fact | None
     invested_capital: Decimal | None
-    roic: Decimal | None  # owner earnings / invested capital, as a percentage
+    all_capex_return: Decimal | None
+    maintenance_estimate_return: Decimal | None
     # signed contributions in statement order, so the UI can show the derivation
     components: tuple[tuple[str, Decimal], ...]
-    # ROIC if maintenance capital expenditure is assumed to equal depreciation —
-    # Buffett's own approximation, and the optimistic end of the range
-    roic_maintenance: Decimal | None = None
+    free_cash_flow_components: tuple[tuple[str, Decimal], ...]
     caveats: tuple[str, ...] = ()
+    # Each value retains the flow facts and reported diluted denominator behind it.
+    # The count is restated for later splits (and, where applicable, the traded
+    # depositary receipt) so one year's per-share figures are comparable.
+    annual: dict[int, AnnualOwnerEarnings] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,6 +140,13 @@ class FinancialSnapshot:
     dividend_per_share: Decimal | None  # rolled to twelve months, for the yield
     pays_dividend: bool | None
     balance_sheet_date: date | None
+    # A direct filing-reported quarterly common dividend rate, annualized. Unlike
+    # dividend_per_share, this deliberately excludes identifiable special cash.
+    recurring_dividend_per_share: Fact | None = None
+    # The weighted denominator each annual EPS was struck on. This is a reported
+    # filing fact, unlike total net income / EPS, which is invalid when the two
+    # figures have different scopes (continuing operations, LP allocations, BDCs).
+    annual_share_counts: dict[int, Fact] = field(default_factory=dict)
     total_debt: Fact | None = None  # total-style rollup tag; preferred over long+short when present
     # employee options still outstanding — dilution a share count does not show
     options_outstanding: Fact | None = None

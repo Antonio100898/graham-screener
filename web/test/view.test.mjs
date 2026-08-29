@@ -57,6 +57,12 @@ test("saving the scroll position leaves the filters alone", () => {
   assert.equal(v.minPositiveEps, 7);
 });
 
+test("a multi-column sort survives a reload in priority order", () => {
+  const sort = [{ key: "fit", dir: 1 }, { key: "pe", dir: 1 }];
+  saveView({ sort });
+  assert.deepEqual(loadView().sort, sort);
+});
+
 test("corrupt storage falls back to the focused Graham defaults", () => {
   store.set("screener-view", "{ not json");
   const v = loadView();

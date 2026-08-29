@@ -76,7 +76,7 @@ from operations.
 | `GainLossOnInvestments` | 18% (already read as an earnings-quality gain) |
 | `InterestExpense` | 62% |
 
-Pre-tax income is already extracted for owner earnings. The measure is
+Pre-tax income is already extracted for earnings-quality context. The measure is
 `(pretax − operating income) ÷ pretax`: how much of the profit never came from
 the business. Guard: a bank, insurer or BDC has no `OperatingIncomeLoss` by
 construction — the existing `graham_profile` already separates them, so the
@@ -302,13 +302,15 @@ percentage honestly; the customer's *name* is prose only.
 There is no XBRL concept for a moat, and there will not be one. What the
 screener already computes as evidence *of* one:
 
-- `owner_earnings.roic` — 2,978 companies carry one, 774 at 10%+.
+- `owner_earnings.all_capex_return` — a conservative floor that deducts all capex;
+  the separate maintenance≈D&A estimate is assumption-labelled.
 - `peer_efficiency` (v49) — operating margin vs the median of the company's own
   industry; 527 companies materially behind.
 - Gross margin (`GrossProfit`, 43%) stability across the 10-year series, and
   R&D intensity (`ResearchAndDevelopmentExpense`, 40%).
 
-Sustained high ROIC + above-median margin *is* the numeric footprint of a moat.
+Sustained high returns across both owner-earnings estimates plus an above-median
+margin are the numeric footprint of a moat.
 The narrative ("why can nobody take this business") is prose.
 
 ### C3. Management goals vs actual achievements — largest build, weakest provenance

@@ -6,8 +6,15 @@ import EarningsEvidence, { epsEvidence } from "./EarningsEvidence.jsx";
 import { send } from "./api.js";
 import { below, spell } from "./format.js";
 import { loadView, saveView, takeOverScrollRestoration } from "./view.js";
-import { TOTAL_CRITERIA, byN, pe3 } from "./screen.js";
-import { AlignmentCompact, alignmentRank } from "./Alignment.jsx";
+import { TOTAL_CRITERIA, byN, indexValuation, pe3 } from "./screen.js";
+import { AlignmentCompact } from "./Alignment.jsx";
+import { alignmentSortValue } from "./alignment.js";
+import { compareRows, normalizeSort, updateSort } from "./sort.js";
+import { payloadWarnings } from "./warnings.js";
+import Portfolio from "./Portfolio.jsx";
+import TradeModal from "./TradeModal.jsx";
+import { matchesPortfolio, openPortfolioCiks } from "./portfolio.js";
+import { quoteStatus, quoteTitle, quoteTone } from "./quote.js";
 
 
 // OR semantics: any typed word matching any field keeps the row. Short and
@@ -28,7 +35,7 @@ function matcher(query) {
 
 // These columns sort best-first by negating their value, so ascending order puts the
 // largest at the top. The arrow must describe what the reader sees, not the sign.
-const DESCENDING_BY_DEFAULT = new Set(["n_pass", "mcap", "ni", "trend", "offhigh", "eps10"]);
+const DESCENDING_BY_DEFAULT = new Set(["fit", "n_pass", "mcap", "ni", "trend", "offhigh", "eps10"]);
 const EPS_POSITIVE_FLOORS = [5, 6, 7, 9, 10];
 const LENSES = ["BOTH", "ENTERPRISING", "DEFENSIVE"];
 const FITS = ["ALL", "ALIGNED", "EVIDENCE_INCOMPLETE", "BLOCKED"];
@@ -49,16 +56,19 @@ function enterprisingGap(row) {
 }
 
 function Th({ id, sort, onSort, children, className = "" }) {
-  const active = sort.key === id;
-  const up = DESCENDING_BY_DEFAULT.has(id) ? sort.dir !== 1 : sort.dir === 1;
+  const priority = sort.findIndex((item) => item.key === id);
+  const active = priority !== -1;
+  const direction = active ? sort[priority].dir : 1;
+  const up = DESCENDING_BY_DEFAULT.has(id) ? direction !== 1 : direction === 1;
   return (
     <th
       className={`${className} sortable ${active ? "sorted" : ""}`}
-      onClick={() => onSort(id)}
-      title="Sort by this column"
+      onClick={(event) => onSort(id, event.shiftKey)}
+      title="Click for primary sort; Shift-click to add or toggle another column"
     >
       {children}
       <span className="arrow">{active ? (up ? "▲" : "▼") : "↕"}</span>
+      {active && sort.length > 1 && <span className="sort-priority">{priority + 1}</span>}
     </th>
   );
 }
@@ -72,6 +82,10 @@ const INDEX_SHORT = { "DJIA": "DJIA", "S&P 500": "S&P", "Nasdaq 100": "N100", "N
 const saved = loadView();
 takeOverScrollRestoration();
 
+const initialSort = normalizeSort(saved.sort).map((item) =>
+  ["grade", "ptbv"].includes(item.key) ? { key: "fit", dir: 1 } : item
+);
+
 export default function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
@@ -79,7 +93,7 @@ export default function App() {
   const [lens, setLens] = useState(saved.lens);
   const [fit, setFit] = useState(saved.fit);
   const [gaps, setGaps] = useState(saved.gaps);
-  const [sort, setSort] = useState(["grade", "ptbv"].includes(saved.sort?.key) ? { key: "fit", dir: 1 } : saved.sort);
+  const [sort, setSort] = useState(() => normalizeSort(initialSort));
   const [sectors_, setSectors] = useState(new Set(saved.sectors));
   const [profiles, setProfiles] = useState(new Set(saved.profiles));
   const [idxSel, setIdxSel] = useState(new Set(saved.indexes));
@@ -92,10 +106,17 @@ export default function App() {
   const [minRoic, setMinRoic] = useState(saved.minRoic); // return on capital, 0 = no floor
   const [selected, setSelected] = useState(null);
   const [tracked, setTracked] = useState(new Set());
+  const [trackingError, setTrackingError] = useState(null);
   const [trackedOnly, setTrackedOnly] = useState(saved.trackedOnly);
   const [hideNA, setHideNA] = useState(saved.hideNA);
   const [hideNoApply, setHideNoApply] = useState(saved.hideNoApply);
   const [belowNcav, setBelowNcav] = useState(saved.belowNcav);
+  const [page, setPage] = useState(() => window.location.hash === "#portfolio" ? "portfolio" : "screener");
+  const [portfolioData, setPortfolioData] = useState(null);
+  const [portfolioError, setPortfolioError] = useState(null);
+  const [portfolioLoading, setPortfolioLoading] = useState(true);
+  const [portfolioQ, setPortfolioQ] = useState("");
+  const [tradeTarget, setTradeTarget] = useState(null);
 
   const load = useCallback(() => {
     // cache-bust so a finished sync shows immediately rather than the stale payload
@@ -106,6 +127,25 @@ export default function App() {
   }, []);
 
   useEffect(load, [load]);
+
+  const loadPortfolio = useCallback(() => {
+    setPortfolioLoading(true);
+    fetch(`/portfolio?t=${Date.now()}`)
+      .then((response) => response.ok
+        ? response.json()
+        : response.json().catch(() => null).then((body) => Promise.reject(new Error(body?.detail ?? `HTTP ${response.status}`))))
+      .then((result) => { setPortfolioData(result); setPortfolioError(null); })
+      .catch((err) => setPortfolioError(err.message))
+      .finally(() => setPortfolioLoading(false));
+  }, []);
+
+  useEffect(() => { loadPortfolio(); }, [loadPortfolio, page]);
+
+  useEffect(() => {
+    const changed = () => setPage(window.location.hash === "#portfolio" ? "portfolio" : "screener");
+    window.addEventListener("hashchange", changed);
+    return () => window.removeEventListener("hashchange", changed);
+  }, []);
 
   useEffect(() => {
     saveView({
@@ -131,9 +171,13 @@ export default function App() {
 
   useEffect(() => {
     fetch("/tracked")
-      .then((r) => r.json())
-      .then((d) => setTracked(new Set(d.tracked.map((t) => t.cik))))
-      .catch(() => {});
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d) => {
+        if (!Array.isArray(d.tracked)) throw new Error("invalid tracking response");
+        setTracked(new Set(d.tracked.map((t) => t.cik)));
+        setTrackingError(null);
+      })
+      .catch((e) => setTrackingError(`Tracked companies could not be loaded: ${e.message}`));
   }, []);
 
   const toggleTracked = async (row, e) => {
@@ -144,11 +188,51 @@ export default function App() {
       on ? next.delete(row.cik) : next.add(row.cik);
       return next;
     });
-    await send(on ? `/tracked/${row.cik}` : "/tracked", {
-      method: on ? "DELETE" : "POST",
-      body: on ? undefined : { cik: row.cik },
-    }).catch(() => {});
+    try {
+      const response = await send(on ? `/tracked/${row.cik}` : "/tracked", {
+        method: on ? "DELETE" : "POST",
+        body: on ? undefined : { cik: row.cik },
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.tracked !== !on || result?.cik !== row.cik)
+        throw new Error(result?.detail ?? `HTTP ${response.status}: invalid tracking response`);
+      setTrackingError(null);
+    } catch (e) {
+      // The optimistic star must not claim persistence the server did not confirm.
+      setTracked((prev) => {
+        const next = new Set(prev);
+        on ? next.add(row.cik) : next.delete(row.cik);
+        return next;
+      });
+      setTrackingError(`Tracking change was not saved: ${e.message}`);
+    }
   };
+
+  const navigate = (next) => {
+    window.location.hash = next === "portfolio" ? "portfolio" : "";
+    setPage(next);
+  };
+
+  const deleteTrade = async (trade) => {
+    if (!portfolioData) return;
+    const description = `${trade.side} ${trade.quantity} ${trade.ticker} at $${trade.price}`;
+    if (!window.confirm(`Delete ${description}?\n\nThis corrects the local ledger and cannot be undone.`)) return;
+    try {
+      const response = await send(`/portfolio/${portfolioData.portfolio.id}/trades/${trade.id}`, {
+        method: "DELETE",
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.portfolio)
+        throw new Error(result?.detail ?? `HTTP ${response.status}: trade was not deleted`);
+      setPortfolioData(result.portfolio);
+      setPortfolioError(null);
+      loadPortfolio();
+    } catch (err) {
+      setPortfolioError(err.message);
+    }
+  };
+
+  const portfolioCiks = useMemo(() => openPortfolioCiks(portfolioData), [portfolioData]);
 
   const rows = useMemo(() => {
     if (!data) return [];
@@ -168,14 +252,21 @@ export default function App() {
         pncav: r.ncavps != null && r.price != null && r.ncavps > 0 ? r.price / r.ncavps : null,
         idx: r.index_memberships ?? [],
         pe3: pe3(r),
-        roic: r.owner_earnings?.roic ?? null,
+        // This is the explicitly labelled total-capex floor return, not a
+        // definitive Buffett owner-earnings return.
+        roic: r.owner_earnings?.all_capex_return ?? null,
         profile: r.graham_profile ?? "REVIEW",
+        warnings: payloadWarnings(r),
         // searched fields, flattened once: ticker, name, sector, and issuer profile
         hay: [r.ticker, r.name, r.sector, r.industry, r.exchange, r.graham_profile]
           .filter(Boolean).join(" ").toLowerCase(),
       };
     });
   }, [data]);
+
+  // This market reference deliberately ignores the filters below. It describes
+  // every S&P 500 member represented in the loaded dashboard payload.
+  const sp500 = useMemo(() => indexValuation(rows, "S&P 500"), [rows]);
 
   const view = useMemo(() => {
     const match = matcher(q);
@@ -214,11 +305,12 @@ export default function App() {
     if (hideNA) out = out.filter((r) => !r.unjudged);
     if (belowNcav) out = out.filter((r) => r.netNet);
     if (match) out = match(out);
-    const { key, dir } = sort;
     // null means "no value" — never a number. Returning Infinity here would park
     // those rows at the top as soon as the sort flipped to descending.
-    const val = (r) => {
-      if (key === "fit") return alignmentRank(r, lens);
+    const val = (r, key) => {
+      // Graham fit displays Enterprising and Defensive points together, so its
+      // sort follows that visible combined score rather than verdict labels.
+      if (key === "fit") return alignmentSortValue(r);
       if (key === "ticker") return r.ticker ?? "";
       if (key === "sector") return r.sector ?? null;
       if (key === "index") return r.idx.length ? INDEX_RANK[r.idx[0]] ?? 8 : 9;
@@ -244,16 +336,7 @@ export default function App() {
       }
       return 0;
     };
-    return out.sort((a, b) => {
-      const x = val(a), y = val(b);
-      // rows with nothing to compare always finish last, whichever way we sort
-      if (x == null || y == null) {
-        if (x == null && y == null) return (a.ticker ?? "").localeCompare(b.ticker ?? "");
-        return x == null ? 1 : -1;
-      }
-      const cmp = typeof x === "string" ? x.localeCompare(y) : x - y;
-      return cmp * dir || (a.ticker ?? "").localeCompare(b.ticker ?? "");
-    });
+    return out.sort((a, b) => compareRows(a, b, sort, val));
   }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
 
   // Counted over the rows on screen, not over all 5,893: with the app's own
@@ -266,6 +349,9 @@ export default function App() {
   const naCount = useMemo(() => view.filter((r) => r.unjudged).length, [view]);
   const netNetCount = useMemo(() => view.filter((r) => r.netNet).length, [view]);
   const noApplyCount = useMemo(() => view.filter((r) => r.inapplicable).length, [view]);
+  const portfolioMatches = useMemo(() =>
+    (portfolioData?.positions ?? []).filter((position) => matchesPortfolio(position, portfolioQ)).length,
+  [portfolioData, portfolioQ]);
 
   const metCounts = useMemo(() => {
     const c = {};
@@ -324,34 +410,60 @@ export default function App() {
     );
   if (!data) return <div className="msg">Loading universe…</div>;
 
-  const sortBy = (key) =>
-    setSort((s) => ({ key, dir: s.key === key ? -s.dir : 1 }));
+  const sortBy = (key, additive) => setSort((current) => updateSort(current, key, additive));
+  const recordTrade = (row) => setTradeTarget(row ?? {});
+
+  if (page === "portfolio") return (
+    <div className="app">
+      <AppHeader page={page} onNavigate={navigate} rows={rows} data={data}
+                 portfolioData={portfolioData} portfolioQ={portfolioQ}
+                 setPortfolioQ={setPortfolioQ} portfolioMatches={portfolioMatches} />
+      <LoadBar onFinished={() => { load(); loadPortfolio(); }} shown={rows.length} />
+      <Portfolio data={portfolioData} loading={portfolioLoading} error={portfolioError}
+                 query={portfolioQ}
+                 onRefresh={() => { load(); loadPortfolio(); }}
+                 onRecordTrade={recordTrade} onDeleteTrade={deleteTrade} />
+      {tradeTarget !== null && portfolioData && (
+        <TradeModal portfolio={portfolioData.portfolio} rows={rows}
+                    initialRow={tradeTarget.cik ? tradeTarget : null}
+                    onClose={() => setTradeTarget(null)}
+                    onSaved={(next) => { setPortfolioData(next); setTradeTarget(null); loadPortfolio(); }} />
+      )}
+    </div>
+  );
 
   return (
     <div className="app">
-      <header>
-        <div>
-          <h1>Graham Screener</h1>
-          <p className="sub">
-            {rows.length.toLocaleString()} companies · enterprising and defensive evidence · engine v{data.engine_version}
+      <AppHeader page={page} onNavigate={navigate} rows={rows} data={data}
+                 portfolioData={portfolioData} q={q} setQ={setQ} matches={view.length} />
+
+      <section className="index-valuation" aria-labelledby="sp500-valuation-title">
+        <div className="index-valuation-intro">
+          <span className="index-valuation-kicker">Market reference</span>
+          <h2 id="sp500-valuation-title">S&amp;P 500 valuation</h2>
+          <p>
+            {sp500.members.toLocaleString()} index members in this dashboard · full cohort,
+            unaffected by the filters below
           </p>
         </div>
-        <div className="searchwrap">
-        <input
-          className="search"
-          placeholder="Search…"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
-        {q.trim() && (
-          <span className="searchhint">
-            {view.length.toLocaleString()} match{view.length === 1 ? "" : "es"}
-          </span>
-        )}
+        <div className="index-valuation-metric">
+          <span>Median P/E</span>
+          <strong>{fmtMultiple(sp500.pe.median)}</strong>
+          <small>{sp500.pe.count.toLocaleString()} companies with a valid positive TTM P/E</small>
         </div>
-      </header>
+        <div className="index-valuation-metric">
+          <span>Median P/E3</span>
+          <strong>{fmtMultiple(sp500.pe3.median)}</strong>
+          <small>{sp500.pe3.count.toLocaleString()} companies · price / 3-year average EPS</small>
+        </div>
+        <p className="index-valuation-note">
+          Missing and non-positive multiples are excluded from each median, never counted as zero.
+        </p>
+      </section>
 
       <LoadBar onFinished={load} shown={rows.length} />
+
+      {trackingError && <div className="msg err">{trackingError}</div>}
 
       <div className="filters graham-controls">
         <select className="mincap lens" value={lens} onChange={(e) => setLens(e.target.value)}
@@ -399,11 +511,11 @@ export default function App() {
           ))}
         </select>
         <select className="mincap" value={minRoic} onChange={(e) => setMinRoic(Number(e.target.value))}
-                title="Owner earnings divided by invested capital. Graham's followers treat 10% as attractive and 6% as acceptable for a strong brand or a business temporarily under a cloud.">
-          <option value={0}>Any ROIC</option>
-          <option value={15}>15%+ (exceptional)</option>
-          <option value={10}>10%+ (attractive)</option>
-          <option value={6}>6%+ (acceptable)</option>
+                title="Reported earnings plus D&A less total capital expenditure, divided by invested capital. This is a conservative floor, not definitive Buffett owner earnings.">
+          <option value={0}>Any all-capex return</option>
+          <option value={15}>15%+ all-capex return</option>
+          <option value={10}>10%+ all-capex return</option>
+          <option value={6}>6%+ all-capex return</option>
         </select>
         <select className="mincap" value={minCap} onChange={(e) => setMinCap(Number(e.target.value))}>
           <option value={0}>Any size</option>
@@ -439,6 +551,7 @@ export default function App() {
         <span className="showing">
           showing {view.length.toLocaleString()} of {rows.length.toLocaleString()}
         </span>
+        <span className="sort-help">Shift-click headers to add sort</span>
       </div>
 
       <table className="grid">
@@ -460,14 +573,16 @@ export default function App() {
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
-            <Th id="roic" sort={sort} onSort={sortBy} className="num">ROIC</Th>
+            <Th id="roic" sort={sort} onSort={sortBy} className="num">
+              All-capex return<em className="sub2">floor · not definitive OE</em>
+            </Th>
             <Th id="pncav" sort={sort} onSort={sortBy} className="num">P/NCAV</Th>
           </tr>
         </thead>
         <tbody>
           {view.slice(0, 300).map((r) => (
             <tr key={r.cik} onClick={() => setSelected(r)}
-                className={tracked.has(r.cik) ? "istracked" : ""}>
+                className={`${tracked.has(r.cik) ? "istracked" : ""}${portfolioCiks.has(r.cik) ? " inportfolio" : ""}`.trim()}>
               <td className="starcol" data-label="">
                 <button className={`star-btn ${tracked.has(r.cik) ? "on" : ""}`}
                         title={tracked.has(r.cik) ? "Remove from tracked" : "Track this company"}
@@ -477,6 +592,10 @@ export default function App() {
               </td>
               <td className="tick" data-label="Ticker">
                 {r.ticker}
+                {portfolioCiks.has(r.cik) && (
+                  <span className="portfolio-mark" title="Open position in your portfolio"
+                        aria-label="In portfolio">◆</span>
+                )}
                 {r.netNet && (
                   <span className="netnetmark" title="trading at or below net current asset value">
                     net-net
@@ -487,6 +606,12 @@ export default function App() {
                         title={`Some data cannot be extracted and must be read in the filing:\n\n`
                                + r.prose_gaps.map((g) => `• ${g.what}\n  affects ${g.affects}`).join("\n\n")}>
                     check filing
+                  </span>
+                )}
+                {r.warnings.length > 0 && (
+                  <span className="warningmark"
+                        title={r.warnings.map((warning) => `${warning.kind}: ${warning.text}`).join("\n\n")}>
+                    data warning
                   </span>
                 )}
               </td>
@@ -504,7 +629,10 @@ export default function App() {
               </td>
               <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
               <td className="num" data-label="Mkt cap">{fmtCap(r.mcap)}</td>
-              <td className="num" data-label="Price">{fmtPrice(r.price)}</td>
+              <td className="num" data-label="Price" title={quoteTitle(r)}>
+                {fmtPrice(r.price)}
+                {r.price != null && <small className={`quote-session ${quoteTone(r)}`}>{quoteStatus(r)}</small>}
+              </td>
               <td className="num offhigh" data-label="Off high" title={drawdownTitle(r)}>
                 {r.price_stats?.pct_below_52w_high == null ? (
                   <span className="dim">—</span>
@@ -520,8 +648,8 @@ export default function App() {
                   title="current price over the average of the three latest annual EPS — one lucky or disastrous year moves it a third as much as it moves the TTM P/E">
                 {fmt(r.pe3)}
               </td>
-              <td className={`num${r.roic != null && r.roic >= 10 ? " ok" : ""}`} data-label="ROIC"
-                  title="owner earnings (operating profit + depreciation and amortisation − tax − capital expenditure) over invested capital — 10% is attractive, 6% acceptable behind a strong brand">
+              <td className="num" data-label="All-capex return"
+                  title="reported earnings + depreciation and amortisation − total capital expenditure, over invested capital. Growth capex is deducted, so this is a floor rather than definitive Buffett owner earnings">
                 {r.roic == null ? "—" : `${r.roic.toFixed(1)}%`}
               </td>
               <td className={`num${r.pncav != null && r.pncav <= 2 / 3 ? " ok" : ""}`} data-label="P/NCAV"
@@ -548,12 +676,56 @@ export default function App() {
 
       {selected && <Detail row={selected} onClose={() => setSelected(null)}
                            tracked={tracked.has(selected.cik)}
-                           onToggleTracked={() => toggleTracked(selected)} />}
+                           onToggleTracked={() => toggleTracked(selected)}
+                           onRecordTrade={() => recordTrade(selected)} />}
+      {tradeTarget !== null && portfolioData && (
+        <TradeModal portfolio={portfolioData.portfolio} rows={rows}
+                    initialRow={tradeTarget.cik ? tradeTarget : null}
+                    onClose={() => setTradeTarget(null)}
+                    onSaved={(next) => { setPortfolioData(next); setTradeTarget(null); }} />
+      )}
     </div>
   );
 }
 
+function AppHeader({ page, onNavigate, rows, data, portfolioData, q, setQ, matches,
+                     portfolioQ, setPortfolioQ, portfolioMatches }) {
+  const searchValue = page === "portfolio" ? portfolioQ : q;
+  const setSearch = page === "portfolio" ? setPortfolioQ : setQ;
+  const searchMatches = page === "portfolio" ? portfolioMatches : matches;
+  return (
+    <header className="app-header">
+      <div>
+        <h1>Graham Screener</h1>
+        <p className="sub">
+          {page === "portfolio"
+            ? `${portfolioData?.summary?.positions ?? 0} positions · cost basis and decision evidence`
+            : `${rows.length.toLocaleString()} companies · enterprising and defensive evidence · engine v${data.engine_version}`}
+        </p>
+        <nav className="app-nav" aria-label="Primary views">
+          <button className={page === "screener" ? "active" : ""} onClick={() => onNavigate("screener")}>Research</button>
+          <button className={page === "portfolio" ? "active" : ""} onClick={() => onNavigate("portfolio")}>
+            Portfolio <span>{portfolioData?.summary?.positions ?? 0}</span>
+          </button>
+        </nav>
+      </div>
+      <div className="searchwrap">
+        <input className="search" placeholder={page === "portfolio" ? "Search portfolio…" : "Search…"}
+               value={searchValue ?? ""}
+               onChange={(event) => setSearch(event.target.value)} />
+        {(searchValue ?? "").trim() && <span className="searchhint">
+          {(searchMatches ?? 0).toLocaleString()} match{searchMatches === 1 ? "" : "es"}
+        </span>}
+      </div>
+    </header>
+  );
+}
+
 const fmt = (v) => (v == null ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
+const fmtMultiple = (v) => (v == null ? "—" : `${v.toLocaleString(undefined, {
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1,
+})}×`);
 
 // penny stocks rounded to 2dp all read "$0.00", which looks like missing data
 const fmtPrice = (v) => {

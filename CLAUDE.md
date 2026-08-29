@@ -31,9 +31,18 @@ web/   React SPA (Vite, no runtime deps beyond React). One fetch of dashboard.js
   NEAR-PASS/CLOSE. The engine verdict ranks a measured FAIL above INDETERMINATE.
 - **Refetch on new filings only.** Engine changes are recomputed locally: bump
   `store.ENGINE_VERSION`, run `make derive`. Never refetch to fix a code bug.
+- Routine derive/export recomputes every ticker-eligible snapshot and defers
+  tickerless or preferred-only cache rows until they can enter the dashboard.
+  `make derive-all` remains available for exhaustive cache maintenance.
 - **Stale facts are missing facts.** Instant facts >400 days older than the
   balance sheet are dropped; fundamentals >450 days older than the quote withhold
   the price criteria.
+- **Foreign forms require a common basis.** A current 20-F/40-F filer enters only
+  when that annual filing carries a USD US-GAAP or standard IFRS balance sheet and
+  its current cover exactly matches the ticker to supported common equity.
+  Depositary securities additionally require a positive filing-backed
+  underlying-shares-per-receipt ratio. Non-USD statements remain unsupported,
+  never converted or guessed.
 
 ## Proving a change
 
@@ -58,7 +67,8 @@ assembled from components struck at different balance-sheet dates.
 
 ```sh
 make test      # pytest (api/.venv) + node --test (web), both required green
-make derive    # recompute snapshots after an engine change
+make derive    # recompute dashboard-eligible snapshots after an engine change
+make derive-all # recompute every cached snapshot, including deferred filers
 make export    # live prices + rebuild dashboard.json
 make dev       # API :8000 + Vite :5173
 ```

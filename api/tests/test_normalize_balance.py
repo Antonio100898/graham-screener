@@ -123,6 +123,33 @@ def test_long_term_debt_total_tag_not_double_counted_in_short_bucket():
     assert float(s.short_term_debt.value) == 2e9  # only genuine short-term borrowings
 
 
+def test_foreign_statement_sums_disjoint_borrowings_and_funding_notes_lx_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebt"] = tagdata("USD", [
+        inst("2025-12-31", 80.939e6, form="20-F", accn="f25", filed="2026-04-29")])
+    gaap["LongTermNotesPayable"] = tagdata("USD", [
+        inst("2025-12-31", 121.633e6, form="20-F", accn="f25", filed="2026-04-29")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [
+        inst("2025-12-31", 10e6, form="20-F", accn="f25", filed="2026-04-29")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 202.572e6
+    assert float(s.short_term_debt.value) == 10e6
+    assert len(s.long_term_debt.provenance.components) == 2
+
+
+def test_foreign_combined_debt_total_does_not_absorb_its_note_component_pmec_style():
+    gaap = dict(GAAP)
+    gaap["LongTermDebt"] = tagdata("USD", [
+        inst("2025-12-31", 12.812e6, form="20-F", accn="f25", filed="2026-04-29")])
+    gaap["LongTermNotesPayable"] = tagdata("USD", [
+        inst("2025-12-31", 4.331e6, form="20-F", accn="f25", filed="2026-04-29")])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [
+        inst("2025-12-31", 8.481e6, form="20-F", accn="f25", filed="2026-04-29")])
+    s = build(gaap)
+    assert float(s.long_term_debt.value) == 12.812e6
+    assert s.short_term_debt is None
+
+
 def test_nci_extracted_when_liabilities_are_direct():
     gaap = dict(GAAP)
     gaap["MinorityInterest"] = tagdata("USD", [inst("2026-03-31", 6.6e9, accn="q126")])
@@ -216,13 +243,229 @@ def test_asset_side_debt_securities_are_not_debt_evidence():
 def test_owner_earnings_and_invested_capital():
     s = build(OE_GAAP)
     oe = s.owner_earnings
-    # 100 + 12 - 20 - 12
-    assert float(oe.owner_earnings) == 80e9
+    # all-capex floor: 70 reported earnings + 12 D&A - 12 total capex
+    assert float(oe.all_capex_floor.value) == 70e9
+    assert float(oe.maintenance_estimate.value) == 70e9
+    assert float(oe.free_cash_flow.value) == 63e9
     # assets 1000 - cash 40 - non-interest-bearing current liabilities 150
     assert float(oe.invested_capital) == 810e9
-    assert round(float(oe.roic), 4) == round(80 / 810 * 100, 4)
-    # with maintenance capex assumed equal to depreciation the two cancel: 100 - 20
-    assert round(float(oe.roic_maintenance), 4) == round(80 / 810 * 100, 4)
+    assert round(float(oe.all_capex_return), 4) == round(70 / 810 * 100, 4)
+    assert round(float(oe.maintenance_estimate_return), 4) == round(70 / 810 * 100, 4)
+
+
+def test_epd_shape_keeps_owner_estimates_distinct_from_standard_fcf():
+    """EPD proves why total capex and maintenance capex cannot be conflated."""
+    gaap = dict(OE_GAAP)
+    values = {
+        "NetIncomeLoss": 5.810e9,
+        "OperatingIncomeLoss": 7.266e9,  # must not become the owner numerator
+        "DepreciationDepletionAndAmortization": 2.303e9,
+        "PaymentsToAcquirePropertyPlantAndEquipment": 5.620e9,
+        "NetCashProvidedByUsedInOperatingActivities": 8.585e9,
+    }
+    for tag, value in values.items():
+        gaap[tag] = tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", value, accn="k25", filed="2026-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 2.185e9,
+            accn="k25", filed="2026-02-15")])
+
+    snapshot = build(gaap)
+    oe = snapshot.owner_earnings
+    assert float(oe.all_capex_floor.value) == pytest.approx(2.493e9)
+    assert float(oe.maintenance_estimate.value) == pytest.approx(5.810e9)
+    assert float(oe.free_cash_flow.value) == pytest.approx(2.965e9)
+
+    from screener.sync import _owner_earnings_row
+    payload = _owner_earnings_row(snapshot)
+    assert payload["status"] == "ESTIMATE_ONLY"
+    assert payload["owner_earnings"] is None and payload["roic"] is None
+    assert payload["maintenance_basis"] == "UNAVAILABLE_PRIMARY_XBRL"
+
+
+def test_hon_shape_starts_with_net_income_not_operating_income():
+    gaap = dict(OE_GAAP)
+    for tag, value in {
+        "NetIncomeLoss": 4.729e9,
+        "OperatingIncomeLoss": 7.521e9,
+        "DepreciationDepletionAndAmortization": 2.000e9,
+        "PaymentsToAcquirePropertyPlantAndEquipment": 1.598e9,
+    }.items():
+        gaap[tag] = tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", value, accn="k25", filed="2026-02-15")])
+
+    oe = build(gaap).owner_earnings
+    assert float(oe.all_capex_floor.value) == pytest.approx(5.131e9)
+    assert dict(oe.components)["reported earnings attributable to owners"] == Decimal("4729000000.0")
+
+
+def test_owner_earnings_per_share_keeps_each_complete_audited_year():
+    gaap = dict(OE_GAAP)
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 80e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 100e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["NetIncomeLoss"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 64e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 80e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["DepreciationDepletionAndAmortization"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 10e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["IncomeTaxExpenseBenefit"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 16e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 20e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["PaymentsToAcquirePropertyPlantAndEquipment"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 8e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2024-01-01", "2024-12-31", 10e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 10e9, accn="k25", filed="2026-02-15"),
+    ])
+
+    snapshot = build(gaap)
+    annual = snapshot.owner_earnings.annual
+
+    assert sorted(annual) == [2024, 2025]
+    assert float(annual[2024].all_capex_floor.value) == 66e9
+    assert float(annual[2024].all_capex_floor_per_share.value) == 6.6
+    assert float(annual[2025].maintenance_estimate_per_share.value) == 8.0
+    assert len(annual[2025].all_capex_floor.provenance.components) == 3
+    assert len(annual[2025].maintenance_estimate_per_share.provenance.components) == 2
+
+    from screener.sync import _owner_earnings_row
+    payload = _owner_earnings_row(snapshot)
+    cell = payload["annual_per_share"]["2024"]
+    assert cell == {
+        "all_capex_floor_per_share": 6.6,
+        "maintenance_estimate_per_share": 6.4,
+        "free_cash_flow_per_share": None,
+        "diluted_shares": 10e9,
+        "end": "2024-12-31",
+    }
+    assert payload["sources"]["reported_earnings"]["accn"] == "k25"
+    assert payload["sources"]["total_capex"]["tag"].endswith(
+        "PaymentsToAcquirePropertyPlantAndEquipment")
+
+
+def test_owner_earnings_per_share_does_not_fill_a_missing_component():
+    gaap = dict(OE_GAAP)
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 80e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 100e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["DepreciationDepletionAndAmortization"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 10e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 12e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["IncomeTaxExpenseBenefit"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 16e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 20e9, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2024-01-01", "2024-12-31", 10e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 10e9, accn="k25", filed="2026-02-15"),
+    ])
+
+    # The base fixture has capex only for FY2025. FY2024 must remain absent.
+    assert sorted(build(gaap).owner_earnings.annual) == [2025]
+
+
+def test_owner_earnings_per_share_restates_onto_the_traded_receipt():
+    gaap = dict(OE_GAAP)
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9, accn="k25", filed="2026-02-15"),
+    ])
+    facts = facts_doc(gaap)
+    ordinary = build_snapshot("ADR", "0000000001", facts)
+    receipt = build_snapshot(
+        "ADR", "0000000001", facts,
+        receipt={"ratio": "2", "accn": "cover-1",
+                 "title": "ADS, each representing 2 shares"},
+    )
+
+    ordinary_year = ordinary.owner_earnings.annual[2025]
+    receipt_year = receipt.owner_earnings.annual[2025]
+    assert receipt_year.all_capex_floor.value == ordinary_year.all_capex_floor.value
+    assert receipt_year.diluted_shares.value == ordinary_year.diluted_shares.value / 2
+    assert (receipt_year.maintenance_estimate_per_share.value
+            == ordinary_year.maintenance_estimate_per_share.value * 2)
+
+
+def test_owner_earnings_old_share_denominators_are_rebased_for_later_splits():
+    gaap = dict(OE_GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        dur("2020-01-01", "2020-12-31", 10, accn="k20", filed="2021-02-15"),
+        dur("2023-01-01", "2023-12-31", 10, accn="k23", filed="2024-02-15"),
+        dur("2023-01-01", "2023-12-31", 5, accn="k24", filed="2025-02-15"),
+        dur("2024-01-01", "2024-12-31", 6, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 7, accn="k25", filed="2026-02-15"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2020-01-01", "2020-12-31", 10e9, accn="k20", filed="2021-02-15"),
+        dur("2023-01-01", "2023-12-31", 10e9, accn="k23", filed="2024-02-15"),
+        dur("2023-01-01", "2023-12-31", 20e9, accn="k24", filed="2025-02-15"),
+        dur("2024-01-01", "2024-12-31", 20e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 20e9, accn="k25", filed="2026-02-15"),
+    ])
+    for tag, value in (
+        ("NetIncomeLoss", 100e9),
+        ("DepreciationDepletionAndAmortization", 0),
+        ("PaymentsToAcquirePropertyPlantAndEquipment", 0),
+    ):
+        gaap[tag] = tagdata("USD", [
+            dur("2020-01-01", "2020-12-31", value, accn="k20", filed="2021-02-15"),
+            dur("2025-01-01", "2025-12-31", value, accn="k25", filed="2026-02-15"),
+        ])
+
+    old = build(gaap).owner_earnings.annual[2020]
+
+    assert old.diluted_shares.value == Decimal("20e9")
+    assert old.maintenance_estimate_per_share.value == Decimal("5")
+    assert "later split" in old.diluted_shares.provenance.concept
+
+
+def test_owner_earnings_repairs_a_proved_table_scale_after_split_rebasing():
+    """FIZZ pattern: FY2018 is tagged as 46,921 shares before a 2:1 split,
+    between 92M and 94M split-adjusted years. The owner series alone repairs the
+    exact 1,000x unit; the filing-reported annual-share table remains untouched."""
+    gaap = dict(OE_GAAP)
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        _yr(2017, 2, "2018-02-15", "k17"),
+        _yr(2017, 1, "2020-02-15", "k19"),
+        _yr(2018, 2.2, "2019-02-15", "k18"),
+        _yr(2018, 1.1, "2020-02-15", "k19"),
+        _yr(2019, 1.2, "2020-02-15", "k19"),
+        _yr(2025, 1.4, "2026-02-15", "k25"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        _shares(2017, 46e6, "2018-02-15", "k17"),
+        _shares(2017, 92e6, "2020-02-15", "k19"),
+        _shares(2018, 46921, "2019-02-15", "k18"),
+        _shares(2019, 94e6, "2020-02-15", "k19"),
+        _shares(2025, 96e6, "2026-02-15", "k25"),
+    ])
+    for tag, value in (
+        ("NetIncomeLoss", 100e6),
+        ("DepreciationDepletionAndAmortization", 0),
+        ("PaymentsToAcquirePropertyPlantAndEquipment", 0),
+    ):
+        gaap[tag] = tagdata("USD", [
+            _yr(year, value, f"{year + 1}-02-15", f"k{str(year)[-2:]}")
+            for year in (2017, 2018, 2019, 2025)
+        ])
+
+    snapshot = build(gaap)
+    year = snapshot.owner_earnings.annual[2018]
+
+    assert snapshot.annual_share_counts[2018].value == Decimal("46921")
+    assert year.diluted_shares.value == Decimal("93842000")
+    assert round(float(year.maintenance_estimate_per_share.value), 6) == round(100e6 / 93842000, 6)
+    assert "adjacent fiscal years agree" in year.diluted_shares.provenance.concept
+    assert any("FY2018 (1000x)" in caveat for caveat in snapshot.owner_earnings.caveats)
 
 
 def test_interest_bearing_current_debt_stays_in_invested_capital():
@@ -238,8 +481,8 @@ def test_no_classified_balance_sheet_yields_earnings_without_a_return():
     the earnings still compute, the ratio does not."""
     gaap = {k: v for k, v in OE_GAAP.items() if k != "LiabilitiesCurrent"}
     oe = build(gaap).owner_earnings
-    assert float(oe.owner_earnings) == 80e9
-    assert oe.invested_capital is None and oe.roic is None
+    assert float(oe.all_capex_floor.value) == 70e9
+    assert oe.invested_capital is None and oe.all_capex_return is None
 
 
 def test_bvps_keeps_intangibles_that_tbvps_removes():
@@ -249,6 +492,41 @@ def test_bvps_keeps_intangibles_that_tbvps_removes():
     assert _bvps(s) == 60.0
     # tangible additionally sheds goodwill 50 and intangibles 30
     assert _tbvps(s) == 52.0
+
+
+def test_historical_tbv_never_turns_a_missing_deduction_into_zero():
+    """AEE files annual goodwill but no intangible-assets fact. Current P/TBV is
+    therefore unavailable; the historical table must not quietly subtract zero
+    and show six apparently comparable P/TBV values anyway."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 6, accn="k25", filed="2026-02-15")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", 60, accn="k25", filed="2026-02-15")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 10, accn="k25", filed="2026-02-15")]),
+        "Assets": tagdata("USD", [
+            inst("2025-12-31", 1000, form="10-K", accn="k25", filed="2026-02-15")]),
+        "Liabilities": tagdata("USD", [
+            inst("2025-12-31", 400, form="10-K", accn="k25", filed="2026-02-15")]),
+        "Goodwill": tagdata("USD", [
+            inst("2025-12-31", 50, form="10-K", accn="k25", filed="2026-02-15")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, annual_ratios,
+    )
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    ratios = annual_ratios(gaap, income, {}, {}, annual_eps=eps)
+
+    assert ratios[2025]["bvps"] == 60
+    assert "tbvps" not in ratios[2025]
+
+    # An explicit zero is evidence and restores the calculation; None is never
+    # treated as that zero implicitly.
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15")])
+    ratios = annual_ratios(gaap, income, {}, {}, annual_eps=eps)
+    assert ratios[2025]["tbvps"] == 55
 
 
 def test_stale_zero_on_priority_debt_tag_loses_to_newer_fact():
