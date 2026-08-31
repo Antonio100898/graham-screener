@@ -22,6 +22,7 @@ from .models import CriterionResult, Fact, FinancialSnapshot, ScreenResult
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import evaluate
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError, UnknownTickerError
+from .sources.crypto import CoinbaseCryptoProvider
 from .sources.prices import YahooPriceProvider
 
 
@@ -43,6 +44,7 @@ app.middleware("http")(auth.require_token)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 _edgar = EdgarClient()
 _prices = YahooPriceProvider()
+_crypto = CoinbaseCryptoProvider()
 
 
 def _snapshot_for(ticker: str, assume_absent_zero: bool = False) -> FinancialSnapshot:
@@ -202,6 +204,20 @@ class PortfolioTradeRequest(BaseModel):
     note: str | None = None
 
 
+class PortfolioAssetRequest(BaseModel):
+    asset_type: Literal["BOND", "CRYPTO"]
+    name: str
+    symbol: str | None = None
+    quantity: Decimal
+    current_price: Decimal | None = None
+    currency: str = "USD"
+    note: str | None = None
+
+
+class PortfolioCashRequest(BaseModel):
+    amount: Decimal
+
+
 @lru_cache(maxsize=2)
 def _dashboard_payload_cached(path: str, modified_ns: int) -> dict:
     # `modified_ns` is deliberately part of the key: a completed export becomes
@@ -226,7 +242,13 @@ def _portfolio_response(conn, selected: dict) -> dict:
     _, rows = _portfolio_rows()
     trades = store.portfolio_trades(conn, selected["id"])
     try:
-        result = portfolio.build_portfolio(selected, trades, rows)
+        result = portfolio.build_portfolio(
+            selected,
+            trades,
+            rows,
+            _portfolio_assets_with_crypto_quotes(conn, selected),
+            store.portfolio_cash(conn, selected["id"]),
+        )
         # Portfolio and Research deliberately share this one immutable snapshot.
         # Universe refresh replaces it atomically once all quotes are ready.
         result["quote_refresh"] = None
@@ -385,6 +407,207 @@ def portfolio_trade_remove(portfolio_id: int, trade_id: int):
         store.delete_portfolio_trade(conn, portfolio_id, trade_id)
         return {"deleted": True, "trade_id": trade_id,
                 "portfolio": _portfolio_response(conn, selected)}
+    finally:
+        conn.close()
+
+
+def _crypto_products(currency: str) -> list[dict]:
+    products = _crypto.products(currency)
+    if products is None:
+        raise HTTPException(502, "Coinbase crypto ticker catalogue is temporarily unavailable")
+    return products
+
+
+def _crypto_product(product_id: str, currency: str) -> dict | None:
+    requested = product_id.strip().upper()
+    if "-" not in requested:
+        requested = f"{requested}-{currency}"
+    return next((product for product in _crypto_products(currency)
+                 if product["id"] == requested), None)
+
+
+def _crypto_quote_payload(product: dict) -> dict:
+    quote = _crypto.quote(product["id"])
+    if quote is None:
+        raise HTTPException(
+            502, f"live Coinbase quote unavailable for {product['id']}")
+    return {
+        "product_id": quote.product_id,
+        "symbol": product["symbol"],
+        "name": product["name"],
+        "price": float(quote.price),
+        "currency": product["quote_currency"],
+        "asof": quote.asof.isoformat(),
+        "source": quote.source,
+    }
+
+
+@app.get("/crypto/products")
+def crypto_products(currency: str = "USD"):
+    currency = currency.strip().upper()
+    if len(currency) != 3 or not currency.isalpha():
+        raise HTTPException(422, "currency must be a three-letter code")
+    return {"currency": currency, "products": _crypto_products(currency)}
+
+
+@app.get("/crypto/quote/{product_id}")
+def crypto_quote(product_id: str, currency: str = "USD"):
+    currency = currency.strip().upper()
+    product = _crypto_product(product_id, currency)
+    if product is None:
+        raise HTTPException(404, f"active Coinbase market {product_id!r} not found")
+    return _crypto_quote_payload(product)
+
+
+def _portfolio_assets_with_crypto_quotes(conn, selected: dict) -> list[dict]:
+    assets = store.portfolio_assets(conn, selected["id"])
+    for asset in assets:
+        if asset["asset_type"] != "CRYPTO":
+            asset.update({
+                "price_live": False,
+                "price_source": "manual",
+                "price_asof": asset["updated_at"],
+            })
+            continue
+        product_id = (asset.get("symbol") or "").strip().upper()
+        if "-" not in product_id and product_id:
+            product_id = f"{product_id}-{selected['base_currency']}"
+        quote = _crypto.quote(product_id) if product_id else None
+        live = quote is not None
+        quote = quote or (_crypto.cached_quote(product_id) if product_id else None)
+        if quote is not None:
+            asset["current_price"] = portfolio.canonical_decimal(quote.price)
+            asset.update({
+                "symbol": quote.product_id,
+                "price_live": live,
+                "price_source": quote.source,
+                "price_asof": quote.asof.isoformat(),
+            })
+        else:
+            asset.update({
+                "price_live": False,
+                "price_source": "saved",
+                "price_asof": asset["updated_at"],
+            })
+        if not live:
+            asset["quote_refresh_warning"] = {
+                "kind": "CRYPTO_QUOTE_REFRESH_FAILED",
+                "note": "Coinbase quote unavailable; the last saved or cached price remains in use",
+            }
+    return assets
+
+
+def _portfolio_asset_fields(req: PortfolioAssetRequest, selected: dict) -> dict:
+    name = req.name.strip()
+    symbol = req.symbol.strip().upper() if req.symbol and req.symbol.strip() else None
+    note = req.note.strip() if req.note and req.note.strip() else None
+    currency = req.currency.strip().upper()
+    if not name:
+        raise HTTPException(422, "asset name is required")
+    if len(name) > 160:
+        raise HTTPException(422, "asset name must be 160 characters or fewer")
+    if symbol and len(symbol) > 32:
+        raise HTTPException(422, "asset symbol or identifier must be 32 characters or fewer")
+    if currency != selected["base_currency"]:
+        raise HTTPException(
+            422,
+            f"{selected['name']} is a {selected['base_currency']} portfolio; "
+            "holdings must be entered in the portfolio currency",
+        )
+    try:
+        quantity = portfolio.decimal_value(req.quantity, "quantity", positive=True)
+    except portfolio.PortfolioError as exc:
+        raise HTTPException(422, str(exc))
+    if req.asset_type == "CRYPTO":
+        if symbol is None:
+            raise HTTPException(422, "crypto ticker is required")
+        product = _crypto_product(symbol, currency)
+        if product is None:
+            raise HTTPException(422, f"{symbol!r} is not an active Coinbase {currency} market")
+        quote = _crypto.quote(product["id"])
+        if quote is None:
+            raise HTTPException(502, f"live Coinbase quote unavailable for {product['id']}")
+        symbol = product["id"]
+        current_price = portfolio.decimal_value(
+            quote.price, "current price", positive=True)
+    else:
+        try:
+            current_price = portfolio.decimal_value(
+                req.current_price, "current price", nonnegative=True)
+        except portfolio.PortfolioError as exc:
+            raise HTTPException(422, str(exc))
+    return {
+        "asset_type": req.asset_type,
+        "symbol": symbol,
+        "name": name,
+        "quantity": portfolio.canonical_decimal(quantity),
+        "current_price": portfolio.canonical_decimal(current_price),
+        "currency": currency,
+        "note": note,
+    }
+
+
+@app.post("/portfolio/{portfolio_id}/assets")
+def portfolio_asset_add(portfolio_id: int, req: PortfolioAssetRequest):
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        asset = store.add_portfolio_asset(
+            conn, portfolio_id=portfolio_id, **_portfolio_asset_fields(req, selected))
+        return {"asset": asset, "portfolio": _portfolio_response(conn, selected)}
+    finally:
+        conn.close()
+
+
+@app.put("/portfolio/{portfolio_id}/assets/{asset_id}")
+def portfolio_asset_update(portfolio_id: int, asset_id: int,
+                           req: PortfolioAssetRequest):
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        asset = store.update_portfolio_asset(
+            conn, portfolio_id=portfolio_id, asset_id=asset_id,
+            **_portfolio_asset_fields(req, selected))
+        if asset is None:
+            raise HTTPException(404, f"portfolio asset {asset_id} not found")
+        return {"asset": asset, "portfolio": _portfolio_response(conn, selected)}
+    finally:
+        conn.close()
+
+
+@app.delete("/portfolio/{portfolio_id}/assets/{asset_id}")
+def portfolio_asset_remove(portfolio_id: int, asset_id: int):
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        if not store.delete_portfolio_asset(conn, portfolio_id, asset_id):
+            raise HTTPException(404, f"portfolio asset {asset_id} not found")
+        return {"deleted": True, "asset_id": asset_id,
+                "portfolio": _portfolio_response(conn, selected)}
+    finally:
+        conn.close()
+
+
+@app.put("/portfolio/{portfolio_id}/cash")
+def portfolio_cash_set(portfolio_id: int, req: PortfolioCashRequest):
+    try:
+        amount = portfolio.decimal_value(req.amount, "liquid cash", nonnegative=True)
+    except portfolio.PortfolioError as exc:
+        raise HTTPException(422, str(exc))
+    conn = store.connect()
+    try:
+        selected = store.portfolio_by_id(conn, portfolio_id)
+        if selected is None:
+            raise HTTPException(404, f"portfolio {portfolio_id} not found")
+        cash = store.set_portfolio_cash(
+            conn, portfolio_id, portfolio.canonical_decimal(amount))
+        return {"cash": cash, "portfolio": _portfolio_response(conn, selected)}
     finally:
         conn.close()
 

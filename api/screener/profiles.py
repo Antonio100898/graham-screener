@@ -59,6 +59,112 @@ PROFILE_META = {
     },
 }
 
+# Business-model routing is advisory, never a screen or a grade. The SEC SIC
+# description and filing-derived diagnostics are enough to identify where a
+# generic industrial ratio is structurally non-comparable, but not enough to
+# invent AFFO, reserve quality, NAV, or organic growth that the filing did not tag.
+ROUTE_META = {
+    "BANK": {
+        "label": "Bank",
+        "preferred": "Tangible book, ROTCE, regulatory capital, credit losses and deposit quality",
+        "deemphasize": "CFO minus capex and the generic current ratio",
+    },
+    "INSURER": {
+        "label": "Insurer",
+        "preferred": "Adjusted book value, combined ratio, reserve adequacy and investment quality",
+        "deemphasize": "Generic free cash flow and the current ratio",
+    },
+    "REIT": {
+        "label": "REIT",
+        "preferred": "Company-reported FFO/AFFO, NAV, occupancy and debt to EBITDA",
+        "deemphasize": "GAAP EPS, ordinary price/book and generic CFO minus capex",
+    },
+    "MLP_PIPELINE": {
+        "label": "MLP / pipeline",
+        "preferred": "Company-reported distributable cash flow, sustaining capex, coverage and leverage",
+        "deemphasize": "CFO minus total capex as owner earnings and taxed-company ROIC",
+    },
+    "SHIPPING": {
+        "label": "Shipping",
+        "preferred": "Vessel NAV, charter coverage, fleet age and debt",
+        "deemphasize": "Historical-cost price/book on its own",
+    },
+    "RETAIL_LEASE": {
+        "label": "Lease-heavy retail / hospitality",
+        "preferred": "Lease-adjusted debt, fixed-charge coverage, inventory turns and cash flow",
+        "deemphasize": "Conventional debt without operating leases",
+    },
+    "SOFTWARE": {
+        "label": "Software",
+        "preferred": "FCF after stock compensation, diluted-share trend and capitalized software",
+        "deemphasize": "Price/book and unadjusted CFO minus capex",
+    },
+    "SERIAL_ACQUIRER": {
+        "label": "Acquisition-led",
+        "preferred": "FCF after acquisitions, acquisition cadence, goodwill and leverage",
+        "deemphasize": "Free cash flow that omits acquisition dependence",
+    },
+    "COMMODITY": {
+        "label": "Commodity producer",
+        "preferred": "Mid-cycle earnings, reserves or replacement cost, and balance-sheet resilience",
+        "deemphasize": "Latest-year P/E on its own",
+    },
+    "UTILITY": {
+        "label": "Regulated utility",
+        "preferred": "Regulatory asset base, allowed returns, capex funding and leverage",
+        "deemphasize": "All-capex earnings after treating expansion capex as a current-period cost",
+    },
+}
+
+
+def analysis_routes(row: dict) -> list[dict]:
+    """Explicitly route structurally different businesses by filed/SEC evidence."""
+    industry = (row.get("industry") or "").lower()
+    name = (row.get("name") or "").lower()
+    sector = row.get("sector") or ""
+    route_ids: list[str] = []
+
+    def add(route: str) -> None:
+        if route not in route_ids:
+            route_ids.append(route)
+
+    if any(term in industry for term in (
+        "commercial bank", "savings institution", "credit union", "bank holding")):
+        add("BANK")
+    if "insurance" in industry:
+        add("INSURER")
+    if "real estate investment trust" in industry:
+        add("REIT")
+    pass_through = bool((row.get("tax_record") or {}).get("pass_through"))
+    pipeline = any(term in industry for term in (
+        "natural gas transmission", "crude petroleum pipelines", "pipeline transportation"))
+    partnership_name = any(term in name for term in (
+        " limited partnership", " l.p.", " lp", " partners"))
+    if pipeline or (pass_through and sector == "Energy" and partnership_name):
+        add("MLP_PIPELINE")
+    if any(term in industry for term in (
+        "deep sea", "water transportation", "marine transportation", "shipping")):
+        add("SHIPPING")
+    if any(term in industry for term in (
+        "retail", "eating places", "restaurants", "hotels", "motels")):
+        add("RETAIL_LEASE")
+    if any(term in industry for term in (
+        "prepackaged software", "computer programming services", "services-computer programming")):
+        add("SOFTWARE")
+    owner = row.get("owner_earnings") or {}
+    if (owner.get("acquisition_years_10") or 0) >= 3 and (
+        (owner.get("acquisitions_to_capex_10") or 0) >= 50
+        or (owner.get("acquisitions_to_free_cash_flow") or 0) >= 50
+    ):
+        add("SERIAL_ACQUIRER")
+    if any(term in industry for term in (
+        "oil and gas extraction", "crude petroleum", "metal mining", "coal mining",
+        "mining and quarrying", "agricultural production")):
+        add("COMMODITY")
+    if sector == "Utilities":
+        add("UTILITY")
+    return [{"id": route, **ROUTE_META[route]} for route in route_ids]
+
 
 def _number(value) -> Decimal | None:
     if value is None:
@@ -758,8 +864,10 @@ def enrich(row: dict) -> dict:
     if (shape := earnings_shape_note(row)) is not None:
         notes.append(shape)
     notes.extend(filing_event_notes(row))
+    routes = analysis_routes(row)
     return {
         "graham_profile": profile,
+        **({"analysis_routes": routes} if routes else {}),
         # what the reader must open a filing to settle; rendered in the panel and
         # marked on the table row, so a missing answer is visible before it is needed
         "prose_gaps": prose_gaps(row),

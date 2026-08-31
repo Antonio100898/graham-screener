@@ -51,6 +51,12 @@ SOURCED = (
     ("shares", "shares"),
     ("options", "options"),
     ("noncontrolling_interest", "noncontrolling_interest"),
+    ("operating_lease_liability", "operating_lease_liability"),
+    ("lease_cost", "lease_cost"),
+    ("asset_quality.inventory", "inventory"),
+    ("asset_quality.receivables", "receivables"),
+    ("asset_quality.cash", "cash"),
+    ("asset_quality.short_term_investments", "short_term_investments"),
 )
 TOLERANCE = 0.005          # a rounded display figure, not a different number
 
@@ -58,6 +64,15 @@ TOLERANCE = 0.005          # a rounded display figure, not a different number
 def _facts(cik: str, cache: Path) -> dict:
     path = cache / f"companyfacts_{cik}.json"
     return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _payload_field(row: dict, path: str):
+    value = row
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
 
 
 def _ratio(row: dict) -> float:
@@ -710,6 +725,18 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                 out.append(("FILING?", f"FY{year} {field}", shown, float(value),
                             "restated after this filing, which prints the original"))
                 continue
+            if field == "eps" and (concepts.get(field) or {}).get("segments"):
+                # A rendered statement may repeat the same EPS concept for several
+                # classes.  Its definition link identifies the concept but not the
+                # XBRL context/member, and `statements.elements` therefore cannot
+                # tell Berkshire's Class A line from its Equivalent Class B line.
+                # The provenance records that missing discriminator explicitly, so
+                # report the page comparison as uncheckable instead of comparing the
+                # selected class with whichever repeated row the renderer exposed.
+                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+                            "filed under a share-class dimension that the rendered "
+                            "statement reader cannot distinguish"))
+                continue
             out.append(("FILING", f"FY{year} {field}", shown, float(value),
                         f"no printed line matches; nearest is {label!r}"))
     return out
@@ -995,7 +1022,9 @@ def _derived_series(row: dict) -> list[tuple]:
     if parts and earnings.get("all_capex_floor") is not None:
         check("owner_earnings.all_capex_floor", earnings["all_capex_floor"], sum(parts),
               "reported earnings plus D&A less total capex")
-    reported = component_map.get("reported earnings attributable to owners")
+    reported = (component_map.get("reported earnings available to common")
+                if "reported earnings available to common" in component_map
+                else component_map.get("reported earnings attributable to owners"))
     if reported is not None and earnings.get("maintenance_estimate") is not None:
         check("owner_earnings.maintenance_estimate", earnings["maintenance_estimate"],
               reported, "reported earnings when maintenance capex is assumed equal to D&A")
@@ -1004,6 +1033,13 @@ def _derived_series(row: dict) -> list[tuple]:
         check("owner_earnings.free_cash_flow", earnings["free_cash_flow"],
               sum(cash_parts), "operating cash flow less total capex")
     capital = earnings.get("invested_capital")
+    capital_evidence = earnings.get("invested_capital_evidence") or {}
+    beginning = (capital_evidence.get("beginning") or {}).get("value")
+    ending = (capital_evidence.get("ending") or {}).get("value")
+    if beginning is not None and ending is not None:
+        check("owner_earnings.invested_capital", capital,
+              (beginning + ending) / 2,
+              "average of exact beginning and ending invested capital")
     if earnings.get("all_capex_return") is not None and capital:
         check("owner_earnings.all_capex_return", earnings["all_capex_return"],
               earnings["all_capex_floor"] / capital * 100,
@@ -1013,6 +1049,23 @@ def _derived_series(row: dict) -> list[tuple]:
               earnings["maintenance_estimate_return"],
               earnings["maintenance_estimate"] / capital * 100,
               "maintenance≈D&A estimate over invested capital")
+    for field, deduction, formula in (
+        ("free_cash_flow_after_stock_compensation", "stock_compensation",
+         "free cash flow less stock compensation"),
+        ("free_cash_flow_after_acquisitions", "cash_acquisitions",
+         "free cash flow less cash acquisitions"),
+        ("expanded_free_cash_flow", "capitalized_intangible_investment",
+         "free cash flow less capitalized software and intangible investment"),
+    ):
+        if (earnings.get(field) is not None and earnings.get("free_cash_flow") is not None
+                and earnings.get(deduction) is not None):
+            check(f"owner_earnings.{field}", earnings[field],
+                  earnings["free_cash_flow"] - abs(earnings[deduction]), formula)
+    if (earnings.get("nopat_roic") is not None and earnings.get("nopat") is not None
+            and capital):
+        check("owner_earnings.nopat_roic", earnings["nopat_roic"],
+              earnings["nopat"] / capital * 100,
+              "NOPAT over average invested capital")
     for year, cell in (earnings.get("annual_per_share") or {}).items():
         if not isinstance(cell, dict):
             continue
@@ -1022,6 +1075,14 @@ def _derived_series(row: dict) -> list[tuple]:
             ("maintenance_estimate", "maintenance_estimate_per_share",
              "maintenance≈D&A estimate"),
             ("free_cash_flow", "free_cash_flow_per_share", "free cash flow"),
+            ("free_cash_flow_after_stock_compensation",
+             "free_cash_flow_after_stock_compensation_per_share",
+             "free cash flow after stock compensation"),
+            ("free_cash_flow_after_acquisitions",
+             "free_cash_flow_after_acquisitions_per_share",
+             "free cash flow after acquisitions"),
+            ("expanded_free_cash_flow", "expanded_free_cash_flow_per_share",
+             "expanded free cash flow"),
         ):
             total = cell.get(total_key)
             if total is not None and shares:
@@ -1072,7 +1133,7 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
         sources = row.get("sources") or {}
         lines = []
         for field, key in SOURCED:
-            shown, source = row.get(field), sources.get(key)
+            shown, source = _payload_field(row, field), sources.get(key)
             if shown is None:
                 continue
             # HCA's goodwill tag died in 2011, so the engine carries the whole

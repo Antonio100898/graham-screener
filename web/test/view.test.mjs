@@ -11,18 +11,22 @@ globalThis.requestAnimationFrame = (fn) => fn();
 globalThis.cancelAnimationFrame = () => {};
 globalThis.history = { scrollRestoration: "auto" };   // as a browser provides it
 
-const { loadView, saveView, takeOverScrollRestoration } = await import("../src/view.js");
+const {
+  hasActiveFilters, loadView, saveView, takeOverScrollRestoration, unfilteredView,
+} = await import("../src/view.js");
 
 beforeEach(() => store.clear());
 
-test("a first visit gets the focused Graham working view", () => {
+test("a first visit shows the full universe", () => {
   const v = loadView();
   assert.equal(v.lens, "BOTH");
   assert.equal(v.fit, "ALL");
   assert.equal(v.gaps, "ALL");
   assert.deepEqual(v.sort, { key: "fit", dir: 1 });
-  assert.equal(v.minCap, 500e6);
+  assert.equal(v.minCap, 0);
+  assert.equal(v.hideNoApply, false);
   assert.equal(v.scroll, 0);
+  assert.equal(hasActiveFilters(v), false);
 });
 
 test("filters, sort, lens and Enterprising gaps survive a reload", () => {
@@ -43,7 +47,7 @@ test("filters, sort, lens and Enterprising gaps survive a reload", () => {
   assert.equal(v.minPositiveEps, 9);
   assert.equal(v.trackedOnly, true);
   assert.deepEqual(v.sort, { key: "eps10", dir: 1 });
-  assert.equal(v.minCap, 500e6, "settings that were not touched keep their value");
+  assert.equal(v.minCap, 0, "settings that were not touched keep their value");
 });
 
 test("saving the scroll position leaves the filters alone", () => {
@@ -63,7 +67,7 @@ test("a multi-column sort survives a reload in priority order", () => {
   assert.deepEqual(loadView().sort, sort);
 });
 
-test("corrupt storage falls back to the focused Graham defaults", () => {
+test("corrupt storage falls back to the unfiltered defaults", () => {
   store.set("screener-view", "{ not json");
   const v = loadView();
   assert.equal(v.lens, "BOTH");
@@ -76,10 +80,21 @@ test("browser scroll restoration is taken over", () => {
   assert.equal(history.scrollRestoration, "manual");
 });
 
-test("companies a criterion cannot apply to are hidden unless asked for", () => {
-  // Banks and REITs file no classified balance sheet, so criteria 2 and 3 can never
-  // be answered for them. Default the filter on, but let an explicit choice stand.
-  assert.equal(loadView().hideNoApply, true);
-  saveView({ hideNoApply: false });
+test("clear-all values disable every table filter", () => {
+  const cleared = unfilteredView();
+  assert.equal(hasActiveFilters(cleared), false);
+
+  for (const patch of [
+    { lens: "DEFENSIVE" }, { fit: "BLOCKED" }, { gaps: "ONE_GAP" },
+    { profiles: ["OPERATING"] }, { sectors: ["Energy"] }, { venues: ["NYSE"] },
+    { indexes: ["S&P 500"] }, { minCap: 500e6 }, { minMet: 1 },
+    { minPositiveEps: 5 }, { minRoic: 6 }, { trackedOnly: true },
+    { hideNA: true }, { hideNoApply: true }, { belowNcav: true },
+  ]) assert.equal(hasActiveFilters({ ...cleared, ...patch }), true, JSON.stringify(patch));
+});
+
+test("an explicit applicability filter survives a reload", () => {
   assert.equal(loadView().hideNoApply, false);
+  saveView({ hideNoApply: true });
+  assert.equal(loadView().hideNoApply, true);
 });

@@ -81,10 +81,21 @@ class AnnualOwnerEarnings:
     all_capex_floor: Fact
     maintenance_estimate: Fact
     free_cash_flow: Fact | None
+    free_cash_flow_after_stock_compensation: Fact | None
+    free_cash_flow_after_acquisitions: Fact | None
+    expanded_free_cash_flow: Fact | None
+    stock_compensation: Fact | None
+    cash_acquisitions: Fact | None
+    capitalized_intangible_investment: Fact | None
+    working_capital_cash_effect: Fact | None
+    operating_cash_flow_before_working_capital: Fact | None
     diluted_shares: Fact
     all_capex_floor_per_share: Fact
     maintenance_estimate_per_share: Fact
     free_cash_flow_per_share: Fact | None
+    free_cash_flow_after_stock_compensation_per_share: Fact | None
+    free_cash_flow_after_acquisitions_per_share: Fact | None
+    expanded_free_cash_flow_per_share: Fact | None
 
 
 @dataclass(frozen=True)
@@ -101,9 +112,37 @@ class OwnerEarnings:
     all_capex_floor: Fact
     maintenance_estimate: Fact
     free_cash_flow: Fact | None
+    free_cash_flow_after_stock_compensation: Fact | None
+    free_cash_flow_after_acquisitions: Fact | None
+    expanded_free_cash_flow: Fact | None
+    stock_compensation: Fact | None
+    cash_acquisitions: Fact | None
+    capitalized_intangible_investment: Fact | None
+    working_capital_cash_effect: Fact | None
+    operating_cash_flow_before_working_capital: Fact | None
+    average_working_capital_cash_effect_3y: Decimal | None
+    stock_compensation_to_revenue: Decimal | None
+    stock_compensation_to_free_cash_flow: Decimal | None
+    acquisitions_to_free_cash_flow: Decimal | None
+    acquisition_years_10: int | None
+    acquisitions_to_capex_10: Decimal | None
+    # The return denominator is the exact average of the fiscal year's beginning
+    # and ending balance sheets.  The endpoint facts retain every filed input;
+    # `invested_capital` is their arithmetic mean for API compatibility.
+    invested_capital_beginning: Fact | None
+    invested_capital_ending: Fact | None
     invested_capital: Decimal | None
+    capital_including_cash_beginning: Fact | None
+    capital_including_cash_ending: Fact | None
+    capital_including_cash: Decimal | None
     all_capex_return: Decimal | None
     maintenance_estimate_return: Decimal | None
+    all_capex_return_including_cash: Decimal | None
+    maintenance_estimate_return_including_cash: Decimal | None
+    normalized_tax_rate: Decimal | None
+    nopat: Decimal | None
+    nopat_roic: Decimal | None
+    nopat_return_including_cash: Decimal | None
     # signed contributions in statement order, so the UI can show the derivation
     components: tuple[tuple[str, Decimal], ...]
     free_cash_flow_components: tuple[tuple[str, Decimal], ...]
@@ -140,6 +179,12 @@ class FinancialSnapshot:
     dividend_per_share: Decimal | None  # rolled to twelve months, for the yield
     pays_dividend: bool | None
     balance_sheet_date: date | None
+    # Contractual rent sits outside Graham's borrowed-money test. These fields
+    # expose it separately; fixed-charge coverage is a labelled proxy based on
+    # reported operating income, interest, and lease cost from one annual period.
+    operating_lease_liability: Fact | None = None
+    lease_cost: Fact | None = None
+    fixed_charge_coverage: Fact | None = None
     # A direct filing-reported quarterly common dividend rate, annualized. Unlike
     # dividend_per_share, this deliberately excludes identifiable special cash.
     recurring_dividend_per_share: Fact | None = None

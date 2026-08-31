@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { quoteStatus, quoteTone } from "../src/quote.js";
+import { quoteIcon, quoteStatus, quoteTone } from "../src/quote.js";
 
 const checked = "2026-08-28T13:10:00+00:00";
 const now = Date.parse(checked);
@@ -13,6 +13,7 @@ test("an actively traded pre-market quote is identified as extended-hours", () =
   };
   assert.equal(quoteStatus(row, now), "Pre-market · open at refresh");
   assert.equal(quoteTone(row, now), "extended");
+  assert.equal(quoteIcon(row, now), "◐");
 });
 
 
@@ -43,6 +44,7 @@ test("outside published sessions the stock is marked sleeping", () => {
   };
   assert.equal(quoteStatus(row, now), "After-hours quote · sleeping at refresh");
   assert.equal(quoteTone(row, now), "closed");
+  assert.equal(quoteIcon(row, now), "☾");
 });
 
 
@@ -53,4 +55,10 @@ test("an old market-state check is never presented as current", () => {
   assert.equal(quoteStatus(row, now + 21 * 60 * 1000),
     "After-hours quote · session status stale");
   assert.equal(quoteTone(row, now + 21 * 60 * 1000), "stale");
+  assert.equal(quoteIcon(row, now + 21 * 60 * 1000), "◇");
+});
+
+
+test("missing quotes get an unavailable icon", () => {
+  assert.equal(quoteIcon({}, now), "⊘");
 });

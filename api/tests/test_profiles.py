@@ -53,6 +53,35 @@ def test_profile_mapping_keeps_financials_out_of_industrial_screen():
     assert financial["alignment"]["defensive"]["verdict"] == "OUT_OF_SCOPE"
 
 
+def test_business_model_routes_name_preferred_and_noncomparable_metrics():
+    cases = (
+        ({"sector": "Financials", "industry": "National Commercial Banks"}, "BANK"),
+        ({"sector": "Financials", "industry": "Fire, Marine & Casualty Insurance"}, "INSURER"),
+        ({"sector": "Real estate", "industry": "Real Estate Investment Trusts"}, "REIT"),
+        ({"sector": "Energy", "industry": "Natural Gas Transmission"}, "MLP_PIPELINE"),
+        ({"sector": "Industrials", "industry": "Deep Sea Foreign Transportation"}, "SHIPPING"),
+        ({"sector": "Consumer", "industry": "Retail-Apparel & Accessory Stores"}, "RETAIL_LEASE"),
+        ({"sector": "Technology", "industry": "Services-Prepackaged Software"}, "SOFTWARE"),
+        ({"sector": "Energy", "industry": "Crude Petroleum & Natural Gas"}, "COMMODITY"),
+        ({"sector": "Utilities", "industry": "Electric Services"}, "UTILITY"),
+    )
+    for fields, expected in cases:
+        routes = enrich({**screen_row(), **fields})["analysis_routes"]
+        route = next(item for item in routes if item["id"] == expected)
+        assert route["preferred"] and route["deemphasize"]
+
+
+def test_filing_backed_acquisition_cadence_adds_serial_acquirer_route():
+    row = screen_row()
+    row["owner_earnings"] = {
+        "acquisition_years_10": 4,
+        "acquisitions_to_capex_10": 125,
+        "acquisitions_to_free_cash_flow": 80,
+    }
+    assert "SERIAL_ACQUIRER" in {
+        route["id"] for route in enrich(row)["analysis_routes"]}
+
+
 def test_operating_profile_exposes_both_alignments_and_modern_growth_label():
     result = enrich(screen_row())
     assert result["graham_profile"] == PROFILE_OPERATING

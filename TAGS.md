@@ -118,23 +118,49 @@ fact) feeds the defensive dividend test and the windowed short-history variant.
 
 A definitive Buffett figure is deliberately withheld unless maintenance capital
 expenditure and required additional working capital are evidenced. Primary XBRL
-normally reports neither. The payload therefore keeps three differently scoped
-figures separate:
+normally reports neither. The payload therefore keeps differently scoped figures
+separate:
 
-- **all-capex floor:** `reported earnings attributable to owners + D&A - total capex`;
-- **maintenance≈D&A estimate:** reported earnings, because the D&A add-back and
-  assumed maintenance-capex deduction cancel; and
-- **standard free cash flow:** `operating cash flow - total capex`.
+- **earnings after total capital expenditure:** `earnings available to common +
+  D&A - total capex`; it can materially understate a growing business and, because
+  required working capital is unknown, is not called a guaranteed floor;
+- **reported earnings — maintenance capex assumed equal to D&A:** the D&A add-back
+  and assumed maintenance deduction cancel by construction; and
+- **standard free cash flow:** `operating cash flow - cash capex`.
 
-The all-capex floor can materially understate a growing business because it deducts
-growth capex. The maintenance≈D&A figure is an explicit assumption, not a reported
-maintenance number. Standard FCF includes actual working-capital movements but
+The common numerator prefers a direct
+`NetIncomeLossAvailableToCommonStockholders*` fact. Where only parent income is
+available, a same-period preferred-dividend fact is deducted and both source facts
+remain in provenance. Standard FCF includes actual working-capital movements but
 cannot identify which portion was required. None is serialized or labelled as
 definitive owner earnings.
+
+Engine v112 adds separately named diagnostics without changing any Graham grade:
+
+| Diagnostic | Tags / formula | Guard |
+|---|---|---|
+| FCF after stock compensation | `ShareBasedCompensation`, then `AllocatedShareBasedCompensationExpense`; standard FCF less the CFO add-back | same fiscal period; conservative shareholder-cost diagnostic, not a second earnings expense |
+| FCF after cash acquisitions | `PaymentsToAcquireBusinessesNetOfCashAcquired`, then gross | same fiscal period; never relabelled standard FCF |
+| Capitalized-intangible cash investment | sum of `PaymentsToDevelopSoftware` and `PaymentsToAcquireIntangibleAssets` | only distinct, same-period cash-flow facts; content/contract costs remain absent without a reliable standard tag |
+| Working-capital cash effect | `IncreaseDecreaseInOperatingAssetsAndLiabilities` | the reported rollup only; overlapping subcomponents are never summed |
+| Operating-lease context | `OperatingLeaseLiability`; lease cost from `OperatingLeaseCost`, `LeaseCost`, `OperatingLeaseExpense`, then `RentExpense` | lease-adjusted debt requires both settled debt and the lease fact; fixed-charge coverage requires operating income, interest and lease cost for one annual period |
+
+Every return denominator is now the exact average of the fiscal year's beginning
+and ending capital. Both balance sheets must report assets, current liabilities,
+and current debt; missing current debt is not treated as zero. Two views are shown:
+capital including all cash, and capital excluding all filed cash and short-term
+investments. The proprietary earnings/cash returns retain those names. A separate
+NOPAT ROIC uses reported operating income, the median of at least two usable tax
+rates from the latest three years, and average invested capital; pass-through
+entities suppress it. No excess-cash estimate is invented.
 
 The company panel carries the newest ten completed fiscal-year slots. Every year
 requires the three same-period floor inputs and that year's reported diluted weighted
 average share count; a missing or differently dated input leaves the year blank.
+It shows total and per-share values together and supplements endpoint CAGR with
+three- and five-slot CAGR, medians, profitable/missing years, worst YoY decline,
+maximum drawdown, variability, and diluted-share CAGR. A declining total hidden
+by a falling share count is disclosed as buyback-driven per-share growth.
 Historical denominators are rebased for filing-observed later splits and for the
 priced depositary-receipt ratio, so the per-share values are on today's traded-
 security basis. If one interior denominator is an exact 1,000x/1,000,000x table-
@@ -681,6 +707,7 @@ without new evidence overturning the recorded counterexample.
 | 4d | **DONE — engine v58 (2026-08-20).** Three questions the criteria cannot answer, all disclosure and none of them a grade. (i) **The shape of the ten-year record.** `ch13` now reports the *first* half of the record separately (`growth_early`) — the ten-year figure adds both halves and cannot say which one produced the result — plus the latest year against the three behind it, and names the two unambiguous shapes: **52 sprints** (a flat decade carried by its last three years: CB, DUK, CSCO, ABT — whose smoothed EPS went $2.01 in FY2013–15 → $1.96 in FY2018–20 → $4.87 in FY2023–25) and **394 marathons** (both halves up ≥ 10%, ten positive years, no fall worse than 40%: MSFT, GOOGL, JPM). A first half that *declined* is deliberately neither: the rebound after a loss year is a return to where the company already was (D: −33% then +591%). (ii) **Deferred tax — the company's own signed opinion of its future earning power.** 265 companies reserve more than half their deferred tax assets while reporting a profit (META: 15,895M of 28,090M, and gross − allowance reconciles to its net tag to the dollar); 194 report a tax charge ≥ 80% deferred (TMUS FY2025: 3,289M charged, 425M currently payable; DTE: 88M charged against a 270M current *refund*, confirmed by its own `CurrentIncomeTaxExpenseBenefit`). Two traps found in the data and guarded: an allowance larger than the assets it reserves against proves the two tags are not one pair (VAL reserves 3,292M against a "gross" 1,368M), and a gross tag gone stale is rebuilt from net + allowance at the same date (BIIB's stopped in 2021). (iii) **`make events`** — material 8-K item numbers from each company's own filing index, the only company events readable without opening a document: non-reliance (4.02), bankruptcy (1.03), debt acceleration (2.04), listing deficiency (3.01), material impairment (2.06), repeated auditor changes (4.01). Items 5.02 and 1.02 were measured against a 200-company sample and **dropped** — at 87% and 38% of filers their numbers cannot separate a fired CFO from a board election, or a lost customer from a refinanced credit line. 19,232 events across all 5,911 companies; **2,165 (36%) carry at least one note** — 1,451 listing deficiencies, 670 auditor-churn, **573 non-reliance**, 215 debt accelerations, 185 impairments, 52 bankruptcies — and 2,291 companies are scanned clean, which is an answer rather than a blank. Each company records how far back its own index could be read (Wells Fargo's thousand most recent filings reach back fourteen months), and no note claims a window wider than that. |
 | 4 | Quality/context layer (one-time gains, warrants, impairments) — warnings only, never adjustments to Graham grades. |
 | 4e | **DONE — engine v67 (2026-08-22).** The audit of 2026-08-21 and its repairs. Thirty of thirty-three findings fixed, each against the company that proved it: one split counted twice (Lam Research FY2022 0.3275 to 3.275), an 8-K read as a split (Essential Utilities 5.50 to its filed 2.20), a debt rollup smaller than its own parts (Pangaea 0.52x PASS to 3.75x FAIL), a lease book standing in for Ford's borrowings, a partnership's group profit over its own units (Westlake 2.29x PASS to 13.29x FAIL), a 52/53-week year losing its restatement (ATI FAIL to PASS), criterion 4 decided on windows that closed a decade ago (Hershey, Berkshire), earnings and share counts on different bases (SM Energy, NRC), Canadian filers priced in the wrong currency, ROIC divided by a balance sheet twelve years newer (J&J FY2014 13.1% to FY2025 22.0%), a 2012 special dividend priced as a 9.49% yield, yields above 100% shipped by the export the engine refuses to publish, preferred-only payouts passing criterion 5 (Boeing), and a current ratio built from two different balance-sheet dates. **The coverage harness sampled nobody**: `coverage.py` selected on `mcap`, which the payload does not carry, so thirteen strata drew zero companies and only the forty pins were ever tested — the parts-vs-rollup identity that catches Pangaea was already written and had never run. Fixed, and the first real run over 113 companies found 110 unclassified tag families and fifteen identity mismatches; all are now read, registered with a reason, or explained by the engine's own refusal. **New**: Graham's two profitability ratios (net margin, return on book value) and a ratio table showing every ratio at today's price and at each of the last five fiscal year ends, each column struck on its own year's report and its own year's price; per-company incorporation from the filing index; a "check the filing" record for what only prose can settle (927 rows). **The cover page is read** (`sources/cover.py`, `make cover`): `dei:Security12bTitle` and `dei:TradingSymbol` are text under a share-class axis, so Company Facts strips both, and between them they settle the question every per-share figure rests on — which security the ticker prices. 3,750 covers read, 4,709 registered classes, six depositary ratios above one. Where a ratio exists the figures are restated onto the traded security: the share count divided by it, earnings, book value and dividends multiplied, so both sides of every multiple describe one thing. Onconova's market capitalisation falls from $550.2B to $42.3B and its P/E becomes measurable at 67.0; Akari's from $1,099B to $0.55B. The note quotes the filer's own sentence, so the parse can be checked rather than trusted, and a cover that has been read closes the gap it answers — 927 down to 632. Seven documentation defects corrected, including a verdict precedence stated backwards and a client-side price mirror that four documents promised and no commit ever built. 307 pytest + 22 node. |
+| 4f | **DONE — engine v112 (2026-08-29).** Owner/cash evidence now starts with income available to common, deducts a same-period preferred claim from parent income when necessary, and labels the D&A-cancelling estimate as reported earnings. Return denominators use exact average beginning/end capital and publish cash-included and cash-excluded views; cash-excluded capital is withheld unless cash, short-term investments, current debt, and any restricted-cash portion are explicitly filed at both endpoints. Normalized tax and supplemental cash-flow comparisons require aligned annual periods, and NOPAT ROIC is withheld for pass-through structures. Supplemental, provenance-backed lenses cover FCF after stock compensation, acquisitions and capitalized intangible cash investment, reported working-capital cash effects, operating leases and fixed-charge coverage. The UI adds total-versus-per-share trends, shorter CAGRs, medians, drawdowns, variability, asset-quality composition, buyback warnings, and explicit bank/insurer/REIT/MLP/shipping/retail/software/acquirer/commodity/utility comparability routes. Historical prices now adopt a declared split restatement only after the filing-derived EPS/BVPS history proves the same factor; until then the export retains contemporaneous closes and discloses the basis gap. Subjective adjusted-NCAV haircuts, estimated excess cash, custom-tag AFFO/DCF, and automated content normalization remain withheld rather than guessed. |
 | 5 | Inline-XBRL extension adapter — the only route to issuer-extension concepts (e.g. franchise rights) that Company Facts cannot expose, **and to the cover page**: `dei:Security12bTitle` carries the depositary ratio in prose ("each representing 10 Ordinary Shares") with the trading symbol attached to one share class, which is the only deterministic answer to "which security does this ticker price". 616 rows are waiting on it for the ratio and 183 for the class. |
 
 ### 4.4 Foreign-filer policy

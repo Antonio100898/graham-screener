@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { indexValuation, medianPositive, reportedRate } from "../src/screen.js";
+import { currentRatio, indexValuation, medianPositive, priceToBook, reportedRate } from "../src/screen.js";
 
 const row = ({ index = "S&P 500", pe = null, pe3 = null, ...extra } = {}) => ({
   idx: index ? [index] : [],
@@ -18,6 +18,15 @@ test("a missing reported rate is distinguished from a zero rate", () => {
   assert.equal(reportedRate(null), "Not available");
   assert.equal(reportedRate(0), "0.0%");
   assert.equal(reportedRate(12.114), "12.1%");
+});
+
+test("Research balance-sheet ratios preserve missing and invalid denominators", () => {
+  assert.equal(currentRatio({ current_assets: 300, current_liabilities: 100 }), 3);
+  assert.equal(currentRatio({ current_assets: 300, current_liabilities: 0 }), null);
+  assert.equal(currentRatio({ current_assets: null, current_liabilities: 100 }), null);
+  assert.equal(priceToBook({ price: 20, bvps: 8 }), 2.5);
+  assert.equal(priceToBook({ price: 20, bvps: -8 }), null);
+  assert.equal(priceToBook({ price: null, bvps: 8 }), null);
 });
 
 test("index valuation uses the full named-index cohort and reports usable denominators", () => {

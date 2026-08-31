@@ -1,9 +1,11 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
 
 from screener import api, portfolio, store
+from screener.sources.crypto import CryptoQuote
 
 
 def row(price=25):
@@ -162,6 +164,45 @@ def test_hourly_quote_warning_reaches_the_portfolio_position():
     assert result["positions"][0]["quote_refresh_warning"]["kind"] == "QUOTE_REFRESH_FAILED"
 
 
+def test_all_asset_summary_keeps_manual_holdings_cash_and_stock_quotes_distinct():
+    result = portfolio.build_portfolio(
+        {"id": 1, "name": "Paper", "base_currency": "USD"},
+        [trade(1, "BUY", 2, 9, 0, "2026-01-01T10:00:00+00:00")],
+        {"0000000001": row(25)},
+        [
+            {"id": 1, "portfolio_id": 1, "asset_type": "BOND", "symbol": "UST-2030",
+             "name": "Treasury note", "quantity": "10", "current_price": "98.5",
+             "currency": "USD", "note": None, "created_at": "2026-08-29T00:00:00+00:00",
+             "updated_at": "2026-08-29T00:00:00+00:00"},
+            {"id": 2, "portfolio_id": 1, "asset_type": "CRYPTO", "symbol": "BTC",
+             "name": "Bitcoin", "quantity": "0.1", "current_price": "60000",
+             "currency": "USD", "note": None, "created_at": "2026-08-29T00:00:00+00:00",
+             "updated_at": "2026-08-29T00:00:00+00:00"},
+        ],
+        {"amount": "500", "updated_at": "2026-08-29T00:00:00+00:00"},
+    )
+
+    assert result["summary"]["stock_value"] == 50
+    assert result["summary"]["bond_value"] == 985
+    assert result["summary"]["crypto_value"] == 6000
+    assert result["summary"]["liquid_cash"] == 500
+    assert result["summary"]["invested_assets"] == 7035
+    assert result["summary"]["total_assets"] == 7535
+    assert result["summary"]["holdings"] == 3
+    assert result["assets"]["bonds"][0]["market_value"] == 985
+    assert sum(item["weight_pct"] for item in result["allocation"]) == pytest.approx(100)
+
+
+def test_all_asset_total_is_withheld_until_cash_is_entered():
+    result = portfolio.build_portfolio(
+        {"id": 1, "name": "Paper", "base_currency": "USD"}, [], {}, [], None)
+
+    assert result["summary"]["stock_value"] == 0
+    assert result["summary"]["liquid_cash"] is None
+    assert result["summary"]["total_assets"] is None
+    assert all(item["weight_pct"] is None for item in result["allocation"])
+
+
 def test_sell_cannot_precede_or_exceed_buys():
     with pytest.raises(portfolio.PortfolioError, match="exceeds"):
         portfolio.build_portfolio(
@@ -194,6 +235,43 @@ def test_store_round_trips_trade_snapshot(tmp_path):
     assert store.portfolio_trades(conn, selected["id"])[0]["decision_snapshot"] == saved
     assert store.delete_portfolio_trade(conn, selected["id"], created["id"])
     assert store.portfolio_trades(conn, selected["id"]) == []
+    conn.close()
+
+
+def test_store_round_trips_manual_assets_and_liquid_cash(tmp_path):
+    conn = store.connect(tmp_path / "portfolio-assets.db")
+    selected = store.ensure_portfolio(conn)
+    created = store.add_portfolio_asset(
+        conn,
+        portfolio_id=selected["id"],
+        asset_type="CRYPTO",
+        symbol="BTC",
+        name="Bitcoin",
+        quantity="0.125",
+        current_price="61234.56",
+        currency="USD",
+        note="cold wallet",
+    )
+    cash = store.set_portfolio_cash(conn, selected["id"], "1234.56")
+
+    assert store.portfolio_assets(conn, selected["id"])[0]["quantity"] == "0.125"
+    assert store.portfolio_cash(conn, selected["id"])["amount"] == "1234.56"
+    updated = store.update_portfolio_asset(
+        conn,
+        portfolio_id=selected["id"],
+        asset_id=created["id"],
+        asset_type="CRYPTO",
+        symbol="BTC",
+        name="Bitcoin",
+        quantity="0.25",
+        current_price="62000",
+        currency="USD",
+        note=None,
+    )
+    assert updated["quantity"] == "0.25"
+    assert cash["amount"] == "1234.56"
+    assert store.delete_portfolio_asset(conn, selected["id"], created["id"])
+    assert store.portfolio_assets(conn, selected["id"]) == []
     conn.close()
 
 
@@ -246,3 +324,113 @@ def test_portfolio_api_records_and_removes_a_trade(tmp_path, monkeypatch):
     removed = client.delete(f"/portfolio/{selected['id']}/trades/{trade_id}")
     assert removed.status_code == 200
     assert removed.json()["portfolio"]["summary"]["positions"] == 0
+
+
+def test_portfolio_api_manages_manual_assets_and_liquid_cash(tmp_path, monkeypatch):
+    original_connect = store.connect
+    database = tmp_path / "api-portfolio-assets.db"
+    monkeypatch.setattr(api.store, "connect", lambda: original_connect(database))
+    dashboard = {"generated": "2026-08-28T12:00:00+00:00", "engine_version": 106,
+                 "rows": [row()]}
+    monkeypatch.setattr(api, "_portfolio_rows", lambda: (
+        dashboard, {"0000000001": dashboard["rows"][0]}))
+    client = TestClient(api.app)
+    selected = client.get("/portfolio").json()["portfolio"]
+
+    cash_response = client.put(
+        f"/portfolio/{selected['id']}/cash", json={"amount": "2500.25"})
+    assert cash_response.status_code == 200
+    assert cash_response.json()["portfolio"]["summary"]["liquid_cash"] == 2500.25
+
+    created = client.post(f"/portfolio/{selected['id']}/assets", json={
+        "asset_type": "BOND", "symbol": "UST-2030", "name": "Treasury note",
+        "quantity": "10", "current_price": "99.5", "currency": "USD",
+    })
+    assert created.status_code == 200
+    body = created.json()
+    assert body["portfolio"]["summary"]["bond_value"] == 995
+    assert body["portfolio"]["summary"]["total_assets"] == 3495.25
+    asset_id = body["asset"]["id"]
+
+    changed = client.put(f"/portfolio/{selected['id']}/assets/{asset_id}", json={
+        "asset_type": "BOND", "symbol": "UST-2030", "name": "Treasury note",
+        "quantity": "20", "current_price": "99", "currency": "USD",
+    })
+    assert changed.status_code == 200
+    assert changed.json()["portfolio"]["summary"]["bond_value"] == 1980
+
+    wrong_currency = client.post(f"/portfolio/{selected['id']}/assets", json={
+        "asset_type": "CRYPTO", "symbol": "BTC", "name": "Bitcoin",
+        "quantity": "1", "current_price": "1", "currency": "EUR",
+    })
+    assert wrong_currency.status_code == 422
+
+    removed = client.delete(f"/portfolio/{selected['id']}/assets/{asset_id}")
+    assert removed.status_code == 200
+    assert removed.json()["portfolio"]["assets"]["bonds"] == []
+
+
+def test_portfolio_api_discovers_and_live_prices_crypto(tmp_path, monkeypatch):
+    class FakeCrypto:
+        price = Decimal("60000")
+        failed = False
+        last = None
+
+        def products(self, currency):
+            return [{"id": "BTC-USD", "symbol": "BTC", "name": "Bitcoin",
+                     "display_name": "BTC/USD", "quote_currency": currency}]
+
+        def quote(self, product_id):
+            if self.failed:
+                return None
+            self.last = CryptoQuote(
+                product_id=product_id,
+                price=self.price,
+                asof=datetime(2026, 8, 30, 18, 45, tzinfo=timezone.utc),
+            )
+            return self.last
+
+        def cached_quote(self, _product_id):
+            return self.last
+
+    original_connect = store.connect
+    database = tmp_path / "api-live-crypto.db"
+    provider = FakeCrypto()
+    monkeypatch.setattr(api.store, "connect", lambda: original_connect(database))
+    monkeypatch.setattr(api, "_crypto", provider)
+    monkeypatch.setattr(api, "_portfolio_rows", lambda: ({"rows": []}, {}))
+    client = TestClient(api.app)
+    selected = client.get("/portfolio").json()["portfolio"]
+    client.put(f"/portfolio/{selected['id']}/cash", json={"amount": 0})
+
+    products = client.get("/crypto/products?currency=USD")
+    assert products.status_code == 200
+    assert products.json()["products"][0]["name"] == "Bitcoin"
+
+    created = client.post(f"/portfolio/{selected['id']}/assets", json={
+        "asset_type": "CRYPTO", "symbol": "BTC-USD", "name": "Bitcoin",
+        "quantity": "0.25", "currency": "USD",
+    })
+    assert created.status_code == 200
+    crypto = created.json()["portfolio"]["assets"]["crypto"][0]
+    assert crypto["current_price"] == 60000
+    assert crypto["market_value"] == 15000
+    assert crypto["price_live"] is True
+    assert crypto["price_source"] == "coinbase"
+
+    provider.price = Decimal("62000")
+    refreshed = client.get("/portfolio").json()
+    assert refreshed["assets"]["crypto"][0]["market_value"] == 15500
+    assert refreshed["summary"]["crypto_value"] == 15500
+
+    provider.failed = True
+    fallback = client.get("/portfolio").json()["assets"]["crypto"][0]
+    assert fallback["current_price"] == 62000
+    assert fallback["price_live"] is False
+    assert fallback["quote_refresh_warning"]["kind"] == "CRYPTO_QUOTE_REFRESH_FAILED"
+
+    invalid = client.post(f"/portfolio/{selected['id']}/assets", json={
+        "asset_type": "CRYPTO", "symbol": "NOPE-USD", "name": "Nope",
+        "quantity": "1", "currency": "USD",
+    })
+    assert invalid.status_code == 422

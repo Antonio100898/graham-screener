@@ -1,8 +1,39 @@
 """The independent payload checker must compare like dates and shown precision."""
 
 import json
+from datetime import date
+from decimal import Decimal
 
 from screener import audit
+
+
+def test_income_audit_does_not_compare_one_share_class_with_another(monkeypatch):
+    row = {
+        "cik": "0001067983",
+        "ticker": "BRK-B",
+        "annual_eps": {"2025": 31.04},
+        "annual_ratios": {"2025": {"end": "2025-12-31"}},
+        "sources": {"eps": {
+            "tag": "us-gaap:EarningsPerShareBasic",
+            "form": "10-K",
+            "accn": "brk-2025",
+            "end": "2025-12-31",
+            "segments": "ClassOfStock=EquivalentClassB;",
+        }},
+    }
+    printed = [("Basic earnings per share — Class A", [Decimal("46563")])]
+    tagged = {"us-gaap_EarningsPerShareBasic": [Decimal("46563")]}
+    monkeypatch.setattr(
+        audit,
+        "_read_statement",
+        lambda *_: ((printed, tagged), [0], [date(2025, 12, 31)], None),
+    )
+
+    result = audit.against_income(row, object())
+
+    assert result == [("FILING?", "FY2025 eps", 31.04, 46563.0,
+                       "filed under a share-class dimension that the rendered "
+                       "statement reader cannot distinguish")]
 
 
 def test_debt_identity_does_not_add_older_components_to_a_newer_rollup():

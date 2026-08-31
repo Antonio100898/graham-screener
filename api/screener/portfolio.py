@@ -237,7 +237,9 @@ def criterion_changes(before: Iterable[dict], after: Iterable[dict]) -> list[dic
     return changes
 
 
-def build_portfolio(portfolio: dict, trades: list[dict], current_rows: dict[str, dict]) -> dict:
+def build_portfolio(portfolio: dict, trades: list[dict], current_rows: dict[str, dict],
+                    manual_assets: list[dict] | None = None,
+                    cash: dict | None = None) -> dict:
     """FIFO positions and P&L, using Decimal until the API boundary."""
     states: dict[str, dict] = {}
     serialised_trades = []
@@ -382,7 +384,7 @@ def build_portfolio(portfolio: dict, trades: list[dict], current_rows: dict[str,
         )
 
     positions.sort(key=lambda position: position["ticker"] or "")
-    return {
+    result = {
         "portfolio": portfolio,
         "summary": {
             "positions": len(positions),
@@ -399,3 +401,96 @@ def build_portfolio(portfolio: dict, trades: list[dict], current_rows: dict[str,
         },
         "positions": positions,
     }
+    return _add_manual_assets(result, manual_assets or [], cash)
+
+
+def _add_manual_assets(result: dict, raw_assets: list[dict], cash: dict | None) -> dict:
+    """Add non-stock holdings and an honest all-assets allocation.
+
+    Stock quotes remain the dashboard's filing/market-backed values. Bond prices
+    are manual and crypto prices are enriched by the API from Coinbase. An absent
+    cash balance or missing stock quote withholds the combined total instead of
+    silently becoming zero.
+    """
+    assets = {"bonds": [], "crypto": []}
+    totals = {"BOND": ZERO, "CRYPTO": ZERO}
+    for raw in raw_assets:
+        asset_type = raw.get("asset_type")
+        if asset_type not in totals:
+            raise PortfolioError(f"unsupported portfolio asset type {asset_type!r}")
+        quantity = decimal_value(raw.get("quantity"), "quantity", positive=True)
+        current_price = decimal_value(
+            raw.get("current_price"), "current price", nonnegative=True)
+        market_value = quantity * current_price
+        totals[asset_type] += market_value
+        item = dict(raw)
+        item.update({
+            "quantity": float(quantity),
+            "current_price": float(current_price),
+            "market_value": float(market_value),
+        })
+        assets["bonds" if asset_type == "BOND" else "crypto"].append(item)
+
+    positions = result["positions"]
+    missing_stock_values = sum(position.get("market_value") is None for position in positions)
+    stock_value = (
+        sum((_number(position["market_value"]) or ZERO for position in positions), ZERO)
+        if not missing_stock_values else None
+    )
+    cash_amount = (
+        decimal_value(cash.get("amount"), "liquid cash", nonnegative=True)
+        if cash is not None else None
+    )
+    invested_assets = (
+        stock_value + totals["BOND"] + totals["CRYPTO"]
+        if stock_value is not None else None
+    )
+    total_assets = (
+        invested_assets + cash_amount
+        if invested_assets is not None and cash_amount is not None else None
+    )
+
+    allocation = [
+        {"type": "STOCK", "label": "Stocks", "value": _float(stock_value)},
+        {"type": "BOND", "label": "Bonds", "value": float(totals["BOND"])},
+        {"type": "CRYPTO", "label": "Crypto", "value": float(totals["CRYPTO"])},
+        {"type": "CASH", "label": "Liquid cash", "value": _float(cash_amount)},
+    ]
+    for category in allocation:
+        value = _number(category["value"])
+        category["weight_pct"] = (
+            float(value / total_assets * 100)
+            if value is not None and total_assets is not None and total_assets > 0 else None
+        )
+
+    for position in positions:
+        value = _number(position.get("market_value"))
+        position["portfolio_weight_pct"] = (
+            float(value / total_assets * 100)
+            if value is not None and total_assets is not None and total_assets > 0 else None
+        )
+    for group in assets.values():
+        for item in group:
+            value = _number(item["market_value"])
+            item["weight_pct"] = (
+                float(value / total_assets * 100)
+                if value is not None and total_assets is not None and total_assets > 0 else None
+            )
+
+    result["assets"] = assets
+    result["cash"] = {
+        "amount": _float(cash_amount),
+        "updated_at": cash.get("updated_at") if cash else None,
+    }
+    result["allocation"] = allocation
+    result["summary"].update({
+        "holdings": len(positions) + len(raw_assets),
+        "stock_value": _float(stock_value),
+        "bond_value": float(totals["BOND"]),
+        "crypto_value": float(totals["CRYPTO"]),
+        "liquid_cash": _float(cash_amount),
+        "invested_assets": _float(invested_assets),
+        "total_assets": _float(total_assets),
+        "unpriced_stock_positions": missing_stock_values,
+    })
+    return result

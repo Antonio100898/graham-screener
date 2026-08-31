@@ -39,6 +39,17 @@ export function quoteTone(row, now = Date.now()) {
 }
 
 
+export function quoteIcon(row, now = Date.now()) {
+  if (quotePrice(row) == null) return "⊘";
+  return {
+    regular: "●",
+    extended: "◐",
+    closed: "☾",
+    stale: "◇",
+  }[quoteTone(row, now)] ?? "◇";
+}
+
+
 export function quoteTitle(row) {
   if (quotePrice(row) == null) return "Quote unavailable";
   const parts = [quoteStatus(row)];

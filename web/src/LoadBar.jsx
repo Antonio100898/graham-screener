@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { send } from "./api.js";
 
-// Each action touches exactly one stage of the pipeline; the labels say which.
-// Recomputation after an engine change has no button: it starts by itself the
-// moment the app notices snapshots below the current engine version.
+// This control is shared by Research and Portfolio, so it stays above their
+// navigation rather than looking like part of either page.
 const ACTIONS = [
   {
     cmd: "bulk",
     label: "Load all",
-    sub: "every US filer, one download",
     hint: "Downloads SEC's complete 1.4 GB archive of every filer's financials, then screens them all. Do this once.",
     confirm:
       "Load every US filer from SEC?\n\n" +
@@ -19,13 +17,11 @@ const ACTIONS = [
   {
     cmd: "daily",
     label: "Fetch filings",
-    sub: "only companies that filed",
     hint: "Reads SEC's daily index to see who filed a 10-K or 10-Q, and refetches only those companies.",
   },
   {
     cmd: "quotes",
     label: "Refresh prices",
-    sub: "every listed ticker",
     hint: "Fetches every universe quote and atomically rebuilds the shared Research and Portfolio snapshot.",
   },
 ];
@@ -43,7 +39,6 @@ function ago(iso) {
 export default function LoadBar({ onFinished, shown }) {
   const [job, setJob] = useState(null);
   const [error, setError] = useState(null);
-  const [help, setHelp] = useState(false);
   const wasRunning = useRef(false);
   const autoDerived = useRef(false);
 
@@ -78,110 +73,59 @@ export default function LoadBar({ onFinished, shown }) {
   const run = async (action) => {
     if (action.confirm && !window.confirm(action.confirm)) return;
     setError(null);
-    const r = await send("/sync", { body: { command: action.cmd } });
-    if (!r.ok) setError((await r.json()).detail ?? `HTTP ${r.status}`);
-    else {
-      wasRunning.current = true;
-      poll();
+    try {
+      const r = await send("/sync", { body: { command: action.cmd } });
+      if (!r.ok) setError((await r.json()).detail ?? `HTTP ${r.status}`);
+      else {
+        wasRunning.current = true;
+        poll();
+      }
+    } catch (err) {
+      setError(err.message);
     }
   };
 
   const st = job?.store;
   const running = job?.status === "running";
   const pct = running && job.total ? Math.round((job.done / job.total) * 100) : null;
-  const unloaded = st ? st.companies - st.snapshots : 0;
 
   return (
-    <div className="loadbar">
+    <aside className="loadbar" aria-label="Shared data controls">
       <div className="topline">
+        <span className="loadbar-label">Data</span>
         <div className="actions">
           {ACTIONS.map((a) => (
             <button key={a.cmd} onClick={() => run(a)} disabled={running} title={a.hint}
                     className={a.heavy ? "heavy" : ""}>
-              <b>{a.label}</b>
-              <em>{a.sub}</em>
+              {a.label}
             </button>
           ))}
         </div>
-        <button className="helptoggle" onClick={() => setHelp((h) => !h)}>
-          {help ? "hide" : "how this works"}
-        </button>
+        {running ? (
+          <div className="prog">
+            <div className="bar">
+              <div className="fill" style={{ width: pct == null ? "100%" : `${pct}%` }}
+                   data-indeterminate={pct == null} />
+            </div>
+            <span className="txt">
+              {job.message}
+              {job.total ? ` · ${job.done.toLocaleString()}/${job.total.toLocaleString()}` : ""}
+            </span>
+            <button className="stop" onClick={() => send("/sync/cancel")}>Stop</button>
+          </div>
+        ) : st && (
+          <div className="loadbar-status">
+            <span title={st.last_fetch ?? "no fetch recorded"}>Filings <b>{ago(st.last_fetch)}</b></span>
+            <span title={st.last_quote_refresh ?? st.last_export ?? "no price refresh recorded"}>
+              Prices <b>{ago(st.last_quote_refresh ?? st.last_export)}</b>
+            </span>
+            <span><b>{shown?.toLocaleString() ?? st.snapshots.toLocaleString()}</b> screened</span>
+            {st.pending_refetch > 0 && <span className="pending">{st.pending_refetch.toLocaleString()} new filing{st.pending_refetch === 1 ? "" : "s"}</span>}
+            {job.status === "error" && <span className="bad" title={job.error}>Last job failed</span>}
+          </div>
+        )}
+        {error && <span className="bad loadbar-error">{error}</span>}
       </div>
-
-      {running ? (
-        <div className="prog">
-          <div className="bar">
-            <div className="fill" style={{ width: pct == null ? "100%" : `${pct}%` }}
-                 data-indeterminate={pct == null} />
-          </div>
-          <button className="stop" onClick={() => send("/sync/cancel")}>Stop</button>
-          <span className="txt">
-            {job.message}
-            {job.total ? ` — ${job.done.toLocaleString()} of ${job.total.toLocaleString()}` : ""}
-          </span>
-        </div>
-      ) : (
-        st && (
-          <div className="coverage">
-            <span className="fresh">
-              <span title={st.last_fetch ?? "no fetch recorded"}>
-                filings fetched <b>{ago(st.last_fetch)}</b>
-              </span>
-              {" · "}
-              <span title={st.computed_at ?? "nothing computed"}>
-                computed <b>{ago(st.computed_at)}</b>
-              </span>
-              {" · "}
-              <span title={st.last_quote_refresh ?? st.last_export ?? "no price refresh recorded"}>
-                prices <b>{ago(st.last_quote_refresh ?? st.last_export)}</b>
-              </span>
-              {job.auto_quotes?.running && <> · automatic every hour</>}
-            </span>
-            <span>
-              <b>{st.snapshots.toLocaleString()}</b> of {st.companies.toLocaleString()} companies have
-              financial data
-              {unloaded > 0 && (
-                <> · <b className="gap">{unloaded.toLocaleString()} never loaded</b></>
-              )}
-              {" · "}
-              <b>{shown?.toLocaleString() ?? "—"}</b> shown in the table
-              {st.pending_refetch > 0 && (
-                <> · {st.pending_refetch.toLocaleString()} filed since last sync</>
-              )}
-            </span>
-            {job.status === "done" && <b className="ok">✓ {job.message}</b>}
-            {job.status === "cancelled" && <b className="dim">⏹ stopped — work already done was kept</b>}
-            {job.status === "error" && <b className="bad">✗ {job.error}</b>}
-          </div>
-        )
-      )}
-      {error && <div className="bad">{error}</div>}
-
-      {help && (
-        <div className="help">
-          <p>
-            <b>Where the company list comes from.</b> SEC publishes a file mapping every ticker to a
-            permanent company ID (CIK). Nothing is hand-maintained — that file is the universe.
-          </p>
-          <p>
-            <b>Where the numbers come from.</b> Each company's complete filing history is one file
-            from SEC, downloaded once and kept. Screening runs locally against that copy, so it
-            costs nothing to re-run.
-          </p>
-          <p>
-            <b>Why data still needs refreshing.</b> Filings are permanent, but companies restate
-            earlier years — after a stock split or a correction, a year you already hold changes.
-            So the rule is "refetch anything that has filed since we last looked", not "refetch
-            anything missing a recent quarter".
-          </p>
-          <p className="dim">
-            To cover the whole market: <b>Load all</b> once. While the local server is
-            running, every listed ticker's quote refreshes automatically each hour;
-            <b> Refresh prices</b> runs the same universe-wide update immediately.
-            Afterwards <b>Fetch filings</b> daily or weekly keeps fundamentals current.
-          </p>
-        </div>
-      )}
-    </div>
+    </aside>
   );
 }

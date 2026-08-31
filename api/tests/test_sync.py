@@ -45,6 +45,19 @@ def test_price_settles_valuation_criteria():
     assert r["verdict"] == "FAIL"
 
 
+def test_price_adds_market_cap_to_positive_filing_backed_net_cash_only():
+    priced = row()
+    priced.update(shares=10, asset_quality={"net_cash": 50})
+    out = apply_price(priced, price=20)
+    assert out["asset_quality"]["market_cap_to_net_cash"] == 4
+
+    priced = row()
+    priced.update(shares=10, asset_quality={"net_cash": -50,
+                                            "market_cap_to_net_cash": 99})
+    out = apply_price(priced, price=20)
+    assert out["asset_quality"].get("market_cap_to_net_cash") is None
+
+
 def test_live_price_removes_obsolete_missing_price_quote_note():
     r = row(ttm=5.0, tbvps=None)
     r["criteria"][-1]["note"] = "missing: intangibles, price quote"
@@ -366,10 +379,58 @@ def test_history_accepts_a_corroborated_reverse_split_restatement():
     new = tuple((day, value * (10 if day < split_day else 1)) for day, value in old)
 
     accepted, warning = _validated_price_history(
-        fetched, old, new, ((split_day, Decimal("10")),))
+        fetched, old, new, ((split_day, Decimal("10")),), (Decimal("10"),))
 
     assert warning is None
     assert accepted == new
+
+
+def test_history_keeps_contemporaneous_prices_until_filings_match_the_split():
+    fetched = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    split_day = date(2026, 8, 22)
+    old = tuple((date(2026, 7, 1) + timedelta(days=7 * i), Decimal("2"))
+                for i in range(8))
+    adjusted = tuple((day, value * (10 if day < split_day else 1))
+                     for day, value in old)
+
+    accepted, warning = _validated_price_history(
+        fetched, old, adjusted, ((split_day, Decimal("10")),))
+
+    assert accepted == old
+    assert "per-share history does not yet reflect" in warning
+
+    # A prior buggy refresh may already have stored the adjusted series. The same
+    # declared event still lets the validator repair it without a ticker override.
+    repaired, warning = _validated_price_history(
+        datetime(2026, 8, 23, tzinfo=timezone.utc), adjusted, adjusted,
+        ((split_day, Decimal("10")),))
+    assert repaired == old
+    assert "per-share history does not yet reflect" in warning
+
+
+def test_per_share_changes_supply_the_independent_split_basis():
+    previous = {
+        "annual_eps": {"2025": -2},
+        "annual_ratios": {"2025": {"bvps": 4, "tbvps": 3}},
+    }
+    current = {
+        "annual_eps": {"2025": -20},
+        "annual_ratios": {"2025": {"bvps": 40, "tbvps": 30}},
+    }
+    factors = sync._per_share_restatement_factors(previous, current)
+    assert factors == (Decimal("10"), Decimal("10"), Decimal("10"))
+
+
+def test_price_stats_are_withheld_while_price_and_filing_split_bases_differ():
+    row_ = {
+        "price": 20,
+        "price_history_warning": {"note": (
+            "the provider declared a split that the filing-derived per-share history "
+            "does not yet reflect; contemporaneous historical closes remain in use")},
+    }
+    closes = ((date(2026, 8, 1), Decimal("10")),
+              (date(2026, 8, 8), Decimal("12")))
+    assert sync._price_stats_row(row_, closes) is None
 
 
 def test_routine_recompute_defers_ineligible_cache_rows_until_they_can_surface(tmp_path):
@@ -541,6 +602,40 @@ def test_row_carries_per_figure_provenance_and_series_mix():
     mix = row["series_mix"]["eps"]
     assert mix["us-gaap:EarningsPerShareBasicAndDiluted"] == [2021]
     assert 2025 in mix["us-gaap:EarningsPerShareDiluted"]
+
+
+def test_asset_quality_and_lease_metrics_are_payload_evidence_not_assumptions():
+    from tests.helpers import OE_GAAP, dur, facts_doc, inst, tagdata
+    from screener.sync import _derive
+
+    gaap = dict(OE_GAAP)
+    gaap.update({
+        "Liabilities": tagdata("USD", [inst("2026-03-31", 100e9, accn="q126")]),
+        "InventoryNet": tagdata("USD", [inst("2026-03-31", 50e9, accn="q126")]),
+        "AccountsReceivableNetCurrent": tagdata(
+            "USD", [inst("2026-03-31", 60e9, accn="q126")]),
+        "ShortTermInvestments": tagdata(
+            "USD", [inst("2026-03-31", 10e9, accn="q126")]),
+        "LongTermDebtNoncurrent": tagdata(
+            "USD", [inst("2026-03-31", 20e9, accn="q126")]),
+        "OperatingLeaseLiability": tagdata(
+            "USD", [inst("2026-03-31", 30e9, accn="q126")]),
+        "OperatingLeaseCost": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", 8e9, accn="k25", filed="2026-02-15")]),
+        "InterestExpense": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", 2e9, accn="k25", filed="2026-02-15")]),
+    })
+    status, row = _derive("0000000001", "TEST", facts_doc(gaap))
+    assert status == "ok"
+    quality = row["asset_quality"]
+    assert quality["inventory"] == 50e9 and quality["inventory_to_ncav"] == 25
+    assert quality["receivables"] == 60e9 and quality["receivables_to_ncav"] == 30
+    assert quality["net_cash"] == 30e9
+    assert row["operating_lease_liability"] == 30e9
+    assert row["lease_adjusted_debt"] == 50e9
+    assert row["fixed_charge_coverage"] == pytest.approx(10.8)
+    assert row["sources"]["inventory"]["accn"] == "q126"
+    assert row["sources"]["fixed_charge_coverage"]["components"]
 
 
 def test_peer_efficiency_needs_a_real_peer_group():

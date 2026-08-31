@@ -35,3 +35,27 @@ def test_due_scheduler_starts_one_universe_quote_job_and_records_attempt(
     conn = original_connect(database)
     assert store.get_state(conn, "last_quote_refresh_attempt") == now.isoformat(timespec="seconds")
     conn.close()
+
+
+def test_due_scheduler_defers_in_process_quote_job_until_engine_derive(
+        tmp_path, monkeypatch):
+    database = tmp_path / "schedule.db"
+    original_connect = store.connect
+    original_connect(database).close()
+    dashboard = tmp_path / "dashboard.json"
+    dashboard.write_text('{"rows":[]}', encoding="utf-8")
+    monkeypatch.setattr(jobs.sync, "DASHBOARD_JSON", dashboard)
+    monkeypatch.setattr(jobs.store, "connect", lambda: original_connect(database))
+    monkeypatch.setattr(
+        jobs.store, "needs_recompute", lambda _conn, *, eligible_only: ["0000000001"])
+    monkeypatch.setenv("SCREENER_AUTO_QUOTES", "1")
+    started = []
+    monkeypatch.setattr(jobs, "start", lambda command: (started.append(command) or True, command))
+
+    assert jobs.run_scheduled_quote_check(
+        datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)) is False
+    assert started == []
+
+    conn = original_connect(database)
+    assert store.get_state(conn, "last_quote_refresh_attempt") is None
+    conn.close()

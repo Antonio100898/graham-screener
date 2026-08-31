@@ -597,6 +597,32 @@ def test_class_voting_decoration_does_not_hide_the_registered_class():
     assert _class_member("Class A Limited Voting Shares") == _class_member("CommonClassA")
 
 
+def test_equivalent_share_basis_matches_the_registered_class():
+    """Berkshire dimensions EPS and weighted shares as Equivalent Class A and
+    Equivalent Class B. Equivalent identifies the per-share basis, while the
+    ticker suffix identifies which of those two classes its price belongs to."""
+    from screener.normalize import (
+        _annual_eps, _class_member, _registered_class_title,
+        _unambiguous_dimensioned,
+    )
+
+    assert _class_member("Class B Common Stock") == _class_member("EquivalentClassB")
+    assert _class_member("Class A Common Stock") != _class_member("EquivalentClassB")
+
+    sidecar = dimensioned("EarningsPerShareBasic", "USD/shares", [
+        classed_entry("2025-01-01", "2025-12-31", 46560,
+                      "ClassOfStock=EquivalentClassA;"),
+        classed_entry("2025-01-01", "2025-12-31", 31.04,
+                      "ClassOfStock=EquivalentClassB;"),
+    ])
+    registered = _registered_class_title("BRK-B", None)
+    annual = _annual_eps(_unambiguous_dimensioned(sidecar, registered))
+
+    assert registered == "Class B Common Stock"
+    assert float(annual[2025].value) == 31.04
+    assert annual[2025].provenance.segments == "ClassOfStock=EquivalentClassB;"
+
+
 def test_a_preferred_cover_collision_does_not_replace_a_plain_common_ticker():
     """The old cover grammar truncated ``GLP pr B`` to ``GLP`` and persisted its
     preferred title over the real common-unit row. A plain ticker cannot name that

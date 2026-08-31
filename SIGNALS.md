@@ -302,8 +302,10 @@ percentage honestly; the customer's *name* is prose only.
 There is no XBRL concept for a moat, and there will not be one. What the
 screener already computes as evidence *of* one:
 
-- `owner_earnings.all_capex_return` — a conservative floor that deducts all capex;
-  the separate maintenance≈D&A estimate is assumption-labelled.
+- `owner_earnings.all_capex_return` — earnings after all capex over exact average
+  invested capital; it is conservative for growth capex but not a guaranteed floor
+  because required working capital is not separately known. The separate
+  maintenance≈D&A reading is labelled as reported earnings by construction.
 - `peer_efficiency` (v49) — operating margin vs the median of the company's own
   industry; 527 companies materially behind.
 - Gross margin (`GrossProfit`, 43%) stability across the 10-year series, and

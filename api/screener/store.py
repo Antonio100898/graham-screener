@@ -17,7 +17,7 @@ from .sources import cover
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 108  # compact provenance for evidence-aware owner earnings and FCF
+ENGINE_VERSION = 114  # carry the selected share class into historical ratios
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
@@ -96,6 +96,35 @@ CREATE INDEX IF NOT EXISTS portfolio_trade_portfolio
 CREATE INDEX IF NOT EXISTS portfolio_trade_company
     ON portfolio_trade(portfolio_id, cik, executed_at, id);
 
+-- Bonds and crypto are current holdings rather than SEC-backed securities. They
+-- stay outside the immutable stock trade ledger; bond prices are manual and the
+-- crypto price is the saved fallback for the live Coinbase quote.
+CREATE TABLE IF NOT EXISTS portfolio_asset (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    portfolio_id  INTEGER NOT NULL,
+    asset_type    TEXT NOT NULL CHECK (asset_type IN ('BOND', 'CRYPTO')),
+    symbol        TEXT,
+    name          TEXT NOT NULL,
+    quantity      TEXT NOT NULL,
+    current_price TEXT NOT NULL,
+    currency      TEXT NOT NULL DEFAULT 'USD',
+    note          TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    FOREIGN KEY (portfolio_id) REFERENCES portfolio(id)
+);
+CREATE INDEX IF NOT EXISTS portfolio_asset_portfolio
+    ON portfolio_asset(portfolio_id, asset_type, name, id);
+
+-- No row means the owner has not supplied a cash balance.  It must not be
+-- silently treated as zero in the total-allocation dashboard.
+CREATE TABLE IF NOT EXISTS portfolio_cash (
+    portfolio_id INTEGER PRIMARY KEY,
+    amount       TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    FOREIGN KEY (portfolio_id) REFERENCES portfolio(id)
+);
+
 -- weekly closes, kept so the price statistics can be recomputed without asking
 -- the provider for five years of history again
 CREATE TABLE IF NOT EXISTS price_history (
@@ -157,7 +186,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 
 REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "portfolio",
-                             "portfolio_trade", "price_history", "filing_event",
+                             "portfolio_trade", "portfolio_asset", "portfolio_cash",
+                             "price_history", "filing_event",
                              "security_cover", "snapshot_dirty", "pending_filing"})
 
 
@@ -653,6 +683,108 @@ def delete_portfolio_trade(conn, portfolio_id: int, trade_id: int) -> bool:
     ).rowcount
     conn.commit()
     return bool(changed)
+
+
+def portfolio_assets(conn, portfolio_id: int) -> list[dict]:
+    rows = conn.execute(
+        """SELECT id, portfolio_id, asset_type, symbol, name, quantity,
+                  current_price, currency, note, created_at, updated_at
+             FROM portfolio_asset
+            WHERE portfolio_id = ?
+            ORDER BY asset_type, name COLLATE NOCASE, id""",
+        (portfolio_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_portfolio_asset(
+    conn,
+    *,
+    portfolio_id: int,
+    asset_type: str,
+    symbol: str | None,
+    name: str,
+    quantity: str,
+    current_price: str,
+    currency: str,
+    note: str | None = None,
+) -> dict:
+    now = _now()
+    cursor = conn.execute(
+        """INSERT INTO portfolio_asset
+               (portfolio_id, asset_type, symbol, name, quantity, current_price,
+                currency, note, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (portfolio_id, asset_type, symbol, name, quantity, current_price,
+         currency, note, now, now),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM portfolio_asset WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return dict(row)
+
+
+def update_portfolio_asset(
+    conn,
+    *,
+    portfolio_id: int,
+    asset_id: int,
+    asset_type: str,
+    symbol: str | None,
+    name: str,
+    quantity: str,
+    current_price: str,
+    currency: str,
+    note: str | None = None,
+) -> dict | None:
+    now = _now()
+    changed = conn.execute(
+        """UPDATE portfolio_asset
+              SET asset_type = ?, symbol = ?, name = ?, quantity = ?,
+                  current_price = ?, currency = ?, note = ?, updated_at = ?
+            WHERE portfolio_id = ? AND id = ?""",
+        (asset_type, symbol, name, quantity, current_price, currency, note, now,
+         portfolio_id, asset_id),
+    ).rowcount
+    conn.commit()
+    if not changed:
+        return None
+    row = conn.execute(
+        "SELECT * FROM portfolio_asset WHERE id = ?", (asset_id,)
+    ).fetchone()
+    return dict(row)
+
+
+def delete_portfolio_asset(conn, portfolio_id: int, asset_id: int) -> bool:
+    changed = conn.execute(
+        "DELETE FROM portfolio_asset WHERE portfolio_id = ? AND id = ?",
+        (portfolio_id, asset_id),
+    ).rowcount
+    conn.commit()
+    return bool(changed)
+
+
+def portfolio_cash(conn, portfolio_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT amount, updated_at FROM portfolio_cash WHERE portfolio_id = ?",
+        (portfolio_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def set_portfolio_cash(conn, portfolio_id: int, amount: str) -> dict:
+    updated_at = _now()
+    conn.execute(
+        """INSERT INTO portfolio_cash (portfolio_id, amount, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(portfolio_id) DO UPDATE SET
+             amount = excluded.amount,
+             updated_at = excluded.updated_at""",
+        (portfolio_id, amount, updated_at),
+    )
+    conn.commit()
+    return {"amount": amount, "updated_at": updated_at}
 
 
 def set_price_history(conn, cik: str, closes) -> None:

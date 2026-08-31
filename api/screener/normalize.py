@@ -829,6 +829,13 @@ def build_snapshot(
         }
 
     vintage = vintage_ttm_eps(gaap)
+    if classed and any(_is_equivalent_class_basis(f) for f in classed_eps.values()):
+        # Historical prices need earnings on the same class basis as the current
+        # quote. Berkshire's "Equivalent Class B" facts explicitly put the whole
+        # company onto that economic unit; Company Facts cannot carry the axis, so
+        # let the selected equivalent basis fill vintages it cannot compute. Bare
+        # values still win wherever they exist, matching the main EPS selection rule.
+        vintage = {**vintage_ttm_eps(classed), **vintage}
 
     # A depositary receipt is priced per receipt while the statements count the
     # ordinary shares behind it; the cover names the ratio and nothing else can.
@@ -855,6 +862,37 @@ def build_snapshot(
         "current_liabilities": current_liabilities,
         "short_term_debt": short_term_debt,
     }, fresh, annual_share_counts, classed)
+
+    operating_lease_liability = _latest_instant(
+        gaap, "OperatingLeaseLiability", LEASE_OBLIGATION_TAGS,
+        not_before=fresh)
+    lease_cost_series = _annual_union(gaap, LEASE_COST_TAGS)
+    lease_cost = None
+    if lease_cost_series:
+        candidate = lease_cost_series[max(lease_cost_series)]
+        if fresh is None or (candidate.provenance.period_end is not None
+                             and candidate.provenance.period_end >= fresh):
+            lease_cost = candidate
+    fixed_charge_coverage = None
+    operating_series = _annual_operating_income(gaap)
+    interest_series = _annual_union(gaap, INTEREST_EXPENSE_TAGS)
+    if lease_cost is not None and lease_cost.provenance.fiscal_year is not None:
+        lease_year = lease_cost.provenance.fiscal_year
+        operating_source = operating_series.get(lease_year)
+        interest_source = interest_series.get(lease_year)
+        if (operating_source is not None and interest_source is not None
+                and len({lease_cost.provenance.period_end,
+                         operating_source.provenance.period_end,
+                         interest_source.provenance.period_end}) == 1):
+            fixed_charges = abs(interest_source.value) + abs(lease_cost.value)
+            if fixed_charges > 0:
+                fixed_charge_coverage = _derived_flow(
+                    "Fixed-charge coverage proxy (operating income plus lease cost / "
+                    "interest plus lease cost)",
+                    f"({operating_source.provenance.tag} + {lease_cost.provenance.tag}) / "
+                    f"({interest_source.provenance.tag} + {lease_cost.provenance.tag})",
+                    (operating_source.value + abs(lease_cost.value)) / fixed_charges,
+                    (operating_source, interest_source, lease_cost), lease_year)
 
     return FinancialSnapshot(
         cik=cik,
@@ -892,6 +930,9 @@ def build_snapshot(
         recurring_dividend_per_share=recurring_dividend_per_share,
         pays_dividend=pays_dividend,
         balance_sheet_date=balance_sheet_date,
+        operating_lease_liability=operating_lease_liability,
+        lease_cost=lease_cost,
+        fixed_charge_coverage=fixed_charge_coverage,
         total_debt=total_debt,
         options_outstanding=options_outstanding,
         rsus_outstanding=rsus_outstanding,
@@ -3005,6 +3046,28 @@ OPERATING_CASH_FLOW_TAGS = (
     "NetCashProvidedByUsedInOperatingActivities",
     "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
 )
+# Supplemental cash-generation diagnostics.  These remain outside every Graham
+# criterion and never replace standard FCF.  The chains are alternatives, not
+# additive families: where both tags exist the first one supplies that year.
+STOCK_COMPENSATION_TAGS = (
+    "ShareBasedCompensation",
+    "AllocatedShareBasedCompensationExpense",
+)
+ACQUISITION_PAYMENT_TAGS = (
+    "PaymentsToAcquireBusinessesNetOfCashAcquired",
+    "PaymentsToAcquireBusinessesGross",
+)
+CAPITALIZED_INTANGIBLE_INVESTMENT_TAGS = (
+    "PaymentsToDevelopSoftware",
+    "PaymentsToAcquireIntangibleAssets",
+)
+# This rollup is the cash-flow-statement effect of operating assets and
+# liabilities.  Individual IncreaseDecreaseIn* components are deliberately not
+# summed: filers publish overlapping rollups and incomplete subsets.
+WORKING_CAPITAL_CASH_EFFECT_TAGS = (
+    "IncreaseDecreaseInOperatingCapital",
+    "IncreaseDecreaseInOperatingAssetsAndLiabilities",
+)
 INTEREST_EXPENSE_TAGS = (
     "InterestExpense", "InterestExpenseDebt", "InterestAndDebtExpense",
     "InterestExpenseNonoperating", "InterestIncomeExpenseNet",
@@ -3051,6 +3114,12 @@ CONVERTIBLE_PREFERRED_SHARE_TAGS = (
 )
 INVENTORY_TAGS = ("InventoryNet",)
 LEASE_OBLIGATION_TAGS = ("OperatingLeaseLiability",)
+LEASE_COST_TAGS = (
+    "OperatingLeaseCost",
+    "LeaseCost",
+    "OperatingLeaseExpense",
+    "RentExpense",
+)
 _DIVERGENCE = Decimal("1.30")   # this much faster than sales is worth saying
 _DIVERGENCE_SPAN = 3            # years back to compare against
 # The two post-ASU-2016-01 AFS successors and held-to-maturity go END of chain:
@@ -3082,6 +3151,186 @@ def _annual_union(gaap: dict, tags: tuple[str, ...],
     return out
 
 
+def _common_owner_earnings(gaap: dict) -> dict[int, Fact]:
+    """Annual earnings belonging to the common security being screened.
+
+    A direct income-available-to-common line is the closest numerator. Parent
+    net income is only the fallback, and a same-period preferred-dividend fact is
+    then deducted because that claim never reaches the common. This is the same
+    scope correction used by the EPS derivation, now applied to owner evidence.
+    """
+    common = _annual_union(gaap, COMMON_INCOME_TAGS)
+    parent = _annual_union(gaap, ("NetIncomeLoss", "ProfitLoss"))
+    preferred = _annual_union(gaap, PREFERRED_DIVIDEND_TAGS)
+    out = dict(common)
+    for year, income in parent.items():
+        if year in out:
+            continue
+        claim = preferred.get(year)
+        if (claim is None or claim.value == 0
+                or claim.provenance.period_end != income.provenance.period_end):
+            out[year] = income
+            continue
+        latest = max((income, claim), key=lambda fact: fact.provenance.filed).provenance
+        out[year] = Fact(
+            value=income.value - abs(claim.value),
+            provenance=Provenance(
+                concept="Net income available to common (parent income less preferred claims)",
+                tag=f"{income.provenance.tag} - {claim.provenance.tag}",
+                fiscal_year=year, form=latest.form, accession=latest.accession,
+                filed=latest.filed, period_end=income.provenance.period_end,
+                period_start=income.provenance.period_start,
+                components=(income.provenance, claim.provenance),
+            ),
+        )
+    return dict(sorted(out.items()))
+
+
+def _taxonomy_at_end(taxo: dict, end: date | None) -> dict:
+    """A taxonomy view containing instants at exactly one balance-sheet date."""
+    if end is None:
+        return {}
+    wanted = end.isoformat()
+    out = {}
+    for tag, data in taxo.items():
+        units = {
+            unit: [entry for entry in entries
+                   if "start" not in entry and entry.get("end") == wanted]
+            for unit, entries in (data.get("units", {}) or {}).items()
+        }
+        units = {unit: entries for unit, entries in units.items() if entries}
+        if units:
+            out[tag] = {**data, "units": units}
+    return out
+
+
+def _capital_fact(gaap: dict, end: date | None, exclude_cash: bool,
+                  caveats: list[str]) -> Fact | None:
+    """Invested capital at one exact date, retaining every filed input."""
+    exact = _taxonomy_at_end(gaap, end)
+    if not exact or end is None:
+        return None
+    assets = _latest_instant(
+        exact, "Assets", ("Assets", "LiabilitiesAndStockholdersEquity"),
+        not_before=end,
+    )
+    current_liabilities = _latest_instant(
+        exact, "LiabilitiesCurrent", ("LiabilitiesCurrent",), not_before=end,
+    )
+    if current_liabilities is None:
+        current_liabilities = _derived_instant(
+            exact, "LiabilitiesCurrent (derived: Liabilities - LiabilitiesNoncurrent)",
+            "Liabilities", "LiabilitiesNoncurrent", end,
+        )
+    if assets is None or assets.value <= 0 or current_liabilities is None:
+        return None
+
+    _, _, short_debt = _debt_figures(exact, end, current_liabilities)
+    if short_debt is None:
+        caveats.append(
+            f"no short-term-debt fact was available at {end.isoformat()}, so "
+            "non-interest-bearing current liabilities and invested capital are withheld")
+        return None
+    nibcl = current_liabilities.value - (short_debt.value if short_debt else Decimal(0))
+    value = assets.value - max(nibcl, Decimal(0))
+    components = [assets, current_liabilities]
+    expression = f"{assets.provenance.tag} - non-interest-bearing current liabilities"
+    components.append(short_debt)
+    expression += f" ({current_liabilities.provenance.tag} - {short_debt.provenance.tag})"
+
+    if exclude_cash:
+        cash = _latest_instant(exact, "Cash", CASH_TAGS, not_before=end)
+        investments = _latest_instant(
+            exact, "ShortTermInvestments", SHORT_TERM_INVESTMENT_TAGS, not_before=end)
+        if cash is None or investments is None:
+            missing = []
+            if cash is None:
+                missing.append("cash")
+            if investments is None:
+                missing.append("short-term-investment")
+            caveats.append(
+                f"no exact-date {' or '.join(missing)} fact was available at "
+                f"{end.isoformat()}, so cash-excluded invested capital is withheld")
+            return None
+        if (cash is not None
+                and _tag_of(cash) == "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"):
+            restricted = _restricted_cash(exact, end, end)
+            if (restricted is None or restricted.value < 0
+                    or restricted.value > cash.value):
+                caveats.append(
+                    f"the cash balance at {end.isoformat()} includes restricted cash but "
+                    "no valid exact-date restricted portion was filed, so cash-excluded "
+                    "invested capital is withheld")
+                return None
+            if restricted.value > 0:
+                original = cash
+                cash = Fact(value=cash.value - restricted.value, provenance=Provenance(
+                    concept="Cash (restricted portion netted out)",
+                    tag=f"{cash.provenance.tag} - {restricted.provenance.tag}",
+                    fiscal_year=None, form=cash.provenance.form,
+                    accession=cash.provenance.accession, filed=cash.provenance.filed,
+                    period_end=end, components=(original.provenance, restricted.provenance),
+                ))
+                caveats.append(
+                    f"the cash rollup at {end.isoformat()} includes restricted cash; "
+                    "the filed restricted portion was excluded from deployable cash")
+        value -= cash.value
+        components.append(cash)
+        expression += f" - {cash.provenance.tag}"
+        value -= investments.value
+        components.append(investments)
+        expression += f" - {investments.provenance.tag}"
+
+    latest = max(components, key=lambda fact: fact.provenance.filed).provenance
+    return Fact(
+        value=value,
+        provenance=Provenance(
+            concept=("Invested capital excluding all cash and short-term investments"
+                     if exclude_cash else "Invested capital including cash and investments"),
+            tag=expression, fiscal_year=None, form=latest.form,
+            accession=latest.accession, filed=latest.filed, period_end=end,
+            components=tuple(fact.provenance for fact in components),
+        ),
+    )
+
+
+def _derived_flow(concept: str, tag: str, value: Decimal,
+                  sources: tuple[Fact, ...], fiscal_year: int) -> Fact:
+    """A duration fact derived from same-period filed cash-flow inputs."""
+    latest = max(sources, key=lambda fact: fact.provenance.filed).provenance
+    return Fact(
+        value=value,
+        provenance=Provenance(
+            concept=concept, tag=tag, fiscal_year=fiscal_year, form=latest.form,
+            accession=latest.accession, filed=latest.filed,
+            period_end=latest.period_end, period_start=latest.period_start,
+            components=tuple(fact.provenance for fact in sources),
+        ),
+    )
+
+
+def _annual_additive_flows(gaap: dict, tags: tuple[str, ...],
+                           concept: str) -> dict[int, Fact]:
+    """Sum distinct cash-flow concepts only when their statement periods align."""
+    series = [_annual_series(gaap, tag, unit=("USD",)) for tag in tags]
+    years = set().union(*(set(items) for items in series)) if series else set()
+    out: dict[int, Fact] = {}
+    for year in years:
+        facts = tuple(items[year] for items in series if year in items)
+        ends = {fact.provenance.period_end for fact in facts}
+        starts = {fact.provenance.period_start for fact in facts}
+        if not facts or len(ends) != 1 or len(starts) != 1:
+            continue
+        out[year] = (facts[0] if len(facts) == 1 else _derived_flow(
+            concept,
+            " + ".join(fact.provenance.tag for fact in facts),
+            sum((abs(fact.value) for fact in facts), Decimal(0)),
+            facts,
+            year,
+        ))
+    return dict(sorted(out.items()))
+
+
 def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
                     annual_share_counts: dict[int, Fact] | None = None,
                     classed: dict | None = None) -> OwnerEarnings | None:
@@ -3106,13 +3355,20 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
     """
     caveats: list[str] = []
     flows: dict[str, dict[int, Fact]] = {}
-    # Owner earnings belongs to the parent/common holders. Prefer that scope per
-    # fiscal year; ProfitLoss is only the final fallback where no parent line exists.
-    if series := _annual_union(gaap, NET_INCOME_TAGS):
-        flows["reported earnings attributable to owners"] = series
+    # The priced security is common equity. A filed common-income line therefore
+    # wins; parent income is a fallback and is reduced by a same-period preferred
+    # claim where the filing supplies one.
+    if series := _common_owner_earnings(gaap):
+        flows["reported earnings available to common"] = series
     if series := _annual_union(gaap, CAPEX_TAGS):
         flows["total capital expenditure"] = series
     operating_cash_flow = _annual_union(gaap, OPERATING_CASH_FLOW_TAGS)
+    stock_compensation = _annual_union(gaap, STOCK_COMPENSATION_TAGS)
+    cash_acquisitions = _annual_union(gaap, ACQUISITION_PAYMENT_TAGS)
+    capitalized_intangibles = _annual_additive_flows(
+        gaap, CAPITALIZED_INTANGIBLE_INVESTMENT_TAGS,
+        "Cash investment in capitalized software and acquired intangibles")
+    working_capital_effect = _annual_union(gaap, WORKING_CAPITAL_CASH_EFFECT_TAGS)
 
     da = _annual_union(gaap, DA_TAGS)
     parts = [s for tag in DA_PART_TAGS if (s := _annual_series(gaap, tag, unit=("USD",)))]
@@ -3130,14 +3386,23 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
     if da:
         flows["depreciation & amortisation"] = da
 
-    required = ("reported earnings attributable to owners",
+    required = ("reported earnings available to common",
                 "depreciation & amortisation", "total capital expenditure")
     if any(k not in flows for k in required):
         return None
     shared = set.intersection(*(set(flows[k]) for k in required))
     if not shared:
         return None
-    fy = max(shared)
+    # A fiscal-year label is not enough: every numerator component must describe
+    # the same statement period. Misaligned facts remain missing rather than
+    # being combined into a number no filing reported.
+    aligned = {
+        year for year in shared
+        if len({flows[label][year].provenance.period_end for label in required}) == 1
+    }
+    if not aligned:
+        return None
+    fy = max(aligned)
     # A return divides a year's flows by the capital that produced them. Stale flows
     # beside a current balance sheet are not a return on anything.
     newest_end = max((flows[k][fy].provenance.period_end for k in required
@@ -3146,7 +3411,7 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
             and (fresh - newest_end).days > _OWNER_EARNINGS_LAG):
         return None
 
-    earnings_source = flows["reported earnings attributable to owners"][fy]
+    earnings_source = flows["reported earnings available to common"][fy]
     depreciation_source = flows["depreciation & amortisation"][fy]
     capex_source = flows["total capital expenditure"][fy]
     earnings = earnings_source.value
@@ -3167,7 +3432,7 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
     all_capex_floor_fact = Fact(
         value=all_capex_floor,
         provenance=Provenance(
-            concept="Owner-earnings all-capex floor",
+            concept="Earnings after total capital expenditure",
             tag=(f"{earnings_source.provenance.tag} + "
                  f"{depreciation_source.provenance.tag} - {capex_source.provenance.tag}"),
             fiscal_year=fy, form=latest_flow.form, accession=latest_flow.accession,
@@ -3180,7 +3445,7 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
     maintenance_estimate_fact = Fact(
         value=maintenance_estimate,
         provenance=Provenance(
-            concept="Owner-earnings estimate (maintenance capex assumed equal to D&A)",
+            concept="Reported earnings (maintenance capex assumed equal to D&A)",
             tag=(f"{earnings_source.provenance.tag} + {depreciation_source.provenance.tag} "
                  f"- assumed maintenance capex ({depreciation_source.provenance.tag})"),
             fiscal_year=fy, form=latest_flow.form, accession=latest_flow.accession,
@@ -3190,6 +3455,9 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
         ),
     )
     cash_flow = None
+    fcf_after_sbc = fcf_after_acquisitions = expanded_fcf = None
+    stock_source = acquisition_source = intangible_source = None
+    working_capital_source = cfo_before_working_capital = None
     cash_flow_components: tuple[tuple[str, Decimal], ...] = ()
     if (_tag_of(flows["total capital expenditure"][fy]) in CASH_CAPEX_TAGS
             and fy in operating_cash_flow
@@ -3213,8 +3481,45 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
             ("operating cash flow", operating_cash_source.value),
             ("- total capital expenditure", -capex),
         )
+
+        def same_period(series: dict[int, Fact]) -> Fact | None:
+            source = series.get(fy)
+            return (source if source is not None
+                    and source.provenance.period_end == cash_flow.provenance.period_end
+                    else None)
+
+        stock_source = same_period(stock_compensation)
+        acquisition_source = same_period(cash_acquisitions)
+        intangible_source = same_period(capitalized_intangibles)
+        working_capital_source = same_period(working_capital_effect)
+        if stock_source is not None:
+            amount = abs(stock_source.value)
+            fcf_after_sbc = _derived_flow(
+                "Free cash flow after stock compensation",
+                f"{cash_flow.provenance.tag} - {stock_source.provenance.tag}",
+                cash_flow.value - amount, (cash_flow, stock_source), fy)
+        if acquisition_source is not None:
+            amount = abs(acquisition_source.value)
+            fcf_after_acquisitions = _derived_flow(
+                "Free cash flow after cash acquisitions",
+                f"{cash_flow.provenance.tag} - {acquisition_source.provenance.tag}",
+                cash_flow.value - amount, (cash_flow, acquisition_source), fy)
+        if intangible_source is not None:
+            amount = abs(intangible_source.value)
+            expanded_fcf = _derived_flow(
+                "Free cash flow after capitalized software and intangible investment",
+                f"{cash_flow.provenance.tag} - {intangible_source.provenance.tag}",
+                cash_flow.value - amount, (cash_flow, intangible_source), fy)
+        if working_capital_source is not None:
+            cfo_before_working_capital = _derived_flow(
+                "Operating cash flow before reported working-capital cash effect",
+                f"{operating_cash_source.provenance.tag} - "
+                f"{working_capital_source.provenance.tag}",
+                operating_cash_source.value - working_capital_source.value,
+                (operating_cash_source, working_capital_source), fy)
+
     components = (
-        ("reported earnings attributable to owners", earnings),
+        ("reported earnings available to common", earnings),
         ("+ depreciation & amortisation", dep),
         ("- total capital expenditure", -capex),
     )
@@ -3222,64 +3527,117 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
     caveats += [
         "definitive Buffett owner earnings are withheld because primary XBRL does not "
         "separate maintenance capital expenditure from growth capital expenditure",
-        "the all-capex floor deducts total capital expenditure and can materially understate "
-        "the economics of a company investing for growth",
-        "the maintenance≈D&A estimate assumes maintenance capital expenditure exactly equals "
-        "depreciation and amortisation; it is an assumption, not a reported figure",
+        "earnings after total capex deducts growth and maintenance spending together and can "
+        "materially understate a company investing for growth; because required working "
+        "capital is omitted, it is not a guaranteed mathematical floor",
+        "the reported-earnings assumption sets maintenance capital expenditure exactly equal "
+        "to depreciation and amortisation, so the add-back and deduction cancel by construction",
         "required additional working capital is not separately reported and is not deducted "
         "from either estimate",
         "standard free cash flow is operating cash flow less total capital expenditure; it "
         "includes actual working-capital movements and is not labelled owner earnings",
-        "past write-offs that reduced invested capital cannot be reconstructed from the "
-        "filings, so invested capital is the balance sheet as it stands",
-        "stock compensation is already expensed within reported earnings and is not "
-        "deducted a second time",
+        "past write-offs that reduced invested capital cannot be reconstructed from filings",
+        "stock compensation is already expensed within reported earnings; the separate FCF "
+        "after stock compensation measure deducts the CFO add-back as a conservative "
+        "shareholder-cost diagnostic, not as a second earnings expense",
     ]
 
-    invested = all_capex_return = maintenance_estimate_return = None
-    assets, cur_liab = snap_parts.get("total_assets"), snap_parts.get("current_liabilities")
-    short_debt = snap_parts.get("short_term_debt")
-    cash = _latest_instant(gaap, "Cash", CASH_TAGS, not_before=fresh)
-    # When the cash rollup includes restricted cash, net out exactly ONE
-    # restricted representation at the SAME period end — restricted cash is not
-    # deployable capital (AAL), but a mismatched period would net a different
-    # balance sheet. Never against the plain carrying-value tag.
-    if cash is not None and _tag_of(cash) == "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents":
-        restricted = _restricted_cash(gaap, fresh, cash.provenance.period_end)
-        if restricted is not None and Decimal(0) < restricted.value <= cash.value:
-            cash = Fact(value=cash.value - restricted.value, provenance=Provenance(
-                concept="Cash (restricted portion netted out)",
-                tag=f"{cash.provenance.tag} - {restricted.provenance.tag}",
-                fiscal_year=None, form=cash.provenance.form,
-                accession=cash.provenance.accession, filed=cash.provenance.filed,
-                period_end=cash.provenance.period_end,
-            ))
-            caveats.append("the cash rollup includes restricted cash; the restricted portion "
-                           "was netted out of invested capital at the same period end")
-    investments = _latest_instant(gaap, "ShortTermInvestments", SHORT_TERM_INVESTMENT_TAGS,
-                                  not_before=fresh)
-    if assets is not None and cur_liab is not None:
-        # Non-interest-bearing current liabilities are what suppliers and employees fund;
-        # only the borrowed part of current liabilities is capital anyone charges for.
-        nibcl = cur_liab.value - (short_debt.value if short_debt else Decimal(0))
-        invested = (assets.value
-                    - (cash.value if cash else Decimal(0))
-                    - (investments.value if investments else Decimal(0))
-                    - max(nibcl, Decimal(0)))
-        if cash is None:
-            caveats.append("no cash balance found, so invested capital is overstated")
-        # ...and one that is a material share of the assets employed. A denominator
-        # of a few thousand dollars against millions of flow prints returns in the
-        # thousands of per cent: 75 rows shipped |ROIC| over 1,000%.
-        if invested > 0 and invested >= assets.value * _INVESTED_CAPITAL_FLOOR:
-            all_capex_return = all_capex_floor / invested * 100
-            maintenance_estimate_return = maintenance_estimate / invested * 100
-        else:
-            invested = None
-            caveats.append("invested capital is too small a part of the assets employed for a "
-                           "return on it to mean anything")
+    # The return denominator belongs to the same fiscal period as its numerator.
+    # Beginning capital is the instant immediately before the flow starts; ending
+    # capital is the statement date on which it closes. Both must exist.
+    flow_start, flow_end = earnings_source.provenance.period_start, earnings_source.provenance.period_end
+    beginning_end = flow_start - timedelta(days=1) if flow_start else None
+    invested_beginning = _capital_fact(gaap, beginning_end, True, caveats)
+    invested_ending = _capital_fact(gaap, flow_end, True, caveats)
+    gross_beginning = _capital_fact(gaap, beginning_end, False, caveats)
+    gross_ending = _capital_fact(gaap, flow_end, False, caveats)
+    invested = capital_including_cash = None
+    all_capex_return = maintenance_estimate_return = None
+    all_capex_return_including_cash = maintenance_estimate_return_including_cash = None
+
+    def average_capital(begin: Fact | None, end: Fact | None) -> Decimal | None:
+        if begin is None or end is None:
+            return None
+        average = (begin.value + end.value) / 2
+        return average if average > 0 else None
+
+    capital_including_cash = average_capital(gross_beginning, gross_ending)
+    invested = average_capital(invested_beginning, invested_ending)
+    if (invested is not None and capital_including_cash is not None
+            and invested < capital_including_cash * _INVESTED_CAPITAL_FLOOR):
+        invested = None
+    if invested is not None:
+        all_capex_return = all_capex_floor / invested * 100
+        maintenance_estimate_return = maintenance_estimate / invested * 100
     else:
-        caveats.append("no classified balance sheet, so invested capital cannot be separated")
+        caveats.append("an exact beginning-and-ending cash-excluded capital pair was unavailable "
+                       "or too small, so its return is withheld")
+    if capital_including_cash is not None:
+        all_capex_return_including_cash = all_capex_floor / capital_including_cash * 100
+        maintenance_estimate_return_including_cash = maintenance_estimate / capital_including_cash * 100
+
+    # A conventional capital-provider numerator: operating income after a median
+    # reported tax rate. This remains separate from the after-interest common-
+    # earnings measures above and is withheld without at least two usable years.
+    operating = _annual_operating_income(gaap)
+    tax = _annual_union(gaap, TAX_TAGS)
+    pretax = _annual_union(gaap, PRETAX_TAGS) or _annual_union(gaap, PRETAX_INCOME_TAGS)
+    rate_years = sorted(set(tax) & set(pretax))[-3:]
+    rates = sorted(
+        tax[year].value / pretax[year].value
+        for year in rate_years
+        if (tax[year].provenance.period_end == pretax[year].provenance.period_end
+            and pretax[year].value > 0
+            and Decimal(0) <= tax[year].value / pretax[year].value <= Decimal("0.50"))
+    )
+    normalized_tax_rate = nopat = nopat_roic = nopat_return_including_cash = None
+    operating_source = operating.get(fy)
+    if (len(rates) >= 2 and operating_source is not None
+            and operating_source.provenance.period_end == flow_end):
+        mid = len(rates) // 2
+        normalized_tax_rate = (rates[mid] if len(rates) % 2
+                               else (rates[mid - 1] + rates[mid]) / 2)
+        nopat = operating_source.value * (Decimal(1) - normalized_tax_rate)
+        if invested is not None:
+            nopat_roic = nopat / invested * 100
+        if capital_including_cash is not None:
+            nopat_return_including_cash = nopat / capital_including_cash * 100
+
+    annual_revenue = _annual_revenue(gaap)
+    stock_compensation_to_revenue = (
+        abs(stock_source.value) / annual_revenue[fy].value * 100
+        if (stock_source is not None and fy in annual_revenue
+            and annual_revenue[fy].provenance.period_end == flow_end
+            and annual_revenue[fy].value > 0)
+        else None)
+    stock_compensation_to_fcf = (
+        abs(stock_source.value) / cash_flow.value * 100
+        if stock_source is not None and cash_flow is not None and cash_flow.value > 0 else None)
+    acquisitions_to_fcf = (
+        abs(acquisition_source.value) / cash_flow.value * 100
+        if acquisition_source is not None and cash_flow is not None and cash_flow.value > 0 else None)
+    acquisition_window = [year for year in range(fy - 9, fy + 1)
+                          if year in cash_acquisitions and cash_acquisitions[year].value != 0]
+    acquisition_years_10 = len(acquisition_window) if cash_acquisitions else None
+    cumulative_acquisitions = sum((abs(cash_acquisitions[y].value)
+                                   for y in acquisition_window), Decimal(0))
+    # Missing acquisition facts are not zero. Compare acquisitions with capex
+    # only in the years that actually reported an acquisition payment.
+    capex_window = [year for year in acquisition_window
+                    if (year in flows["total capital expenditure"]
+                        and cash_acquisitions[year].provenance.period_end
+                        == flows["total capital expenditure"][year].provenance.period_end)]
+    cumulative_capex = sum((abs(flows["total capital expenditure"][y].value)
+                            for y in capex_window), Decimal(0))
+    acquisitions_to_capex_10 = (cumulative_acquisitions / cumulative_capex * 100
+                                if cumulative_capex > 0 and acquisition_window else None)
+    wc_years = list(range(fy - 2, fy + 1))
+    average_working_capital = (
+        sum((working_capital_effect[y].value for y in wc_years), Decimal(0)) / 3
+        if all(y in working_capital_effect and y in operating_cash_flow
+               and working_capital_effect[y].provenance.period_end
+               == operating_cash_flow[y].provenance.period_end
+               for y in wc_years) else None)
 
     annual: dict[int, AnnualOwnerEarnings] = {}
     periods = _per_share_periods(gaap)
@@ -3370,7 +3728,7 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
         floor_fact = Fact(
             value=floor_y,
             provenance=Provenance(
-                concept="Owner-earnings all-capex floor",
+                concept="Earnings after total capital expenditure",
                 tag=(f"{facts[0].provenance.tag} + {facts[1].provenance.tag} "
                      f"- {facts[2].provenance.tag}"),
                 fiscal_year=year, form=latest.form, accession=latest.accession,
@@ -3382,7 +3740,7 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
         estimate_fact = Fact(
             value=earnings_y,
             provenance=Provenance(
-                concept="Owner-earnings estimate (maintenance capex assumed equal to D&A)",
+                concept="Reported earnings (maintenance capex assumed equal to D&A)",
                 tag=(f"{facts[0].provenance.tag} + {facts[1].provenance.tag} "
                      f"- assumed maintenance capex ({facts[1].provenance.tag})"),
                 fiscal_year=year, form=latest.form, accession=latest.accession,
@@ -3393,6 +3751,9 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
         )
 
         cash_flow_fact = None
+        fcf_after_sbc_y = fcf_after_acquisitions_y = expanded_fcf_y = None
+        stock_y = acquisition_y = intangible_y = working_capital_y = None
+        cfo_before_working_capital_y = None
         cash_flow_source = operating_cash_flow.get(year)
         if (cash_flow_source is not None
                 and _tag_of(facts[2]) in CASH_CAPEX_TAGS
@@ -3410,6 +3771,40 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
                     components=(cash_flow_source.provenance, facts[2].provenance),
                 ),
             )
+            def annual_period_source(series: dict[int, Fact]) -> Fact | None:
+                source = series.get(year)
+                return (source if source is not None
+                        and source.provenance.period_end == cash_flow_source.provenance.period_end
+                        else None)
+
+            stock_y = annual_period_source(stock_compensation)
+            acquisition_y = annual_period_source(cash_acquisitions)
+            intangible_y = annual_period_source(capitalized_intangibles)
+            working_capital_y = annual_period_source(working_capital_effect)
+            if stock_y is not None:
+                fcf_after_sbc_y = _derived_flow(
+                    "Free cash flow after stock compensation",
+                    f"{cash_flow_fact.provenance.tag} - {stock_y.provenance.tag}",
+                    cash_flow_fact.value - abs(stock_y.value),
+                    (cash_flow_fact, stock_y), year)
+            if acquisition_y is not None:
+                fcf_after_acquisitions_y = _derived_flow(
+                    "Free cash flow after cash acquisitions",
+                    f"{cash_flow_fact.provenance.tag} - {acquisition_y.provenance.tag}",
+                    cash_flow_fact.value - abs(acquisition_y.value),
+                    (cash_flow_fact, acquisition_y), year)
+            if intangible_y is not None:
+                expanded_fcf_y = _derived_flow(
+                    "Free cash flow after capitalized software and intangible investment",
+                    f"{cash_flow_fact.provenance.tag} - {intangible_y.provenance.tag}",
+                    cash_flow_fact.value - abs(intangible_y.value),
+                    (cash_flow_fact, intangible_y), year)
+            if working_capital_y is not None:
+                cfo_before_working_capital_y = _derived_flow(
+                    "Operating cash flow before reported working-capital cash effect",
+                    f"{cash_flow_source.provenance.tag} - {working_capital_y.provenance.tag}",
+                    cash_flow_source.value - working_capital_y.value,
+                    (cash_flow_source, working_capital_y), year)
 
         def per_share_fact(source: Fact, concept: str) -> Fact:
             return Fact(
@@ -3430,13 +3825,30 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
             all_capex_floor=floor_fact,
             maintenance_estimate=estimate_fact,
             free_cash_flow=cash_flow_fact,
+            free_cash_flow_after_stock_compensation=fcf_after_sbc_y,
+            free_cash_flow_after_acquisitions=fcf_after_acquisitions_y,
+            expanded_free_cash_flow=expanded_fcf_y,
+            stock_compensation=stock_y,
+            cash_acquisitions=acquisition_y,
+            capitalized_intangible_investment=intangible_y,
+            working_capital_cash_effect=working_capital_y,
+            operating_cash_flow_before_working_capital=cfo_before_working_capital_y,
             diluted_shares=adjusted_count,
-            all_capex_floor_per_share=per_share_fact(floor_fact, "All-capex floor"),
+            all_capex_floor_per_share=per_share_fact(floor_fact, "Earnings after total capex"),
             maintenance_estimate_per_share=per_share_fact(
-                estimate_fact, "Maintenance-capex estimate"),
+                estimate_fact, "Reported earnings assumption"),
             free_cash_flow_per_share=(
                 per_share_fact(cash_flow_fact, "Free cash flow")
                 if cash_flow_fact is not None else None),
+            free_cash_flow_after_stock_compensation_per_share=(
+                per_share_fact(fcf_after_sbc_y, "Free cash flow after stock compensation")
+                if fcf_after_sbc_y is not None else None),
+            free_cash_flow_after_acquisitions_per_share=(
+                per_share_fact(fcf_after_acquisitions_y, "Free cash flow after acquisitions")
+                if fcf_after_acquisitions_y is not None else None),
+            expanded_free_cash_flow_per_share=(
+                per_share_fact(expanded_fcf_y, "Expanded free cash flow")
+                if expanded_fcf_y is not None else None),
         )
 
     return OwnerEarnings(
@@ -3444,12 +3856,37 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
         all_capex_floor=all_capex_floor_fact,
         maintenance_estimate=maintenance_estimate_fact,
         free_cash_flow=cash_flow,
+        free_cash_flow_after_stock_compensation=fcf_after_sbc,
+        free_cash_flow_after_acquisitions=fcf_after_acquisitions,
+        expanded_free_cash_flow=expanded_fcf,
+        stock_compensation=stock_source,
+        cash_acquisitions=acquisition_source,
+        capitalized_intangible_investment=intangible_source,
+        working_capital_cash_effect=working_capital_source,
+        operating_cash_flow_before_working_capital=cfo_before_working_capital,
+        average_working_capital_cash_effect_3y=average_working_capital,
+        stock_compensation_to_revenue=stock_compensation_to_revenue,
+        stock_compensation_to_free_cash_flow=stock_compensation_to_fcf,
+        acquisitions_to_free_cash_flow=acquisitions_to_fcf,
+        acquisition_years_10=acquisition_years_10,
+        acquisitions_to_capex_10=acquisitions_to_capex_10,
+        invested_capital_beginning=invested_beginning,
+        invested_capital_ending=invested_ending,
         invested_capital=invested,
+        capital_including_cash_beginning=gross_beginning,
+        capital_including_cash_ending=gross_ending,
+        capital_including_cash=capital_including_cash,
         all_capex_return=all_capex_return,
         maintenance_estimate_return=maintenance_estimate_return,
+        all_capex_return_including_cash=all_capex_return_including_cash,
+        maintenance_estimate_return_including_cash=maintenance_estimate_return_including_cash,
+        normalized_tax_rate=normalized_tax_rate,
+        nopat=nopat,
+        nopat_roic=nopat_roic,
+        nopat_return_including_cash=nopat_return_including_cash,
         components=components,
         free_cash_flow_components=cash_flow_components,
-        caveats=tuple(caveats),
+        caveats=tuple(dict.fromkeys(caveats)),
         annual=annual,
     )
 
@@ -3895,6 +4332,10 @@ def _class_member(title: str) -> frozenset[str]:
         "unit", "units", "representing", "limited", "partner", "partners",
         "partnership", "interest", "interests", "capital", "account", "equity",
         "fixed", "rate", "cumulative", "redeemable",
+        # Berkshire states EPS and weighted shares on an economically equivalent
+        # Class A/Class B basis. "Equivalent" describes the unit of measure, not
+        # a third legal share class, so it must not defeat the cover/ticker match.
+        "equivalent",
     }}
     # Some covers shorten "Series B Preferred Units" to "Series B Fixed Rate
     # Cumulative Redeemable". Once a series letter/number is present it is the
@@ -3902,6 +4343,17 @@ def _class_member(title: str) -> frozenset[str]:
     if "series" in kept:
         kept.discard("preferred")
     return frozenset(kept) or frozenset({"common"})
+
+
+def _is_equivalent_class_basis(fact: Fact) -> bool:
+    """Whether a classed fact states the whole security on an equivalent basis.
+
+    A plain Class A weighted count is only one slice and cannot divide total common
+    equity. Berkshire's ``EquivalentClassB`` is different: the filing has converted
+    both legal classes into one economic Class B unit, so it is a valid denominator
+    for whole-company book value as well as Class B EPS.
+    """
+    return "equivalentclass" in (fact.provenance.segments or "").lower()
 
 
 def _dimensioned_class(
@@ -4125,7 +4577,8 @@ def _note(kind: str, text: str) -> dict:
 
 def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[int, Fact],
                   annual_operating: dict[int, Fact], years: int = 6,
-                  annual_eps: dict[int, Fact] | None = None) -> dict[int, dict]:
+                  annual_eps: dict[int, Fact] | None = None,
+                  annual_share_counts: dict[int, Fact] | None = None) -> dict[int, dict]:
     """Graham's comparison ratios as they stood at each fiscal year end.
 
     Chapter 13 compares companies by putting the same handful of ratios side by
@@ -4159,6 +4612,17 @@ def annual_ratios(gaap: dict, annual_ni: dict[int, Fact], annual_revenue: dict[i
     if annual_eps is None:
         annual_eps = _annual_eps(gaap)
     counts = _annual_share_counts(gaap, {}, annual_eps, annual_ni)
+    if annual_share_counts is not None:
+        # The snapshot has already selected dimensioned counts onto the traded
+        # class. Company Facts cannot reproduce those, so let them fill its gaps.
+        # Keep ordinary counts on the established path: receipt counts have already
+        # been rebased by the snapshot and are restated later by sync, while using
+        # them here would apply that legal ratio twice.
+        classed_counts = {
+            year: fact for year, fact in annual_share_counts.items()
+            if _is_equivalent_class_basis(fact)
+        }
+        counts = {**classed_counts, **counts}
     options = _annual_balances(gaap, OPTION_COUNT_TAGS, unit=("shares",), labels=labels)
     rsus = _annual_balances(gaap, RSU_COUNT_TAGS, unit=("shares",), labels=labels)
 

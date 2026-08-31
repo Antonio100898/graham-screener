@@ -35,6 +35,14 @@ the net result of immutable buys and sells.
   pre/post windows the security is marked sleeping; an unsupported overnight
   price is never inferred from the previous RTH close.
 - Non-USD trades stay separate until an explicit FX source exists.
+- Bonds and crypto are current holdings, separate from the immutable stock trade
+  ledger. Bond prices remain manual. Crypto markets are selected from Coinbase's
+  public active-pair catalogue and valued from its live last-trade ticker; the
+  saved quote is a disclosed fallback when refresh fails. Quantity and the saved
+  price remain decimal text.
+- Liquid cash is a persisted portfolio balance. An amount that has never been
+  entered remains unknown, not zero, so the combined total and allocation do not
+  overstate completeness.
 
 ## Decision evidence
 
@@ -60,6 +68,14 @@ The position table shows quantity, average cost including fees, current dated
 price, cost basis, market value, unrealised P&L, portfolio weight, first/latest
 trade dates, purchase-versus-current Graham fit, and purchase-versus-current
 valuation multiples. Existing multi-column sorting semantics apply.
+
+The top-level dashboard totals stocks, bonds, crypto, and liquid cash and shows
+their allocation percentages. Its three tabs keep the full stock ledger in
+**Stocks** and provide current-holding lists for **Bonds** and **Crypto**. A
+missing stock quote or unentered cash balance withholds the combined total and
+allocation percentages. Holdings can be added, updated, and removed; cash can be
+entered or updated directly in the summary. While the page is open, crypto quotes
+and the resulting allocation refresh every 30 seconds.
 
 The position detail shows:
 

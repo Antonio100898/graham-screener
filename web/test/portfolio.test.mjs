@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { matchesPortfolio, openPortfolioCiks, reviewChanges } from "../src/portfolio.js";
+import {
+  matchesPortfolio, matchesPortfolioAsset, openPortfolioCiks, portfolioHoldingCount,
+  reviewChanges,
+} from "../src/portfolio.js";
 
 
 test("a pre-trade quote cannot create a price-dependent exit-review signal", () => {
@@ -54,4 +57,23 @@ test("research holding markers include only positive open portfolio positions", 
   ] });
 
   assert.deepEqual([...ciks], ["0001"]);
+});
+
+
+test("portfolio search includes manual asset identifiers, names and notes", () => {
+  const bond = { symbol: "US91282C", name: "US Treasury note", note: "retirement account" };
+
+  assert.equal(matchesPortfolioAsset(bond, "treasury"), true);
+  assert.equal(matchesPortfolioAsset(bond, "91282"), true);
+  assert.equal(matchesPortfolioAsset(bond, "retirement"), true);
+  assert.equal(matchesPortfolioAsset(bond, "bitcoin"), false);
+});
+
+
+test("portfolio holding count includes stocks, bonds and crypto", () => {
+  assert.equal(portfolioHoldingCount({
+    positions: [{ cik: "1" }],
+    assets: { bonds: [{ id: 1 }, { id: 2 }], crypto: [{ id: 3 }] },
+  }), 4);
+  assert.equal(portfolioHoldingCount({ summary: { holdings: 7 } }), 7);
 });

@@ -3,25 +3,51 @@
 // and Sets serialise badly as query strings.
 const KEY = "screener-view";
 
+/** Every table-filter control in its genuinely unfiltered state. */
+export function unfilteredView() {
+  return {
+    gaps: "ALL",
+    lens: "BOTH",
+    fit: "ALL",
+    profiles: [],
+    sectors: [],
+    venues: [],
+    indexes: [],
+    minCap: 0,
+    minMet: 0,
+    minPositiveEps: 0,
+    minRoic: 0,
+    trackedOnly: false,
+    hideNA: false,
+    hideNoApply: false,
+    belowNcav: false,
+  };
+}
+
+const selected = (value) => value?.size ?? value?.length ?? 0;
+
+/** Whether the table is narrower than the full loaded universe. */
+export function hasActiveFilters(view) {
+  return view.lens !== "BOTH"
+    || view.fit !== "ALL"
+    || view.gaps !== "ALL"
+    || selected(view.profiles) > 0
+    || selected(view.sectors) > 0
+    || selected(view.venues) > 0
+    || selected(view.indexes) > 0
+    || view.minCap > 0
+    || view.minMet > 0
+    || view.minPositiveEps > 0
+    || view.minRoic > 0
+    || Boolean(view.trackedOnly)
+    || Boolean(view.hideNA)
+    || Boolean(view.hideNoApply)
+    || Boolean(view.belowNcav);
+}
+
 const DEFAULTS = {
   q: "",
-  gaps: "ALL",
-  lens: "BOTH",
-  fit: "ALL",
-  profiles: [],
-  sectors: [],
-  venues: [],
-  indexes: [],
-  minCap: 500e6,
-  minMet: 0,
-  minPositiveEps: 0,
-  minRoic: 0,
-  trackedOnly: false,
-  hideNA: false,
-  // on by default: criteria 2 and 3 cannot apply to a filer with no classified
-  // balance sheet, so these companies are unreachable rather than merely unmeasured
-  hideNoApply: true,
-  belowNcav: false,
+  ...unfilteredView(),
   sort: { key: "fit", dir: 1 },
   scroll: 0,
 };

@@ -59,6 +59,23 @@ def build(gaap=GAAP):
     return build_snapshot("TEST", "0000000001", facts_doc(gaap))
 OE_GAAP = {
     **GAAP,
+    # The FY2025 return denominator requires the exact balance sheets at both
+    # 2024-12-31 and 2025-12-31. The later quarter remains the snapshot date.
+    "Assets": tagdata("USD", [
+        inst("2024-12-31", 1000e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 1000e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 1000e9, accn="q126"),
+    ]),
+    "LiabilitiesCurrent": tagdata("USD", [
+        inst("2024-12-31", 150e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 150e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 150e9, accn="q126"),
+    ]),
+    "DebtCurrent": tagdata("USD", [
+        inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 0, accn="q126"),
+    ]),
     "NetIncomeLoss": tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 70e9, accn="k25", filed="2026-02-15")]),
     "OperatingIncomeLoss": tagdata("USD", [
@@ -72,7 +89,17 @@ OE_GAAP = {
     "NetCashProvidedByUsedInOperatingActivities": tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 75e9, accn="k25", filed="2026-02-15")]),
     "CashAndCashEquivalentsAtCarryingValue": tagdata("USD", [
-        inst("2026-03-31", 40e9, accn="q126")]),
+        inst("2024-12-31", 40e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 40e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 40e9, accn="q126"),
+    ]),
+    # Missing is not zero: the cash-excluded return requires a filed zero for
+    # short-term investments at both denominator dates.
+    "ShortTermInvestments": tagdata("USD", [
+        inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 0, accn="q126"),
+    ]),
 }
 def _yr(y, val, filed, accn):
     return dur(f"{y}-01-01", f"{y}-12-31", val, accn=accn, filed=filed)

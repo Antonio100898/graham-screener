@@ -147,6 +147,14 @@ def run_scheduled_quote_check(now: datetime | None = None) -> bool:
     try:
         if not _quote_schedule(conn, now)["due"]:
             return False
+        # An engine bump can leave thousands of snapshots awaiting an explicit
+        # derive.  Do not turn the lightweight API-lifetime quote scheduler into
+        # a hidden full-universe rebuild: export() intentionally derives stale
+        # snapshots before it writes a payload, and that CPU-heavy work can make
+        # even unrelated portfolio and crypto requests appear hung.  The normal
+        # derive/export workflow will make the hourly refresh eligible again.
+        if store.needs_recompute(conn, eligible_only=True):
+            return False
     finally:
         conn.close()
     started, _ = start("quotes")

@@ -1,10 +1,11 @@
 import { useEffect } from "react";
 import { awardOverhang, totalCapitalisation, workingCapitalToDebt } from "./capital.js";
-import { byN, pe3, recurringDividendPresentation, reportedRate } from "./screen.js";
+import { byN, currentRatio as currentRatioOf, pe3, priceToBook as priceToBookOf,
+  recurringDividendPresentation, reportedRate } from "./screen.js";
 import { profileMeta } from "./Alignment.jsx";
 import AnnualFinancialHistory from "./AnnualFinancialHistory.jsx";
 import EpsCurve from "./EpsCurve.jsx";
-import { ownerEarningsTrend } from "./ownerEarnings.js";
+import { ownerEarningsTrend, ownerMetricTrend } from "./ownerEarnings.js";
 import { payloadWarnings } from "./warnings.js";
 import { quoteStatus, quoteTitle } from "./quote.js";
 
@@ -33,9 +34,9 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
   // criterion 3's "net current assets" and working capital are one quantity; the
   // panel used to show it twice, one row apart, under two names
   const workingCapital = ca != null && cl != null ? ca - cl : null;
-  const currentRatio = ca != null && cl > 0 ? ca / cl : null;
+  const currentRatio = currentRatioOf(row);
   const marketCap = row.price != null && row.shares != null ? row.price * row.shares : null;
-  const priceToBook = row.price != null && row.bvps > 0 ? row.price / row.bvps : null;
+  const priceToBook = priceToBookOf(row);
   const pe3Value = pe3(row);
   const defensive = row.alignment?.defensive;
   const enterprising = row.alignment?.enterprising;
@@ -78,6 +79,7 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
         </header>
 
         <DataWarnings row={row} />
+        <AnalysisRoutes routes={row.analysis_routes} />
 
         <section className="snapshot-section" aria-label="Market and financial snapshot">
           <h3>Market &amp; financial snapshot</h3>
@@ -97,12 +99,20 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
                     value={rateOrDash(awards)} />
             <Metric label="Long-term debt" value={money(ltd)} />
             <Metric label="Short-term debt" sub="due within a year" value={money(row.short_term_debt)} />
+            <Metric label="Operating-lease liabilities" sub="outside Graham's debt test"
+                    value={money(row.operating_lease_liability)} />
+            <Metric label="Lease-adjusted debt" sub="reported debt plus operating leases"
+                    value={money(row.lease_adjusted_debt)} />
+            <Metric label="Fixed-charge coverage" sub="reported operating-income proxy"
+                    value={multiple(row.fixed_charge_coverage)} />
             <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} emphasis={row.ncavps != null && row.price != null && row.price <= row.ncavps} />
           </div>
         </section>
 
         <Ratios row={row} currentRatio={currentRatio} priceToBook={priceToBook}
                 pe3Value={pe3Value} prof={prof} wcToDebt={wcToDebt} awards={awards} />
+
+        <AssetProtection row={row} />
 
         <EpsCurve annualEps={row.annual_eps} ttmEps={row.ttm_eps} />
 
@@ -119,7 +129,7 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
           rows={defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook })}
         />
 
-        <OwnerEarnings oe={row.owner_earnings} />
+        <OwnerEarnings oe={row.owner_earnings} cik={row.cik} />
         <Notes title="What the multiples do not say"
                subtitle="Cash conversion, dilution, interest cover, leases, receivables and inventory against sales, untaxed profits, tax charged but not paid, valuation allowances, an eroding margin, a foreign listing whose ratio is only on the cover page, a book value made of acquisitions, the shape of the ten-year record, peer efficiency, warrants, debt discount, and the events the company's own filing index proves — context, never part of a grade"
                notes={row.context_notes} />
@@ -155,6 +165,55 @@ function DataWarnings({ row }) {
           </p>
         );
       })}
+    </section>
+  );
+}
+
+function AnalysisRoutes({ routes }) {
+  if (!routes?.length) return null;
+  return (
+    <section className="criteria-section analysis-routes" aria-label="Business-model comparability">
+      <div className="criteria-title"><div><h3>Business-model routing</h3>
+        <p>These are comparability warnings, not grades. The screener does not invent
+           sector measures that the filing does not report.</p></div></div>
+      <div className="analysis-route-grid">
+        {routes.map((route) => (
+          <article key={route.id}>
+            <b>{route.label}</b>
+            <p><strong>Prefer:</strong> {route.preferred}.</p>
+            <p><strong>De-emphasize:</strong> {route.deemphasize}.</p>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AssetProtection({ row }) {
+  const quality = row.asset_quality ?? {};
+  const marketCap = row.price != null && row.shares != null ? row.price * row.shares : null;
+  if ([row.bvps, row.tbvps, row.ncavps, quality.common_equity, quality.inventory,
+    quality.receivables, quality.net_cash].every((value) => value == null)) return null;
+  return (
+    <section className="criteria-section" aria-label="Asset protection">
+      <div className="criteria-title"><div><h3>Asset protection</h3>
+        <p>Reported book and NCAV composition. No liquidation haircuts are assumed.</p></div></div>
+      <div className="snapshot-grid">
+        <Metric label="Book value / share" value={moneyPrice(row.bvps)} />
+        <Metric label="Tangible book / share" value={moneyPrice(row.tbvps)} />
+        <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} />
+        <Metric label="Common equity" value={money(quality.common_equity)} />
+        <Metric label="Goodwill / common equity" value={rateOrDash(quality.goodwill_to_common_equity)} />
+        <Metric label="Goodwill + intangibles / equity"
+                value={rateOrDash(quality.goodwill_and_intangibles_to_common_equity)} />
+        <Metric label="Inventory / positive NCAV" value={rateOrDash(quality.inventory_to_ncav)} />
+        <Metric label="Receivables / positive NCAV" value={rateOrDash(quality.receivables_to_ncav)} />
+        <Metric label="Net cash" sub="cash + short investments − reported debt"
+                value={money(quality.net_cash)} />
+        <Metric label="Market cap / positive net cash"
+                sub={marketCap == null ? undefined : `market cap ${money(marketCap)}`}
+                value={multiple(quality.market_cap_to_net_cash)} />
+      </div>
     </section>
   );
 }
@@ -334,66 +393,132 @@ function enterprisingRow(criterion) {
 }
 
 /** Separately labelled evidence around Buffett owner earnings. Not a Graham criterion. */
-function OwnerEarnings({ oe }) {
+function OwnerEarnings({ oe, cik }) {
   if (!oe) return null;
   const rate = (value) => (value == null ? "—" : `${number(value)}%`);
   const trend = ownerEarningsTrend(oe);
+  const fcfAfterSbc = ownerMetricTrend(
+    oe, "free_cash_flow_after_stock_compensation_per_share",
+    "free_cash_flow_after_stock_compensation");
   const latest = trend?.rows.find((row) => row.fiscalYear === oe.fiscal_year);
+  const beginning = oe.invested_capital_evidence?.beginning;
+  const ending = oe.invested_capital_evidence?.ending;
   return (
     <section className="criteria-section">
       <div className="criteria-title">
-        <div><h3>Owner earnings evidence</h3></div>
-        <b>Estimate only</b>
+        <div><h3>Owner earnings &amp; cash-generation evidence</h3>
+          <p>No definitive owner-earnings number is claimed: maintenance capex and required
+             incremental working capital are not separately reported in primary XBRL.</p></div>
+        <b>Evidence lenses</b>
       </div>
       {trend && (
         <div className="snapshot-grid owner-earnings-summary">
-          <Metric label={`FY${oe.fiscal_year} maintenance≈D&A estimate / share`}
+          <Metric label={`FY${oe.fiscal_year} reported earnings / share`}
+                  sub="maintenance capex assumed equal to D&A; equals earnings by construction"
                   value={moneyPrice(latest?.perShare)} />
-          <Metric label={`FY${trend.firstFiscalYear}–FY${trend.latestFiscalYear} CAGR`}
+          <Metric label="10-slot CAGR" sub={`${trend.firstFiscalYear}–${trend.latestFiscalYear}`}
                   value={rate(trend.cagr)} />
-          <Metric label="Years increased"
-                  value={trend.comparableSteps ? `${trend.yearsIncreased}/${trend.comparableSteps}` : "—"} />
-          <Metric label="Years growing at least 6%"
-                  value={trend.rateSteps ? `${trend.yearsAtLeastSix}/${trend.rateSteps}` : "—"} />
-          <Metric label="History available"
-                  value={`${trend.yearsPresent}/${trend.yearsExpected} years`} />
+          <Metric label="5-slot CAGR" value={rate(trend.cagr5)} />
+          <Metric label="3-slot CAGR" value={rate(trend.cagr3)} />
+          <Metric label="Total earnings CAGR" value={rate(trend.totalCagr)} />
+          <Metric label="Diluted-share CAGR" value={rate(trend.shareCountCagr)} />
+          <Metric label="10-year median / share" value={moneyPrice(trend.median10)} />
+          <Metric label="Latest vs 10-year median" value={signedPercent(trend.latestVsMedian10)} />
+          <Metric label="Worst YoY decline" value={rate(trend.worstYoyDecline)} />
+          <Metric label="Maximum peak-to-trough decline" value={rate(trend.maximumDrawdown)} />
+          <Metric label="Variability" sub="coefficient of variation"
+                  value={rate(trend.variability)} />
+          <Metric label="History" value={`${trend.yearsPresent}/${trend.yearsExpected} years · ${trend.yearsProfitable} positive`} />
         </div>
       )}
+      {trend?.buybackDriven && (
+        <p className="criteria-note warning"><b>Buyback-driven growth:</b> per-share results
+          improved while total reported earnings declined because diluted shares fell.</p>
+      )}
       <table className="criteria-clean">
-        <thead><tr><th>Component</th><th className="num">FY{oe.fiscal_year}</th></tr></thead>
+        <thead><tr><th>Measurement</th><th className="num">FY{oe.fiscal_year}</th></tr></thead>
         <tbody>
           {oe.components.map(([label, value]) => (
             <tr key={label}><td><b>{label}</b></td><td className="num">{money(value)}</td></tr>
           ))}
-          <tr><td><b>All-capex floor</b></td>
+          <tr><td><b>Earnings after total capital expenditure</b>
+            <small>Growth and maintenance capex deducted together; not a guaranteed floor.</small></td>
               <td className="num">{money(oe.all_capex_floor)}</td></tr>
-          <tr><td><b>Maintenance≈D&amp;A estimate</b></td>
+          <tr><td><b>Reported earnings — maintenance capex assumed equal to D&amp;A</b>
+            <small>The D&amp;A add-back and assumed maintenance deduction cancel by construction.</small></td>
               <td className="num">{money(oe.maintenance_estimate)}</td></tr>
-          <tr><td><b>Standard free cash flow</b></td>
+          <tr><td><b>Standard free cash flow</b><small>Operating cash flow less cash capex.</small></td>
               <td className="num">{money(oe.free_cash_flow)}</td></tr>
-          <tr><td><b>Invested capital</b></td>
+          {oe.free_cash_flow_after_stock_compensation != null && <tr>
+            <td><b>FCF after stock compensation</b><small>Conservative shareholder-cost diagnostic.</small></td>
+            <td className="num">{money(oe.free_cash_flow_after_stock_compensation)}</td></tr>}
+          {oe.free_cash_flow_after_acquisitions != null && <tr>
+            <td><b>FCF after cash acquisitions</b></td>
+            <td className="num">{money(oe.free_cash_flow_after_acquisitions)}</td></tr>}
+          {oe.expanded_free_cash_flow != null && <tr>
+            <td><b>FCF after capitalized software and acquired intangibles</b></td>
+            <td className="num">{money(oe.expanded_free_cash_flow)}</td></tr>}
+          {oe.operating_cash_flow_before_working_capital != null && <tr>
+            <td><b>CFO before reported working-capital cash effect</b></td>
+            <td className="num">{money(oe.operating_cash_flow_before_working_capital)}</td></tr>}
+          {oe.average_working_capital_cash_effect_3y != null && <tr>
+            <td><b>Three-year average working-capital cash effect</b></td>
+            <td className="num">{money(oe.average_working_capital_cash_effect_3y)}</td></tr>}
+          {oe.stock_compensation_to_revenue != null && <tr>
+            <td><b>Stock compensation / revenue</b></td>
+            <td className="num">{rate(oe.stock_compensation_to_revenue)}</td></tr>}
+          {oe.stock_compensation_to_free_cash_flow != null && <tr>
+            <td><b>Stock compensation / standard FCF</b></td>
+            <td className="num">{rate(oe.stock_compensation_to_free_cash_flow)}</td></tr>}
+          {oe.acquisitions_to_free_cash_flow != null && <tr>
+            <td><b>Cash acquisitions / standard FCF</b></td>
+            <td className="num">{rate(oe.acquisitions_to_free_cash_flow)}</td></tr>}
+          {oe.acquisition_years_10 != null && <tr>
+            <td><b>Fiscal years with reported cash acquisitions</b><small>Latest ten fiscal-year slots; missing facts are not zero.</small></td>
+            <td className="num">{number(oe.acquisition_years_10)}</td></tr>}
+          <tr><td><b>Average invested capital</b>
+            <small>All cash and short-term investments excluded; exact beginning and ending balance sheets required.</small></td>
               <td className="num">{money(oe.invested_capital)}</td></tr>
-          <tr><td><b>All-capex floor / invested capital</b></td>
+          {(beginning || ending) && <tr><td><b>Capital endpoints</b></td>
+            <td className="num">{money(beginning?.value)} ({beginning?.end ?? "—"}) → {money(ending?.value)} ({ending?.end ?? "—"})</td></tr>}
+          <tr><td><b>Average capital including cash</b></td>
+              <td className="num">{money(oe.capital_including_cash)}</td></tr>
+          <tr><td><b>All-capex cash return / average invested capital</b></td>
               <td className="num">{rate(oe.all_capex_return)}</td></tr>
-          <tr><td><b>Maintenance≈D&amp;A estimate / invested capital</b></td>
+          <tr><td><b>Earnings-based return / average invested capital</b></td>
               <td className="num">{rate(oe.maintenance_estimate_return)}</td></tr>
+          <tr><td><b>All-capex cash return / capital including cash</b></td>
+              <td className="num">{rate(oe.all_capex_return_including_cash)}</td></tr>
+          {oe.nopat_roic != null && <tr><td><b>NOPAT ROIC</b>
+            <small>Operating income after the median usable three-year tax rate, over average invested capital.</small></td>
+              <td className="num">{rate(oe.nopat_roic)}</td></tr>}
+          {oe.nopat_return_including_cash != null && <tr><td><b>NOPAT return including cash</b></td>
+              <td className="num">{rate(oe.nopat_return_including_cash)}</td></tr>}
         </tbody>
       </table>
       {trend && (
         <div className="annual-history-scroll owner-earnings-history">
           <table className="annual-history-table">
-            <thead><tr><th>Fiscal year</th><th className="num">Maintenance≈D&amp;A estimate / share</th>
-              <th className="num">YoY</th><th className="num">All-capex floor / share</th>
-              <th className="num">FCF / share</th>
-              <th className="num">Diluted shares</th></tr></thead>
+            <thead><tr><th>Fiscal year</th><th className="num">Reported earnings / share</th>
+              <th className="num">Reported earnings total</th><th className="num">YoY / share</th>
+              <th className="num">After total capex / share</th><th className="num">After total capex total</th>
+              <th className="num">Standard FCF / share</th><th className="num">Standard FCF total</th>
+              <th className="num">FCF after SBC / share</th><th className="num">FCF after acquisitions / share</th>
+              <th className="num">Expanded FCF / share</th><th className="num">Diluted shares</th></tr></thead>
             <tbody>
-              {trend.rows.map(({ fiscalYear, cell, perShare, yoy }) => (
+              {trend.rows.map(({ fiscalYear, cell, perShare, total, yoy }) => (
                 <tr key={fiscalYear} className={perShare != null && perShare < 0 ? "loss" : ""}>
                   <td><b>FY{fiscalYear}</b>{fiscalYear === oe.fiscal_year && <small>latest completed</small>}</td>
                   <td className="num">{moneyPrice(perShare)}</td>
+                  <td className="num">{money(total)}</td>
                   <td className="num">{signedPercent(yoy)}</td>
-                  <td className="num">{moneyPrice(cell?.all_capex_floor_per_share)}</td>
+                  <td className="num">{moneyPrice(cell?.earnings_after_total_capex_per_share ?? cell?.all_capex_floor_per_share)}</td>
+                  <td className="num">{money(cell?.earnings_after_total_capex ?? cell?.all_capex_floor)}</td>
                   <td className="num">{moneyPrice(cell?.free_cash_flow_per_share)}</td>
+                  <td className="num">{money(cell?.free_cash_flow)}</td>
+                  <td className="num">{moneyPrice(cell?.free_cash_flow_after_stock_compensation_per_share)}</td>
+                  <td className="num">{moneyPrice(cell?.free_cash_flow_after_acquisitions_per_share)}</td>
+                  <td className="num">{moneyPrice(cell?.expanded_free_cash_flow_per_share)}</td>
                   <td className="num">{shareCount(cell?.diluted_shares)}</td>
                 </tr>
               ))}
@@ -401,6 +526,22 @@ function OwnerEarnings({ oe }) {
           </table>
         </div>
       )}
+      {fcfAfterSbc?.yearsPresent > 1 && <p className="criteria-note">
+        <b>FCF after stock compensation record:</b> {fcfAfterSbc.yearsPresent}/10 years,
+        5-slot CAGR {rate(fcfAfterSbc.cagr5)}, maximum drawdown {rate(fcfAfterSbc.maximumDrawdown)}.
+      </p>}
+      {!!Object.keys(oe.sources ?? {}).length && (
+        <div className="owner-source-list">
+          <b>Latest-year filing inputs</b>
+          {Object.entries(oe.sources).map(([name, source]) => (
+            <span key={name}><code>{name.replaceAll("_", " ")}: {source.tag}</code>
+              <SourceCell cik={cik} source={source} /></span>
+          ))}
+        </div>
+      )}
+      {!!oe.caveats?.length && <ul className="disclosure-notes compact">
+        {oe.caveats.map((caveat) => <li key={caveat}>{caveat}</li>)}
+      </ul>}
     </section>
   );
 }
@@ -428,6 +569,10 @@ const SOURCE_LABELS = {
   current_assets: "Current assets", current_liabilities: "Current liabilities",
   long_term_debt: "Long-term debt", short_term_debt: "Short-term debt",
   total_debt: "Total debt (rollup)", goodwill: "Goodwill", intangibles: "Intangibles",
+  operating_lease_liability: "Operating-lease liabilities", lease_cost: "Lease cost",
+  fixed_charge_coverage: "Fixed-charge coverage proxy",
+  inventory: "Inventory", receivables: "Receivables", cash: "Cash",
+  short_term_investments: "Short-term investments",
   preferred_stock: "Preferred stock", temporary_equity: "Temporary equity",
   noncontrolling_interest: "Noncontrolling interest", shares: "Shares outstanding",
   dividend: "Dividend paid (tagged period)",
@@ -467,8 +612,10 @@ function Provenance({ row }) {
           <tbody>
             {Object.entries(SOURCE_LABELS).filter(([key]) => sources[key]).flatMap(([key, label]) => {
               const s = sources[key];
-              const raw = key === "dividend" && row[key] == null ? undefined : row[key];
-              const value = key === "shares" ? number(raw) : money(raw);
+              const stored = row[key] ?? row.asset_quality?.[key];
+              const raw = key === "dividend" && stored == null ? undefined : stored;
+              const value = key === "shares" ? number(raw)
+                : key === "fixed_charge_coverage" ? multiple(raw) : money(raw);
               const out = [(
                 <tr key={key}>
                   <td><b>{label}</b></td>

@@ -19,6 +19,26 @@ export function matchesPortfolio(position, query) {
 }
 
 
+/** Bonds and crypto use the same search behavior as stock positions. */
+export function matchesPortfolioAsset(asset, query) {
+  const phrase = String(query ?? "").trim().toLowerCase();
+  if (!phrase) return true;
+  const words = phrase.split(/[\s,]+/).filter((word) => word.length > 1);
+  const needles = words.length ? [phrase, ...words] : [phrase];
+  const haystack = [asset?.symbol, asset?.name, asset?.note]
+    .filter(Boolean).join(" ").toLowerCase();
+  return needles.some((needle) => haystack.includes(needle));
+}
+
+
+export function portfolioHoldingCount(portfolio) {
+  return Number(portfolio?.summary?.holdings
+    ?? (portfolio?.positions?.length ?? 0)
+      + (portfolio?.assets?.bonds?.length ?? 0)
+      + (portfolio?.assets?.crypto?.length ?? 0));
+}
+
+
 /** CIKs with a positive open position. A closed ledger history is never a holding. */
 export function openPortfolioCiks(portfolio) {
   return new Set((portfolio?.positions ?? [])

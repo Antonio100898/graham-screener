@@ -3,18 +3,18 @@ import Detail from "./Detail.jsx";
 import LoadBar from "./LoadBar.jsx";
 import MultiSelect from "./MultiSelect.jsx";
 import EarningsEvidence, { epsEvidence } from "./EarningsEvidence.jsx";
-import { send } from "./api.js";
+import { fetchJson, send } from "./api.js";
 import { below, spell } from "./format.js";
-import { loadView, saveView, takeOverScrollRestoration } from "./view.js";
-import { TOTAL_CRITERIA, byN, indexValuation, pe3 } from "./screen.js";
+import { hasActiveFilters, loadView, saveView, takeOverScrollRestoration, unfilteredView } from "./view.js";
+import { TOTAL_CRITERIA, byN, currentRatio, indexValuation, pe3, priceToBook } from "./screen.js";
 import { AlignmentCompact } from "./Alignment.jsx";
 import { alignmentSortValue } from "./alignment.js";
 import { compareRows, normalizeSort, updateSort } from "./sort.js";
 import { payloadWarnings } from "./warnings.js";
 import Portfolio from "./Portfolio.jsx";
 import TradeModal from "./TradeModal.jsx";
-import { matchesPortfolio, openPortfolioCiks } from "./portfolio.js";
-import { quoteStatus, quoteTitle, quoteTone } from "./quote.js";
+import { matchesPortfolio, matchesPortfolioAsset, openPortfolioCiks, portfolioHoldingCount } from "./portfolio.js";
+import { quoteIcon, quoteStatus, quoteTitle, quoteTone } from "./quote.js";
 
 
 // OR semantics: any typed word matching any field keeps the row. Short and
@@ -35,7 +35,9 @@ function matcher(query) {
 
 // These columns sort best-first by negating their value, so ascending order puts the
 // largest at the top. The arrow must describe what the reader sees, not the sign.
-const DESCENDING_BY_DEFAULT = new Set(["fit", "n_pass", "mcap", "ni", "trend", "offhigh", "eps10"]);
+const DESCENDING_BY_DEFAULT = new Set([
+  "fit", "n_pass", "mcap", "ni", "trend", "offhigh", "eps10", "current_ratio",
+]);
 const EPS_POSITIVE_FLOORS = [5, 6, 7, 9, 10];
 const LENSES = ["BOTH", "ENTERPRISING", "DEFENSIVE"];
 const FITS = ["ALL", "ALIGNED", "EVIDENCE_INCOMPLETE", "BLOCKED"];
@@ -75,16 +77,16 @@ function Th({ id, sort, onSort, children, className = "" }) {
 
 // narrowest first: 30 companies beat 500 beat ~100 beat every Nasdaq listing
 const INDEX_RANK = { "DJIA": 0, "S&P 500": 1, "Nasdaq 100": 2, "Nasdaq Comp": 3 };
-// "Nasdaq Comp" is every Nasdaq listing, which the Exchange filter already says;
-// the badge is named for what it is rather than for an index it does not track
-const INDEX_SHORT = { "DJIA": "DJIA", "S&P 500": "S&P", "Nasdaq 100": "N100", "Nasdaq Comp": "Nasdaq-listed" };
-
 const saved = loadView();
 takeOverScrollRestoration();
 
-const initialSort = normalizeSort(saved.sort).map((item) =>
-  ["grade", "ptbv"].includes(item.key) ? { key: "fit", dir: 1 } : item
-);
+const TABLE_SORT_KEYS = new Set([
+  "ticker", "name", "sector", "fit", "eps10", "mcap", "price", "offhigh", "pe", "pe3",
+  "current_ratio", "pb",
+]);
+const initialSort = normalizeSort(normalizeSort(saved.sort)
+  .map((item) => ["grade", "ptbv"].includes(item.key) ? { key: "fit", dir: 1 } : item)
+  .filter((item) => TABLE_SORT_KEYS.has(item.key)));
 
 export default function App() {
   const [data, setData] = useState(null);
@@ -128,18 +130,20 @@ export default function App() {
 
   useEffect(load, [load]);
 
-  const loadPortfolio = useCallback(() => {
-    setPortfolioLoading(true);
-    fetch(`/portfolio?t=${Date.now()}`)
-      .then((response) => response.ok
-        ? response.json()
-        : response.json().catch(() => null).then((body) => Promise.reject(new Error(body?.detail ?? `HTTP ${response.status}`))))
+  const loadPortfolio = useCallback((silent = false) => {
+    if (!silent) setPortfolioLoading(true);
+    fetchJson(`/portfolio?t=${Date.now()}`, { timeoutMs: 15_000 })
       .then((result) => { setPortfolioData(result); setPortfolioError(null); })
       .catch((err) => setPortfolioError(err.message))
-      .finally(() => setPortfolioLoading(false));
+      .finally(() => { if (!silent) setPortfolioLoading(false); });
   }, []);
 
-  useEffect(() => { loadPortfolio(); }, [loadPortfolio, page]);
+  useEffect(() => {
+    loadPortfolio();
+    if (page !== "portfolio") return undefined;
+    const timer = window.setInterval(() => loadPortfolio(true), 30_000);
+    return () => window.clearInterval(timer);
+  }, [loadPortfolio, page]);
 
   useEffect(() => {
     const changed = () => setPage(window.location.hash === "#portfolio" ? "portfolio" : "screener");
@@ -213,6 +217,25 @@ export default function App() {
     setPage(next);
   };
 
+  const clearFilters = () => {
+    const empty = unfilteredView();
+    setLens(empty.lens);
+    setFit(empty.fit);
+    setGaps(empty.gaps);
+    setProfiles(new Set(empty.profiles));
+    setSectors(new Set(empty.sectors));
+    setVenues(new Set(empty.venues));
+    setIdxSel(new Set(empty.indexes));
+    setMinCap(empty.minCap);
+    setMinMet(empty.minMet);
+    setMinPositiveEps(empty.minPositiveEps);
+    setMinRoic(empty.minRoic);
+    setTrackedOnly(empty.trackedOnly);
+    setHideNA(empty.hideNA);
+    setHideNoApply(empty.hideNoApply);
+    setBelowNcav(empty.belowNcav);
+  };
+
   const deleteTrade = async (trade) => {
     if (!portfolioData) return;
     const description = `${trade.side} ${trade.quantity} ${trade.ticker} at $${trade.price}`;
@@ -252,6 +275,8 @@ export default function App() {
         pncav: r.ncavps != null && r.price != null && r.ncavps > 0 ? r.price / r.ncavps : null,
         idx: r.index_memberships ?? [],
         pe3: pe3(r),
+        currentRatio: currentRatio(r),
+        pb: priceToBook(r),
         // This is the explicitly labelled total-capex floor return, not a
         // definitive Buffett owner-earnings return.
         roic: r.owner_earnings?.all_capex_return ?? null,
@@ -313,15 +338,12 @@ export default function App() {
       if (key === "fit") return alignmentSortValue(r);
       if (key === "ticker") return r.ticker ?? "";
       if (key === "sector") return r.sector ?? null;
-      if (key === "index") return r.idx.length ? INDEX_RANK[r.idx[0]] ?? 8 : 9;
       if (key === "name") return r.name ?? "";
       if (key === "n_pass") return -r.n_pass;
       if (key === "pe") return byN(r, 1).value ?? null;
       if (key === "pe3") return r.pe3 ?? null;
-      // the interesting end is the highest return, so it leads on the first click
-      if (key === "roic") return r.roic == null ? null : -r.roic;
-      // here the interesting end is the cheapest, which is the lowest ratio
-      if (key === "pncav") return r.pncav ?? null;
+      if (key === "current_ratio") return r.currentRatio == null ? null : -r.currentRatio;
+      if (key === "pb") return r.pb ?? null;
       // the interesting end is the most beaten-down, so sort those to the top
       if (key === "offhigh")
         return r.price_stats?.pct_below_52w_high == null
@@ -349,9 +371,13 @@ export default function App() {
   const naCount = useMemo(() => view.filter((r) => r.unjudged).length, [view]);
   const netNetCount = useMemo(() => view.filter((r) => r.netNet).length, [view]);
   const noApplyCount = useMemo(() => view.filter((r) => r.inapplicable).length, [view]);
-  const portfolioMatches = useMemo(() =>
-    (portfolioData?.positions ?? []).filter((position) => matchesPortfolio(position, portfolioQ)).length,
-  [portfolioData, portfolioQ]);
+  const portfolioMatches = useMemo(() => [
+    ...(portfolioData?.positions ?? []),
+    ...(portfolioData?.assets?.bonds ?? []),
+    ...(portfolioData?.assets?.crypto ?? []),
+  ].filter((holding) => holding.cik
+    ? matchesPortfolio(holding, portfolioQ)
+    : matchesPortfolioAsset(holding, portfolioQ)).length, [portfolioData, portfolioQ]);
 
   const metCounts = useMemo(() => {
     const c = {};
@@ -395,6 +421,10 @@ export default function App() {
     const match = matcher(q);
     return match ? match(rows).length : 0;
   }, [rows, q]);
+  const activeFilters = hasActiveFilters({
+    lens, fit, gaps, profiles, sectors: sectors_, venues, indexes: idxSel,
+    minCap, minMet, minPositiveEps, minRoic, trackedOnly, hideNA, hideNoApply, belowNcav,
+  });
 
 
   if (error)
@@ -421,8 +451,8 @@ export default function App() {
       <LoadBar onFinished={() => { load(); loadPortfolio(); }} shown={rows.length} />
       <Portfolio data={portfolioData} loading={portfolioLoading} error={portfolioError}
                  query={portfolioQ}
-                 onRefresh={() => { load(); loadPortfolio(); }}
-                 onRecordTrade={recordTrade} onDeleteTrade={deleteTrade} />
+                 onRecordTrade={recordTrade} onDeleteTrade={deleteTrade}
+                 onDataChange={setPortfolioData} />
       {tradeTarget !== null && portfolioData && (
         <TradeModal portfolio={portfolioData.portfolio} rows={rows}
                     initialRow={tradeTarget.cik ? tradeTarget : null}
@@ -436,6 +466,7 @@ export default function App() {
     <div className="app">
       <AppHeader page={page} onNavigate={navigate} rows={rows} data={data}
                  portfolioData={portfolioData} q={q} setQ={setQ} matches={view.length} />
+      <LoadBar onFinished={load} shown={rows.length} />
 
       <section className="index-valuation" aria-labelledby="sp500-valuation-title">
         <div className="index-valuation-intro">
@@ -460,8 +491,6 @@ export default function App() {
           Missing and non-positive multiples are excluded from each median, never counted as zero.
         </p>
       </section>
-
-      <LoadBar onFinished={load} shown={rows.length} />
 
       {trackingError && <div className="msg err">{trackingError}</div>}
 
@@ -543,11 +572,7 @@ export default function App() {
                 onClick={() => setTrackedOnly((v) => !v)}>
           ★ Tracked <span className="count">{tracked.size}</span>
         </button>
-        {(lens !== "BOTH" || fit !== "ALL" || gaps !== "ALL" || profiles.size > 0 || sectors_.size > 0 || venues.size > 0 || idxSel.size > 0 || minMet > 0 || minPositiveEps > 0 || minRoic > 0 || hideNA || !hideNoApply || belowNcav) && (
-          <button className="chip clear" onClick={() => {
-            setLens("BOTH"); setFit("ALL"); setGaps("ALL"); setProfiles(new Set()); setSectors(new Set()); setVenues(new Set()); setIdxSel(new Set()); setMinMet(0); setMinPositiveEps(0); setMinRoic(0); setHideNA(false); setHideNoApply(true); setBelowNcav(false);
-          }}>clear all</button>
-        )}
+        {activeFilters && <button className="chip clear" onClick={clearFilters}>clear all</button>}
         <span className="showing">
           showing {view.length.toLocaleString()} of {rows.length.toLocaleString()}
         </span>
@@ -562,21 +587,18 @@ export default function App() {
             <Th id="name" sort={sort} onSort={sortBy}>Company</Th>
             <Th id="sector" sort={sort} onSort={sortBy}>Sector</Th>
             <Th id="fit" sort={sort} onSort={sortBy}>Graham fit<em className="sub2">E · D</em></Th>
-            <Th id="index" sort={sort} onSort={sortBy}>Index</Th>
             <Th id="eps10" sort={sort} onSort={sortBy}>10Y EPS evidence<em className="sub2">positive years · growth</em></Th>
             <Th id="mcap" sort={sort} onSort={sortBy} className="num">Mkt cap</Th>
             <Th id="price" sort={sort} onSort={sortBy} className="num">Price</Th>
-            <Th id="offhigh" sort={sort} onSort={sortBy} className="num">
+            <Th id="offhigh" sort={sort} onSort={sortBy} className="num offhigh-col">
               Off high<em className="sub2">52w · 3y</em>
             </Th>
             <Th id="pe" sort={sort} onSort={sortBy} className="num">P/E</Th>
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
-            <Th id="roic" sort={sort} onSort={sortBy} className="num">
-              All-capex return<em className="sub2">floor · not definitive OE</em>
-            </Th>
-            <Th id="pncav" sort={sort} onSort={sortBy} className="num">P/NCAV</Th>
+            <Th id="current_ratio" sort={sort} onSort={sortBy} className="num">Current ratio</Th>
+            <Th id="pb" sort={sort} onSort={sortBy} className="num">P/B</Th>
           </tr>
         </thead>
         <tbody>
@@ -622,16 +644,12 @@ export default function App() {
                 {r.exchange === "OTC" && <span className="otc">OTC</span>}
               </td>
               <td data-label="Graham fit"><AlignmentCompact row={r} /></td>
-              <td className="idxcell" data-label="Index" title={r.idx.join(" · ") || "not in a tracked index"}>
-                {r.idx.length
-                  ? r.idx.map((m) => <span key={m} className="idxbadge">{INDEX_SHORT[m] ?? m}</span>)
-                  : <span className="dim">—</span>}
-              </td>
               <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
               <td className="num" data-label="Mkt cap">{fmtCap(r.mcap)}</td>
-              <td className="num" data-label="Price" title={quoteTitle(r)}>
+              <td className="num" data-label="Price">
                 {fmtPrice(r.price)}
-                {r.price != null && <small className={`quote-session ${quoteTone(r)}`}>{quoteStatus(r)}</small>}
+                <span className={`quote-icon ${quoteTone(r)}`} title={quoteTitle(r)}
+                      aria-label={quoteStatus(r)}>{quoteIcon(r)}</span>
               </td>
               <td className="num offhigh" data-label="Off high" title={drawdownTitle(r)}>
                 {r.price_stats?.pct_below_52w_high == null ? (
@@ -648,13 +666,13 @@ export default function App() {
                   title="current price over the average of the three latest annual EPS — one lucky or disastrous year moves it a third as much as it moves the TTM P/E">
                 {fmt(r.pe3)}
               </td>
-              <td className="num" data-label="All-capex return"
-                  title="reported earnings + depreciation and amortisation − total capital expenditure, over invested capital. Growth capex is deducted, so this is a floor rather than definitive Buffett owner earnings">
-                {r.roic == null ? "—" : `${r.roic.toFixed(1)}%`}
+              <td className="num" data-label="Current ratio"
+                  title="current assets divided by current liabilities; blank when either required value is unavailable or current liabilities are not positive">
+                {r.currentRatio == null ? "—" : `${r.currentRatio.toFixed(2)}×`}
               </td>
-              <td className={`num${r.pncav != null && r.pncav <= 2 / 3 ? " ok" : ""}`} data-label="P/NCAV"
-                  title="price over net current asset value per share — current assets less every liability, fixed assets counted as nothing. Graham's hardest bargain is a price under two-thirds of it; blank where net current assets are not positive">
-                {r.pncav == null ? "—" : `${r.pncav.toFixed(2)}×`}
+              <td className="num" data-label="P/B"
+                  title="current price divided by book value per share; blank when book value is unavailable or not positive">
+                {r.pb == null ? "—" : `${r.pb.toFixed(2)}×`}
               </td>
             </tr>
           ))}
@@ -664,7 +682,7 @@ export default function App() {
         <p className="msg">
           No match inside the current filters, but <b>{matchesAnywhere.toLocaleString()}</b>{" "}
           elsewhere.{" "}
-          <button className="linkish" onClick={() => { setGaps("ALL"); setSectors(new Set()); setVenues(new Set()); }}>
+          <button className="linkish" onClick={clearFilters}>
             search everything
           </button>
         </p>
@@ -699,13 +717,13 @@ function AppHeader({ page, onNavigate, rows, data, portfolioData, q, setQ, match
         <h1>Graham Screener</h1>
         <p className="sub">
           {page === "portfolio"
-            ? `${portfolioData?.summary?.positions ?? 0} positions · cost basis and decision evidence`
+            ? `${portfolioHoldingCount(portfolioData)} holdings · stocks, bonds, crypto and liquid cash`
             : `${rows.length.toLocaleString()} companies · enterprising and defensive evidence · engine v${data.engine_version}`}
         </p>
         <nav className="app-nav" aria-label="Primary views">
           <button className={page === "screener" ? "active" : ""} onClick={() => onNavigate("screener")}>Research</button>
           <button className={page === "portfolio" ? "active" : ""} onClick={() => onNavigate("portfolio")}>
-            Portfolio <span>{portfolioData?.summary?.positions ?? 0}</span>
+            Portfolio <span>{portfolioHoldingCount(portfolioData)}</span>
           </button>
         </nav>
       </div>

@@ -31,6 +31,18 @@ const PRICE_CRITERIA = new Set([1, 7]);
 /** Criterion by its number — the array is no longer numbered 1..n positionally. */
 export const byN = (row, n) => row.criteria.find((c) => c.n === n);
 
+/** Balance-sheet and valuation ratios shared by the Research table and detail
+ * panel. Missing or non-positive denominators stay unavailable, never zero. */
+export function currentRatio(row) {
+  return row.current_assets != null && row.current_liabilities > 0
+    ? row.current_assets / row.current_liabilities
+    : null;
+}
+
+export function priceToBook(row) {
+  return row.price != null && row.bvps > 0 ? row.price / row.bvps : null;
+}
+
 /** A missing operating margin is materially different from a zero margin.
  * The filing must provide a same-period operating-income/revenue basis; the UI
  * says when it did not instead of leaving an unexplained dash. */

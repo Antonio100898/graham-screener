@@ -510,6 +510,27 @@ def test_vintage_ttm_sees_only_what_was_filed():
     assert "2021-12-31" not in v    # nothing at all was filed yet
 
 
+def test_vintage_history_fills_from_the_selected_dimensioned_class():
+    """Berkshire's recent Class B EPS lives only on the share-class axis. The
+    current screen already selects it; historical P/E must use that same selected
+    basis instead of leaving every fiscal-year column blank."""
+    gaap = {k: v for k, v in GAAP.items() if k != "EarningsPerShareDiluted"}
+    sidecar = dimensioned("EarningsPerShareBasic", "USD/shares", [
+        dict(dur("2023-01-01", "2023-12-31", 4.0,
+                 accn="k23", filed="2024-02-15"),
+             segments="ClassOfStock=EquivalentClassB;"),
+        dict(dur("2024-01-01", "2024-12-31", 5.0,
+                 accn="k24", filed="2025-02-15"),
+             segments="ClassOfStock=EquivalentClassB;"),
+    ])
+
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap), dimensioned=sidecar)
+
+    # At the end of FY2024 only FY2023's report had been filed. This is the same
+    # no-look-ahead rule as the undimensioned path, now on the selected class.
+    assert s.ttm_eps_vintage["2024-12-31"] == Decimal("4.0")
+
+
 def test_revenue_series_survives_the_asc606_tag_switch():
     gaap = dict(GAAP)
     gaap["SalesRevenueNet"] = tagdata("USD", REVENUE)

@@ -26,7 +26,7 @@ import sys
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import httpx
@@ -202,9 +202,16 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
     historical_ratios = normalize.annual_ratios(
         statement_taxonomy, snap.annual_net_income,
         snap.annual_revenue, snap.annual_operating_income,
-        annual_eps=snap.annual_eps)
+        annual_eps=snap.annual_eps,
+        annual_share_counts=snap.annual_share_counts)
     if receipt and receipt.get("ratio"):
         _restate_historical_ratios(historical_ratios, Decimal(str(receipt["ratio"])))
+    settled_debt_value = settled_debt(snap)[0]
+    lease_adjusted_debt = (
+        settled_debt_value + snap.operating_lease_liability.value
+        if settled_debt_value is not None and snap.operating_lease_liability is not None
+        else None)
+    asset_quality, asset_sources = _asset_quality(snap, statement_taxonomy)
     row = {
         "cik": cik,
         "ticker": ticker,
@@ -256,6 +263,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         "tbvps": _tbvps(snap),
         "bvps": _bvps(snap),
         "ncavps": _ncavps(snap),
+        "asset_quality": asset_quality,
         # chapter-13 comparison material; dollar figures repeated here so the UI
         # can show working capital and capitalization without a second request
         "annual_revenue": {str(y): float(f.value)
@@ -276,6 +284,15 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
                                 if snap.current_liabilities else None),
         "long_term_debt": float(snap.long_term_debt.value) if snap.long_term_debt else None,
         "total_debt": float(snap.total_debt.value) if snap.total_debt else None,
+        "operating_lease_liability": (
+            float(snap.operating_lease_liability.value)
+            if snap.operating_lease_liability else None),
+        "lease_adjusted_debt": (
+            float(lease_adjusted_debt) if lease_adjusted_debt is not None else None),
+        "lease_cost": float(snap.lease_cost.value) if snap.lease_cost else None,
+        "fixed_charge_coverage": (
+            float(snap.fixed_charge_coverage.value)
+            if snap.fixed_charge_coverage else None),
         # Employee options as a share of the count they will dilute. Absent for the
         # filers that grant restricted stock instead, and absent is not zero.
         "options": (float(snap.options_outstanding.value)
@@ -285,7 +302,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # What criterion 3 actually weighed, rollup and parts already reconciled.
         # The panel adds it to the market value of the common to price the whole
         # enterprise, and None here means unknown rather than debt-free.
-        "debt": (lambda d: float(d) if d is not None else None)(settled_debt(snap)[0]),
+        "debt": float(settled_debt_value) if settled_debt_value is not None else None,
         "total_assets": float(snap.total_assets.value) if snap.total_assets else None,
         "total_liabilities": (float(snap.total_liabilities.value)
                               if snap.total_liabilities else None),
@@ -332,6 +349,10 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("long_term_debt", _source(snap.long_term_debt)),
             ("short_term_debt", _source(snap.short_term_debt)),
             ("total_debt", _source(snap.total_debt)),
+            ("operating_lease_liability", _source(snap.operating_lease_liability)),
+            ("lease_cost", _duration_source(snap.lease_cost, "USD")),
+            ("fixed_charge_coverage", _source(snap.fixed_charge_coverage)),
+            *((name, _source(fact)) for name, fact in asset_sources.items()),
             ("options", _source(snap.options_outstanding)),
             ("rsus", _source(snap.rsus_outstanding)),
             ("goodwill", _source(snap.goodwill)),
@@ -456,6 +477,72 @@ def _ttm_basis(snap) -> str:
     return "latest 12 months"
 
 
+def _asset_quality(snap, gaap: dict) -> tuple[dict, dict]:
+    """Current asset-protection diagnostics with exact balance-sheet evidence.
+
+    Haircut-adjusted NCAV is deliberately absent: a liquidation haircut is an
+    investor assumption, not a filed fact. These ratios keep the reported book
+    and NCAV lenses factual and expose the composition that can weaken them.
+    """
+    end = snap.balance_sheet_date
+    inventory = normalize._at_period_end(
+        gaap, "Inventory", normalize.INVENTORY_TAGS, end)
+    receivables = normalize._at_period_end(
+        gaap, "Receivables", normalize.RECEIVABLE_TAGS, end)
+    cash = normalize._at_period_end(
+        gaap, "Cash", normalize.CASH_TAGS, end)
+    investments = normalize._at_period_end(
+        gaap, "ShortTermInvestments", normalize.SHORT_TERM_INVESTMENT_TAGS, end)
+    common_equity = _common_equity(snap)
+    ncav = (
+        Decimal(str(_ncavps(snap))) * snap.shares_outstanding.value
+        if _ncavps(snap) is not None and snap.shares_outstanding is not None
+        else None)
+
+    def pct(value: Decimal | None, base: Decimal | None) -> float | None:
+        return (float(value / base * 100)
+                if value is not None and base is not None and base > 0 else None)
+
+    settled = settled_debt(snap)[0]
+    # The combined cash/restricted-cash tag does not prove deployable cash by
+    # itself. Net cash is withheld unless the plain cash tag and investments are
+    # both filed at the exact balance-sheet date.
+    plain_cash = cash if cash is not None and normalize._tag_of(
+        cash) == "CashAndCashEquivalentsAtCarryingValue" else None
+    net_cash = (
+        plain_cash.value + investments.value - settled
+        if plain_cash is not None and investments is not None and settled is not None
+        else None)
+    goodwill = snap.goodwill.value if snap.goodwill is not None else None
+    intangibles = snap.intangibles.value if snap.intangibles is not None else None
+    values = {
+        "common_equity": float(common_equity) if common_equity is not None else None,
+        "goodwill_to_common_equity": pct(goodwill, common_equity),
+        "intangibles_to_common_equity": pct(intangibles, common_equity),
+        "goodwill_and_intangibles_to_common_equity": (
+            pct(goodwill + intangibles, common_equity)
+            if goodwill is not None and intangibles is not None else None),
+        "inventory": float(inventory.value) if inventory is not None else None,
+        "inventory_to_ncav": pct(inventory.value if inventory else None, ncav),
+        "receivables": float(receivables.value) if receivables is not None else None,
+        "receivables_to_ncav": pct(receivables.value if receivables else None, ncav),
+        "cash": float(plain_cash.value) if plain_cash is not None else None,
+        "short_term_investments": (
+            float(investments.value) if investments is not None else None),
+        "net_cash": float(net_cash) if net_cash is not None else None,
+        "market_cap_to_net_cash": None,
+    }
+    sources = {
+        name: fact for name, fact in (
+            ("inventory", inventory),
+            ("receivables", receivables),
+            ("cash", plain_cash),
+            ("short_term_investments", investments),
+        ) if fact is not None
+    }
+    return {key: value for key, value in values.items() if value is not None}, sources
+
+
 def _owner_earnings_row(snap) -> dict | None:
     """Serialize owner-earnings evidence without inventing maintenance capex.
 
@@ -466,6 +553,31 @@ def _owner_earnings_row(snap) -> dict | None:
     oe = snap.owner_earnings
     if oe is None:
         return None
+
+    def source_row(provenance) -> dict:
+        return {
+            "tag": provenance.tag,
+            "form": provenance.form,
+            "accn": provenance.accession,
+            "end": (provenance.period_end.isoformat()
+                    if provenance.period_end else None),
+            "filed": provenance.filed.isoformat() if provenance.filed else None,
+        }
+
+    def fact_value(fact) -> float | None:
+        return float(fact.value) if fact is not None else None
+
+    def capital_point(fact) -> dict | None:
+        if fact is None:
+            return None
+        return {
+            "value": float(fact.value),
+            "end": (fact.provenance.period_end.isoformat()
+                    if fact.provenance.period_end else None),
+            "formula": fact.provenance.tag,
+            "sources": [source_row(source)
+                        for source in fact.provenance.components],
+        }
     # The requested view is a calendar of the latest ten fiscal-year slots, not
     # the latest ten observations. Sparse evidence must produce visible gaps
     # rather than reaching farther into the past to fill the quota.
@@ -477,41 +589,158 @@ def _owner_earnings_row(snap) -> dict | None:
         ("reported_earnings", "depreciation_and_amortisation", "total_capex"),
         floor_sources,
     ):
-        owner_sources[name] = {
-            "tag": provenance.tag,
-            "form": provenance.form,
-            "accn": provenance.accession,
-            "end": (provenance.period_end.isoformat()
-                    if provenance.period_end else None),
-            "filed": provenance.filed.isoformat() if provenance.filed else None,
-        }
+        owner_sources[name] = source_row(provenance)
     if oe.free_cash_flow is not None and oe.free_cash_flow.provenance.components:
         provenance = oe.free_cash_flow.provenance.components[0]
-        owner_sources["operating_cash_flow"] = {
-            "tag": provenance.tag,
-            "form": provenance.form,
-            "accn": provenance.accession,
-            "end": (provenance.period_end.isoformat()
-                    if provenance.period_end else None),
-            "filed": provenance.filed.isoformat() if provenance.filed else None,
+        owner_sources["operating_cash_flow"] = source_row(provenance)
+    for name, fact in (
+        ("stock_compensation", oe.stock_compensation),
+        ("cash_acquisitions", oe.cash_acquisitions),
+        ("capitalized_intangible_investment", oe.capitalized_intangible_investment),
+        ("working_capital_cash_effect", oe.working_capital_cash_effect),
+    ):
+        if fact is not None:
+            owner_sources[name] = source_row(fact.provenance)
+
+    def annual_cell(year: int) -> dict:
+        item = oe.annual[year]
+        shares = item.diluted_shares.value
+
+        def per_share(fact) -> float | None:
+            return (float(fact.value / shares)
+                    if fact is not None and shares > 0 else None)
+
+        cell = {
+            # Compatibility names are retained while the clearer display names
+            # keep consumers from treating either proxy as definitive owner earnings.
+            "all_capex_floor": float(item.all_capex_floor.value),
+            "maintenance_estimate": float(item.maintenance_estimate.value),
+            "earnings_after_total_capex": float(item.all_capex_floor.value),
+            "reported_earnings_assumption": float(item.maintenance_estimate.value),
+            "free_cash_flow": fact_value(item.free_cash_flow),
+            "free_cash_flow_after_stock_compensation": fact_value(
+                item.free_cash_flow_after_stock_compensation),
+            "free_cash_flow_after_acquisitions": fact_value(
+                item.free_cash_flow_after_acquisitions),
+            "expanded_free_cash_flow": fact_value(item.expanded_free_cash_flow),
+            "all_capex_floor_per_share": float(item.all_capex_floor_per_share.value),
+            "maintenance_estimate_per_share": float(
+                item.maintenance_estimate_per_share.value),
+            "earnings_after_total_capex_per_share": float(
+                item.all_capex_floor_per_share.value),
+            "reported_earnings_assumption_per_share": float(
+                item.maintenance_estimate_per_share.value),
+            "free_cash_flow_per_share": fact_value(item.free_cash_flow_per_share),
+            "free_cash_flow_after_stock_compensation_per_share": fact_value(
+                item.free_cash_flow_after_stock_compensation_per_share),
+            "free_cash_flow_after_acquisitions_per_share": fact_value(
+                item.free_cash_flow_after_acquisitions_per_share),
+            "expanded_free_cash_flow_per_share": fact_value(
+                item.expanded_free_cash_flow_per_share),
+            "stock_compensation_per_share": per_share(item.stock_compensation),
+            "cash_acquisitions_per_share": per_share(item.cash_acquisitions),
+            "capitalized_intangible_investment_per_share": per_share(
+                item.capitalized_intangible_investment),
+            "working_capital_cash_effect_per_share": per_share(
+                item.working_capital_cash_effect),
+            "operating_cash_flow_before_working_capital_per_share": per_share(
+                item.operating_cash_flow_before_working_capital),
+            "diluted_shares": float(shares),
+            "end": (item.maintenance_estimate_per_share.provenance.period_end.isoformat()
+                    if item.maintenance_estimate_per_share.provenance.period_end
+                    else None),
         }
+        # Preserve the original three per-share keys even when FCF is unavailable;
+        # new supplemental fields are omitted when missing so sparse evidence does
+        # not inflate every company-year with a page of nulls.
+        always = {
+            "all_capex_floor", "maintenance_estimate",
+            "earnings_after_total_capex", "reported_earnings_assumption",
+            "all_capex_floor_per_share", "maintenance_estimate_per_share",
+            "earnings_after_total_capex_per_share",
+            "reported_earnings_assumption_per_share", "free_cash_flow_per_share",
+            "diluted_shares", "end",
+        }
+        return {key: value for key, value in cell.items()
+                if value is not None or key in always}
+
     return {
         "fiscal_year": oe.fiscal_year,
         "status": "ESTIMATE_ONLY",
         "owner_earnings": None,
         "maintenance_capex": None,
         "maintenance_basis": "UNAVAILABLE_PRIMARY_XBRL",
+        "all_capex_label": "Earnings after total capital expenditure",
+        "maintenance_estimate_label": (
+            "Reported earnings — maintenance capex assumed equal to D&A"),
         "all_capex_floor": float(oe.all_capex_floor.value),
         "maintenance_estimate": float(oe.maintenance_estimate.value),
-        "free_cash_flow": (float(oe.free_cash_flow.value)
-                           if oe.free_cash_flow is not None else None),
+        "free_cash_flow": fact_value(oe.free_cash_flow),
+        "free_cash_flow_after_stock_compensation": fact_value(
+            oe.free_cash_flow_after_stock_compensation),
+        "free_cash_flow_after_acquisitions": fact_value(
+            oe.free_cash_flow_after_acquisitions),
+        "expanded_free_cash_flow": fact_value(oe.expanded_free_cash_flow),
+        "stock_compensation": fact_value(oe.stock_compensation),
+        "cash_acquisitions": fact_value(oe.cash_acquisitions),
+        "capitalized_intangible_investment": fact_value(
+            oe.capitalized_intangible_investment),
+        "working_capital_cash_effect": fact_value(oe.working_capital_cash_effect),
+        "operating_cash_flow_before_working_capital": fact_value(
+            oe.operating_cash_flow_before_working_capital),
+        "average_working_capital_cash_effect_3y": (
+            float(oe.average_working_capital_cash_effect_3y)
+            if oe.average_working_capital_cash_effect_3y is not None else None),
+        "stock_compensation_to_revenue": (
+            float(oe.stock_compensation_to_revenue)
+            if oe.stock_compensation_to_revenue is not None else None),
+        "stock_compensation_to_free_cash_flow": (
+            float(oe.stock_compensation_to_free_cash_flow)
+            if oe.stock_compensation_to_free_cash_flow is not None else None),
+        "acquisitions_to_free_cash_flow": (
+            float(oe.acquisitions_to_free_cash_flow)
+            if oe.acquisitions_to_free_cash_flow is not None else None),
+        "acquisition_years_10": oe.acquisition_years_10,
+        "acquisitions_to_capex_10": (
+            float(oe.acquisitions_to_capex_10)
+            if oe.acquisitions_to_capex_10 is not None else None),
         "invested_capital": float(oe.invested_capital) if oe.invested_capital is not None else None,
+        "invested_capital_basis": "AVERAGE_BEGINNING_END_EXCLUDING_CASH_AND_SHORT_TERM_INVESTMENTS",
+        "invested_capital_evidence": {
+            "beginning": capital_point(oe.invested_capital_beginning),
+            "ending": capital_point(oe.invested_capital_ending),
+        },
+        "capital_including_cash": (
+            float(oe.capital_including_cash)
+            if oe.capital_including_cash is not None else None),
+        "capital_including_cash_evidence": {
+            "beginning": capital_point(oe.capital_including_cash_beginning),
+            "ending": capital_point(oe.capital_including_cash_ending),
+        },
         "roic": None,
         "all_capex_return": (float(oe.all_capex_return)
                              if oe.all_capex_return is not None else None),
         "maintenance_estimate_return": (
             float(oe.maintenance_estimate_return)
             if oe.maintenance_estimate_return is not None else None),
+        "all_capex_return_including_cash": (
+            float(oe.all_capex_return_including_cash)
+            if oe.all_capex_return_including_cash is not None else None),
+        "maintenance_estimate_return_including_cash": (
+            float(oe.maintenance_estimate_return_including_cash)
+            if oe.maintenance_estimate_return_including_cash is not None else None),
+        "normalized_tax_rate": (
+            float(oe.normalized_tax_rate * 100)
+            if oe.normalized_tax_rate is not None
+            and not (snap.tax_record or {}).get("pass_through") else None),
+        "nopat": (float(oe.nopat) if oe.nopat is not None
+                  and not (snap.tax_record or {}).get("pass_through") else None),
+        "nopat_roic": (float(oe.nopat_roic) if oe.nopat_roic is not None
+                       and not (snap.tax_record or {}).get("pass_through") else None),
+        "nopat_return_including_cash": (
+            float(oe.nopat_return_including_cash)
+            if oe.nopat_return_including_cash is not None
+            and not (snap.tax_record or {}).get("pass_through") else None),
         "components": [[label, float(v)] for label, v in oe.components],
         "free_cash_flow_components": [
             [label, float(value)] for label, value in oe.free_cash_flow_components],
@@ -522,22 +751,7 @@ def _owner_earnings_row(snap) -> dict | None:
         "caveats": list(oe.caveats),
         # Ten completed fiscal years, on today's split and traded-security basis.
         # A missing year is omitted rather than imputed; the UI renders the gap.
-        "annual_per_share": {
-            str(year): {
-                "all_capex_floor_per_share": float(
-                    oe.annual[year].all_capex_floor_per_share.value),
-                "maintenance_estimate_per_share": float(
-                    oe.annual[year].maintenance_estimate_per_share.value),
-                "free_cash_flow_per_share": (
-                    float(oe.annual[year].free_cash_flow_per_share.value)
-                    if oe.annual[year].free_cash_flow_per_share is not None else None),
-                "diluted_shares": float(oe.annual[year].diluted_shares.value),
-                "end": (oe.annual[year].maintenance_estimate_per_share.provenance.period_end.isoformat()
-                        if oe.annual[year].maintenance_estimate_per_share.provenance.period_end
-                        else None),
-            }
-            for year in years
-        },
+        "annual_per_share": {str(year): annual_cell(year) for year in years},
     }
 
 
@@ -1145,6 +1359,13 @@ def apply_price(row: dict, price: float | None) -> dict:
                       "market_timezone", "market_state_asof", "price_source"):
             row.pop(field, None)
     crit = {c["n"]: c for c in row["criteria"]}
+    asset_quality = row.get("asset_quality") or {}
+    asset_quality.pop("market_cap_to_net_cash", None)
+    if (price is not None and price > 0 and row.get("shares") is not None
+            and asset_quality.get("net_cash") is not None
+            and asset_quality["net_cash"] > 0):
+        asset_quality["market_cap_to_net_cash"] = (
+            price * row["shares"] / asset_quality["net_cash"])
     if price is not None and price > 0 and not row.get("basis_conflict"):
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
         # Snapshots are intentionally price-free.  Once export has supplied a
@@ -1256,13 +1477,15 @@ def _validated_price_history(
     old_closes,
     new_closes,
     split_events=(),
+    per_share_restatement_factors=(),
 ) -> tuple[tuple | None, str | None]:
     """Accept a provider history only when revisions have an evidenced cause.
 
     Small candle corrections are harmless. A split can legitimately rescale every
-    pre-event close, but only by the provider's declared corporate-action factor.
-    Unexplained rescaling and suddenly truncated coverage retain the stored series
-    instead of silently rewriting every historical multiple in the UI.
+    pre-event close only after the filing-derived per-share history proves the same
+    factor. Until then, reconstruct contemporaneous closes: a split-adjusted price
+    divided by an unadjusted EPS or BVPS silently corrupts every historical multiple.
+    Unexplained rescaling and suddenly truncated coverage retain the stored series.
     """
     new = tuple((d, Decimal(str(value))) for d, value in new_closes
                 if Decimal(str(value)).is_finite() and Decimal(str(value)) > 0)
@@ -1291,18 +1514,77 @@ def _validated_price_history(
              if old_fetched is not None else date.max)
     recent_splits = [(d, Decimal(str(factor))) for d, factor in split_events
                      if d >= floor and Decimal(str(factor)) > 0]
-    bad = 0
-    for day, old_value, new_value in overlap:
+    basis_factors = tuple(Decimal(str(factor)) for factor in per_share_restatement_factors
+                          if Decimal(str(factor)).is_finite()
+                          and Decimal(str(factor)) > 0)
+
+    def expected_factor(day: date) -> Decimal:
         expected = Decimal(1)
         for split_day, factor in recent_splits:
             if day < split_day:
                 expected *= factor
+        return expected
+
+    def close_to(actual: Decimal, expected: Decimal) -> bool:
+        return abs(actual / expected - 1) <= _HISTORY_REVISION_TOLERANCE
+
+    def filing_proves(expected: Decimal) -> bool:
+        return any(close_to(factor, expected) for factor in basis_factors)
+
+    bad = 0
+    needs_contemporaneous_basis = False
+    for day, old_value, new_value in overlap:
+        expected = expected_factor(day)
         actual = new_value / old_value
-        if abs(actual / expected - 1) > _HISTORY_REVISION_TOLERANCE:
-            bad += 1
+        if close_to(actual, Decimal(1)):
+            if expected != 1 and not filing_proves(expected):
+                needs_contemporaneous_basis = True
+            continue
+        if expected != 1 and close_to(actual, expected):
+            if filing_proves(expected):
+                continue
+            needs_contemporaneous_basis = True
+            continue
+        bad += 1
     if bad > max(2, len(overlap) // 20):
         return None, "historical closes were rescaled without matching split evidence"
+    if needs_contemporaneous_basis:
+        contemporaneous = tuple(
+            (day, value / expected_factor(day)) for day, value in new)
+        return contemporaneous, (
+            "the provider declared a split that the filing-derived per-share history "
+            "does not yet reflect; contemporaneous historical closes remain in use")
     return new, None
+
+
+def _per_share_restatement_factors(previous: dict | None, row: dict) -> tuple[Decimal, ...]:
+    """Factors independently proved by a change in filing-derived per-share history."""
+    if not previous:
+        return ()
+    factors: list[Decimal] = []
+
+    def observe(old_value, new_value) -> None:
+        try:
+            old = Decimal(str(old_value))
+            new = Decimal(str(new_value))
+        except (ValueError, TypeError, InvalidOperation):
+            return
+        if old == 0 or not old.is_finite() or not new.is_finite():
+            return
+        factor = abs(new / old)
+        if abs(factor - 1) > _HISTORY_REVISION_TOLERANCE:
+            factors.append(factor)
+
+    old_eps = previous.get("annual_eps") or {}
+    new_eps = row.get("annual_eps") or {}
+    for year in set(old_eps) & set(new_eps):
+        observe(old_eps[year], new_eps[year])
+    old_ratios = previous.get("annual_ratios") or {}
+    new_ratios = row.get("annual_ratios") or {}
+    for year in set(old_ratios) & set(new_ratios):
+        for field in ("bvps", "tbvps", "ncavps"):
+            observe(old_ratios[year].get(field), new_ratios[year].get(field))
+    return tuple(factors)
 
 
 def _equity_awards(snap) -> dict:
@@ -1362,7 +1644,9 @@ def _price_the_ratio_history(row: dict, closes) -> None:
 
 def _price_stats_row(row: dict, closes) -> dict | None:
     """Where the price sits in its own five-year history. Never a criterion."""
-    if not closes or not row.get("price"):
+    warning = (row.get("price_history_warning") or {}).get("note", "")
+    if ("filing-derived per-share history does not yet reflect" in warning
+            or not closes or not row.get("price")):
         return None
     series = tuple((d, Decimal(str(c))) for d, c in closes)
     stats = pricestats.compute(series, Decimal(str(row["price"])))
@@ -1562,13 +1846,16 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
             if history is not None:
                 old_fetched, old_closes = store.price_history_record(conn, row["cik"])
                 closes, warning = _validated_price_history(
-                    old_fetched, old_closes, history.closes, history.splits)
+                    old_fetched, old_closes, history.closes, history.splits,
+                    _per_share_restatement_factors(
+                        previous_rows.get(row["cik"]), row))
                 if warning is not None:
                     row["price_history_warning"] = {
                         "kind": "HISTORY_REJECTED",
-                        "note": warning + "; the previously validated history remains in use",
+                        "note": (warning if closes else
+                                 warning + "; the previously validated history remains in use"),
                     }
-                elif closes:
+                if closes:
                     store.set_price_history(conn, row["cik"], closes)
             elif quote_only:
                 prior = previous_rows.get(row["cik"], {})

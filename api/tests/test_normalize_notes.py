@@ -404,9 +404,17 @@ def test_additional_sale_gain_tags_use_the_same_earnings_quality_guard():
 
 
 def test_afs_successor_tag_is_the_fragment_never_the_total_pfe_style():
-    gaap = dict(OE_GAAP)
-    gaap["OtherShortTermInvestments"] = tagdata("USD", [inst("2026-03-31", 12454e6, accn="q126")])
-    gaap["AvailableForSaleSecuritiesDebtSecuritiesCurrent"] = tagdata("USD", [inst("2026-03-31", 9183e6, accn="q126")])
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "ShortTermInvestments"}
+    gaap["OtherShortTermInvestments"] = tagdata("USD", [
+        inst("2024-12-31", 12454e6, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 12454e6, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 12454e6, accn="q126"),
+    ])
+    gaap["AvailableForSaleSecuritiesDebtSecuritiesCurrent"] = tagdata("USD", [
+        inst("2024-12-31", 9183e6, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 9183e6, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 9183e6, accn="q126"),
+    ])
     s = build(gaap)
     # invested capital = 1000e9 assets - 40e9 cash - 12.454e9 investments - 150e9 nibcl
     assert float(s.owner_earnings.invested_capital) == 1000e9 - 40e9 - 12454e6 - 150e9
@@ -420,14 +428,26 @@ def test_afs_successor_tag_is_the_fragment_never_the_total_pfe_style():
 def test_restricted_cash_netted_only_from_the_inclusive_rollup_aal_style():
     gaap = {k: v for k, v in OE_GAAP.items() if k != "CashAndCashEquivalentsAtCarryingValue"}
     gaap["CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"] = \
-        tagdata("USD", [inst("2026-03-31", 40e9, accn="q126")])
-    gaap["RestrictedCash"] = tagdata("USD", [inst("2026-03-31", 3e9, accn="q126")])
+        tagdata("USD", [
+            inst("2024-12-31", 40e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 40e9, form="10-K", accn="k25", filed="2026-02-15"),
+            inst("2026-03-31", 40e9, accn="q126"),
+        ])
+    gaap["RestrictedCash"] = tagdata("USD", [
+        inst("2024-12-31", 3e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 3e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 3e9, accn="q126"),
+    ])
     s = build(gaap)
     assert float(s.owner_earnings.invested_capital) == 1000e9 - 37e9 - 150e9
     assert any("restricted" in c for c in s.owner_earnings.caveats)
 
     # plain carrying-value tag: never netted
-    s = build(OE_GAAP | {"RestrictedCash": tagdata("USD", [inst("2026-03-31", 3e9, accn="q126")])})
+    s = build(OE_GAAP | {"RestrictedCash": tagdata("USD", [
+        inst("2024-12-31", 3e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 3e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 3e9, accn="q126"),
+    ])})
     assert float(s.owner_earnings.invested_capital) == 810e9
 
 
@@ -480,7 +500,7 @@ def test_geographic_pretax_sum_never_overrides_reported_owner_earnings():
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 70e9, accn="k25", filed="2026-02-15")])
     oe = build(gaap).owner_earnings
-    assert float(dict(oe.components)["reported earnings attributable to owners"]) == 70e9
+    assert float(dict(oe.components)["reported earnings available to common"]) == 70e9
     assert not any("domestic and foreign" in c for c in oe.caveats)
 
 
@@ -512,6 +532,21 @@ def test_lease_obligations_are_disclosed_beside_the_debt_test_that_ignores_them(
     gaap["OperatingLeaseLiability"] = tagdata("USD", [inst("2026-03-31", 200e9, accn="q126")])
     note = next(n for n in texts(build(gaap)) if "lease obligations" in n)
     assert "200,000M" in note and "long-term debt" in note
+
+
+def test_lease_cost_and_fixed_charge_proxy_keep_one_reported_period():
+    gaap = dict(OE_GAAP)
+    gaap["OperatingLeaseLiability"] = tagdata("USD", [
+        inst("2026-03-31", 200e9, accn="q126")])
+    gaap["OperatingLeaseCost"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 8e9, accn="k25", filed="2026-02-15")])
+    gaap["InterestExpense"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 2e9, accn="k25", filed="2026-02-15")])
+    snapshot = build(gaap)
+    assert float(snapshot.operating_lease_liability.value) == 200e9
+    assert float(snapshot.lease_cost.value) == 8e9
+    assert float(snapshot.fixed_charge_coverage.value) == pytest.approx(10.8)
+    assert len(snapshot.fixed_charge_coverage.provenance.components) == 3
 
 
 def test_a_lease_book_that_is_trivial_to_the_company_says_nothing():

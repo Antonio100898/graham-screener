@@ -17,6 +17,7 @@ export default defineConfig({
       "/tracked": "http://127.0.0.1:8000",
       "/portfolio": "http://127.0.0.1:8000",
       "/portfolios": "http://127.0.0.1:8000",
+      "/crypto": "http://127.0.0.1:8000",
       "/sync": "http://127.0.0.1:8000",
       "/config": "http://127.0.0.1:8000",
     },
