@@ -57,14 +57,18 @@ def quarters_through(start: Quarter, end: Quarter) -> list[Quarter]:
 
 
 def latest_published(today: date) -> Quarter:
-    """SEC publishes a quarter roughly a month after it closes, so the newest
-    dataset on offer describes the quarter before last at the turn of a month."""
+    """The immediately preceding, fully closed quarter.
+
+    Publication normally follows quarter-end by several weeks.  ``download``
+    treats a still-unpublished candidate's 404 as an ordinary stop condition, so
+    lagging by a second whole quarter here only makes fresh dimensioned filings
+    invisible after SEC has actually published them.
+    """
     q = (today.month - 1) // 3 + 1
     year = today.year
-    for _ in range(2):  # step back two quarters: one closed, one for the lag
-        q -= 1
-        if q == 0:
-            q, year = 4, year - 1
+    q -= 1
+    if q == 0:
+        q, year = 4, year - 1
     return Quarter(year, q)
 
 
@@ -149,7 +153,12 @@ def harvest(zip_path: Path, ciks: set[str], tags: frozenset[str],
                         continue
                 else:
                     try:
-                        if abs(float(value)) < extension_floor:
+                        # Explicitly allowlisted statement concepts remain useful
+                        # below the generic extension materiality floor. FUSB's
+                        # $1.581m cash-flow D&A is the exact statement row; its
+                        # standard-taxonomy fact is only a rounded note disclosure
+                        # whose Inline-XBRL scale was lost in the later filing.
+                        if tag not in tags and abs(float(value)) < extension_floor:
                             continue
                     except ValueError:
                         continue

@@ -183,8 +183,20 @@ def columns(document: str) -> list[date]:
     heading, not by position.
     """
     head = re.search(r"<thead[^>]*>(.*?)</thead>", document, re.S | re.I)
-    # these renderings carry no <thead>; the period headings sit in the first rows
-    scope = head.group(1) if head else _readable_head(document)
+    # Most SEC renderings carry no <thead>.  Read only the leading <th> rows in
+    # that case, not the first few hundred visible characters: a later expense
+    # caption can repeat both dates in the opposite order (SHFH), and those prose
+    # dates are not column headings.
+    if head:
+        scope = head.group(1)
+    else:
+        header_rows = []
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", document, re.S | re.I):
+            if re.search(r"<th\b", row, re.I):
+                header_rows.append(row)
+            elif header_rows:
+                break
+        scope = " ".join(header_rows) if header_rows else _readable_head(document)
     out = []
     for match in _HEADER_DATE.finditer(re.sub(r"<[^>]+>", " ", scope)):
         month, day, year = match.groups()
@@ -192,7 +204,26 @@ def columns(document: str) -> list[date]:
             out.append(date(int(year), _MONTHS[month[:3].lower()], int(day)))
         except ValueError:
             continue
+    # Some generated reports reserve a dated scenario column whose every body
+    # cell is blank.  CCI's June 2026 balance sheet, for example, heads an empty
+    # "Dec. 31, 2026" column before the real June 2026 / December 2025 pair.
+    # Remove only positions proved empty across the whole table; ordinary sparse
+    # rows do not get to move the remaining dates sideways.
+    active = _numeric_column_positions(document)
+    if active and len(out) == max(active) + 1 and len(active) < len(out):
+        out = [out[position] for position in active]
     return out
+
+
+def _numeric_column_positions(document: str) -> list[int]:
+    """Raw table-cell positions which contain at least one numeric value."""
+    counts: dict[int, int] = {}
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", document, re.S | re.I):
+        cells = _cells(row)
+        for position, cell in enumerate(cells[1:]):
+            if _CELL.match(cell):
+                counts[position] = counts.get(position, 0) + 1
+    return sorted(counts)
 
 
 def lines(document: str) -> list[tuple[str, list[Decimal]]]:
@@ -317,7 +348,7 @@ def all_matching(statement_lines, *phrases: str, column: int = 0,
 _ELEMENT = re.compile(r"defref_([A-Za-z0-9-]+_[A-Za-z0-9]+)")
 
 
-def elements(document: str) -> dict[str, list[Decimal]]:
+def elements(document: str) -> dict[str, list[Decimal | None]]:
     """The statement keyed by the concept each line was tagged with, not its label.
 
     This is the exact question and the labels were only ever a proxy for it. Apple
@@ -337,22 +368,26 @@ def elements(document: str) -> dict[str, list[Decimal]]:
     factor = scale(document)
     share_word = _SHARES_UNSCALED.search(_readable_head(document))
     share_factor = _UNITS.get(share_word.group(1).lower() if share_word else "", Decimal(1))
-    out: dict[str, list[Decimal]] = {}
+    out: dict[str, list[Decimal | None]] = {}
+    active = _numeric_column_positions(document)
     for row in re.findall(r"<tr[^>]*>(.*?)</tr>", document, re.S | re.I):
         found = _ELEMENT.search(row)
         if not found:
             continue
-        cells = [c for c in _cells(row) if c]
+        cells = _cells(row)
         if len(cells) < 2:
             continue
         label = cells[0].rstrip(" :")
         per_share = bool(_PER_SHARE.search(label)) or "PerShare" in found.group(1)
         about_shares = (bool(_A_COUNT_OF_SHARES.search(label))
                         or "SharesOutstanding" in found.group(1)) and not per_share
-        values = []
-        for cell in cells[1:]:
+        values: list[Decimal | None] = []
+        positions = active or list(range(len(cells) - 1))
+        for position in positions:
+            cell = cells[position + 1] if position + 1 < len(cells) else ""
             m = _CELL.match(cell)
             if not m:
+                values.append(None)
                 continue
             try:
                 value = Decimal(m.group(1).replace(",", ""))
@@ -363,6 +398,8 @@ def elements(document: str) -> dict[str, list[Decimal]]:
             unit = (Decimal(1) if per_share else
                     share_factor if (about_shares and "$" not in cell) else factor)
             values.append(value * unit)
-        if values and len(values) > len(out.get(found.group(1), ())):
+        populated = sum(value is not None for value in values)
+        previous = out.get(found.group(1), ())
+        if populated and populated > sum(value is not None for value in previous):
             out[found.group(1)] = values
     return out

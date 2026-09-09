@@ -1,8 +1,10 @@
 """Layer 1: price quotes behind a swappable PriceProvider protocol."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Protocol
 
 import httpx
@@ -11,8 +13,8 @@ from ..models import PriceHistory, Quote
 
 
 class PriceProvider(Protocol):
-    def quote(self, ticker: str) -> Quote | None: ...
-    def history(self, ticker: str) -> PriceHistory | None: ...
+    def quote(self, ticker: str, expected_currency: str = "USD") -> Quote | None: ...
+    def history(self, ticker: str, expected_currency: str = "USD") -> PriceHistory | None: ...
 
 
 YAHOO_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -33,8 +35,11 @@ class YahooPriceProvider:
 
     def _chart(self, ticker: str, range_: str, interval: str,
                include_pre_post: bool = False) -> dict | None:
-        # Yahoo uses dash-form class symbols (BRK-B), matching SEC's ticker map
-        symbol = ticker.strip().upper().replace(".", "-")
+        # A one-letter suffix is a US share class (BRK.B -> BRK-B). A multi-letter
+        # suffix is an exchange code and must remain dotted (ADS.DE).
+        symbol = ticker.strip().upper()
+        if re.fullmatch(r"[A-Z0-9]+\.[A-Z]", symbol):
+            symbol = symbol.replace(".", "-")
         try:
             resp = self._http.get(YAHOO_URL.format(
                 symbol=symbol, range=range_, interval=interval,
@@ -67,7 +72,8 @@ class YahooPriceProvider:
         return outside
 
     @classmethod
-    def _quote_from(cls, result: dict, *, now: datetime | None = None) -> Quote | None:
+    def _quote_from(cls, result: dict, *, now: datetime | None = None,
+                    expected_currency: str = "USD") -> Quote | None:
         try:
             meta = result["meta"]
             price = Decimal(str(meta["regularMarketPrice"]))
@@ -77,7 +83,7 @@ class YahooPriceProvider:
             # resolve to the US listing whose filings the row carries.
             if not price.is_finite() or price <= 0:
                 return None
-            if meta.get("currency") not in (None, "USD"):
+            if meta.get("currency") not in (None, expected_currency):
                 return None
             session = "REGULAR"
             periods = cls._periods(meta)
@@ -115,11 +121,11 @@ class YahooPriceProvider:
         except _BAD:
             return None
 
-    def quote(self, ticker: str) -> Quote | None:
+    def quote(self, ticker: str, expected_currency: str = "USD") -> Quote | None:
         result = self._chart(ticker, "1d", "5m", include_pre_post=True)
-        return self._quote_from(result) if result else None
+        return self._quote_from(result, expected_currency=expected_currency) if result else None
 
-    def history(self, ticker: str) -> PriceHistory | None:
+    def history(self, ticker: str, expected_currency: str = "USD") -> PriceHistory | None:
         """Five years of weekly closes, and the live quote that comes with them.
 
         Weekly history and an extended-hours quote use different intervals. The
@@ -130,7 +136,7 @@ class YahooPriceProvider:
         if not result:
             return None
         quote_result = self._chart(ticker, "1d", "5m", include_pre_post=True)
-        q = self._quote_from(quote_result or result)
+        q = self._quote_from(quote_result or result, expected_currency=expected_currency)
         if q is None:
             return None
         try:
@@ -161,3 +167,68 @@ class YahooPriceProvider:
             except _BAD + (ZeroDivisionError,):
                 continue
         return PriceHistory(quote=q, closes=tuple(series), splits=tuple(sorted(splits)))
+
+    def exchange_rate_history(
+        self, base_currency: str, counter_currency: str,
+    ) -> PriceHistory | None:
+        """Counter-currency units for one base unit, current and ten-year weekly.
+
+        `USDJPY=X`, for example, is JPY per USD. The direction is part of the
+        method contract so callers never infer whether a provider pair needs to
+        be multiplied or divided. A direct pair is preferred; an available
+        inverse pair is inverted explicitly and retains its symbol in provenance.
+        """
+        base = base_currency.strip().upper()
+        counter = counter_currency.strip().upper()
+        if not (re.fullmatch(r"[A-Z]{3}", base)
+                and re.fullmatch(r"[A-Z]{3}", counter)):
+            return None
+        if base == counter:
+            now = datetime.now(tz=timezone.utc)
+            return PriceHistory(
+                quote=Quote(Decimal(1), now, "identity-fx"), closes=())
+
+        def read(symbol: str, expected: str) -> PriceHistory | None:
+            result = self._chart(symbol, "10y", "1wk")
+            quote = self._quote_from(result, expected_currency=expected) if result else None
+            if result is None or quote is None:
+                return None
+            try:
+                stamps = result.get("timestamp") or []
+                closes = result["indicators"]["quote"][0]["close"]
+            except _BAD:
+                closes = []
+                stamps = []
+            series = []
+            for stamp, close in zip(stamps, closes):
+                if close is None:
+                    continue
+                try:
+                    value = Decimal(str(close))
+                    if value.is_finite() and value > 0:
+                        series.append((
+                            datetime.fromtimestamp(stamp, tz=timezone.utc).date(), value))
+                except _BAD:
+                    continue
+            return PriceHistory(
+                quote=replace(quote, source=f"yahoo-fx:{symbol}"),
+                closes=tuple(series),
+            )
+
+        direct_symbol = f"{base}{counter}=X"
+        direct = read(direct_symbol, counter)
+        if direct is not None:
+            return direct
+        inverse_symbol = f"{counter}{base}=X"
+        inverse = read(inverse_symbol, base)
+        if inverse is None or inverse.quote.price <= 0:
+            return None
+        return PriceHistory(
+            quote=replace(
+                inverse.quote,
+                price=Decimal(1) / inverse.quote.price,
+                source=f"{inverse.quote.source}:inverted",
+            ),
+            closes=tuple((day, Decimal(1) / value)
+                         for day, value in inverse.closes if value > 0),
+        )

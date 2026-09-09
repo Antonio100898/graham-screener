@@ -4,9 +4,11 @@ Evaluates US-listed SEC filers against Benjamin Graham's Enterprising Investor
 criteria (The Intelligent Investor, ch. 15), computed from primary SEC XBRL
 filings — never aggregator fundamentals — with provenance for every figure.
 The universe includes domestic filers and foreign 20-F/40-F filers when their
-current annual report supplies a USD US-GAAP or standard IFRS balance sheet and
-its cover resolves the exact common-equity security (including any depositary
-ratio). Non-USD statements remain excluded rather than converted or guessed.
+current annual report supplies a coherent US-GAAP or standard IFRS balance sheet
+in one identifiable currency and its cover resolves the exact common-equity
+security (including any depositary ratio). For non-USD statements, explicit
+current and fiscal-date FX rates put a USD-listed share price on the reporting
+basis; missing FX leaves valuation unavailable rather than guessed.
 
 Six criteria are scored: P/E < 10, current ratio ≥ 1.5, debt ≤ 1.1× net current
 assets, positive EPS in each of the last 5 years, a current dividend, and price

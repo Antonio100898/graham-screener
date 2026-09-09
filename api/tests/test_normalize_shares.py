@@ -345,18 +345,20 @@ def test_yield_reads_the_annual_series_even_from_another_chained_tag_ko_style():
 def test_a_per_share_rate_repeated_across_contexts_is_not_a_years_dividends():
     """Visa tags 0.59 for a quarter and 0.59 again for the fiscal year: the
     element carries the rate per payment. Taking it as the annual total would
-    understate the yield fourfold, so the figure is withheld instead."""
+    understate the yield fourfold, so the figure is withheld instead.  The
+    shared TEST fixture is a December filer, so these contexts use that same
+    fiscal calendar; Visa's equivalent real contexts end in September."""
     gaap = {k: v for k, v in GAAP.items() if k != "PaymentsOfDividendsCommonStock"}
     gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
-        dur("2024-10-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
-        dur("2025-07-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
+        dur("2025-01-01", "2025-12-31", 0.59, form="10-K", accn="k25", filed="2026-02-15"),
+        dur("2025-10-01", "2025-12-31", 0.59, form="10-K", accn="k25", filed="2026-02-15"),
     ])
     assert build(gaap).dividend_per_share is None
 
     # a genuine annual total, larger than any one quarter, is used
     gaap["CommonStockDividendsPerShareDeclared"] = tagdata("USD/shares", [
-        dur("2024-10-01", "2025-09-30", 2.36, form="10-K", accn="k25", filed="2025-11-15"),
-        dur("2025-07-01", "2025-09-30", 0.59, form="10-K", accn="k25", filed="2025-11-15"),
+        dur("2025-01-01", "2025-12-31", 2.36, form="10-K", accn="k25", filed="2026-02-15"),
+        dur("2025-10-01", "2025-12-31", 0.59, form="10-K", accn="k25", filed="2026-02-15"),
     ])
     assert build(gaap).dividend_per_share == Decimal("2.36")
 
@@ -686,3 +688,91 @@ def test_a_named_but_unmatched_class_is_withheld():
     registered = _registered_class_title("BH-A", None)
     assert registered == "Class A Common Stock"
     assert _unambiguous_dimensioned(sidecar, registered) == {}
+
+
+def test_uhal_uses_voting_class_eps_and_dividends_but_companywide_share_count():
+    """U-Haul's reports allocate earnings and dividends between UHAL Voting
+    Common and UHAL.B Series N Non-Voting Common.  Company Facts flattens the
+    sibling class, while DERA preserves the issuer-defined class axes.  The
+    priced UHAL security must use voting EPS/dividends without dividing the
+    company's equity and cash flow by only the voting tenth of its shares."""
+    gaap = {k: v for k, v in GAAP.items() if k not in {
+        "EarningsPerShareDiluted", "CommonStockSharesOutstanding",
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "PaymentsOfDividendsCommonStock",
+    }}
+    gaap.update({
+        # Flattened non-voting figures: neither may leak into the UHAL ticker.
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2024-04-01", "2025-03-31", 1.89, accn="k25", filed="2025-05-29"),
+            dur("2025-04-01", "2026-03-31", 0.44, accn="k26", filed="2026-05-28"),
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2024-04-01", "2025-03-31", 367.09e6, accn="k25", filed="2025-05-29"),
+            dur("2025-04-01", "2026-03-31", 83.128e6, accn="k26", filed="2026-05-28"),
+        ]),
+        "PaymentsOfDividendsCommonStock": tagdata("USD", [
+            dur("2025-04-01", "2026-03-31", 35.294e6,
+                accn="k26", filed="2026-05-28"),
+        ]),
+    })
+    dim = {"facts": {"us-gaap": {
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            classed_entry("2024-04-01", "2025-03-31", 1.69,
+                          "EquityComponents=CommonStock;",
+                          accn="k25", filed="2025-05-29"),
+            classed_entry("2024-04-01", "2025-03-31", 1.89,
+                          "ClassOfStock=NonvotingCommonStock;",
+                          accn="k25", filed="2025-05-29"),
+            classed_entry("2025-04-01", "2026-03-31", 0.24,
+                          "ClassOfStock=CommonClassA;",
+                          accn="k26", filed="2026-05-28"),
+            classed_entry("2025-04-01", "2026-03-31", 0.44,
+                          "ClassOfStock=NonvotingCommonStock;",
+                          accn="k26", filed="2026-05-28"),
+        ]),
+        "CommonStockSharesOutstanding": tagdata("shares", [
+            {**inst("2026-03-31", 19_607_788, form="10-K",
+                    accn="k26", filed="2026-05-28"),
+             "segments": "ClassOfStock=CommonClassA;"},
+            {**inst("2026-03-31", 176_470_092, form="10-K",
+                    accn="k26", filed="2026-05-28"),
+             "segments": "ClassOfStock=NonvotingCommonStock;"},
+        ]),
+        "WeightedAverageNumberOfSharesOutstandingBasic": tagdata("shares", [
+            classed_entry("2024-04-01", "2025-03-31", 19_607_788,
+                          "EquityComponents=CommonStock;",
+                          accn="k25", filed="2025-05-29"),
+            classed_entry("2024-04-01", "2025-03-31", 176_470_092,
+                          "ClassOfStock=NonvotingCommonStock;",
+                          accn="k25", filed="2025-05-29"),
+            classed_entry("2025-04-01", "2026-03-31", 19_607_788,
+                          "ClassOfStock=CommonClassA;",
+                          accn="k26", filed="2026-05-28"),
+            classed_entry("2025-04-01", "2026-03-31", 176_470_092,
+                          "ClassOfStock=NonvotingCommonStock;",
+                          accn="k26", filed="2026-05-28"),
+        ]),
+        "DividendsCommonStockCash": tagdata("USD", [
+            classed_entry("2025-04-01", "2026-03-31", 0,
+                          "EquityComponents=CommonStock;",
+                          accn="k26", filed="2026-05-28"),
+            classed_entry("2025-04-01", "2026-03-31", 35.294e6,
+                          "ClassOfStock=NonvotingCommonStock;",
+                          accn="k26", filed="2026-05-28"),
+        ]),
+    }}}
+
+    s = build_snapshot("UHAL", "0000004457", facts_doc(gaap), dimensioned=dim)
+
+    assert s.annual_eps[2025].value == Decimal("1.69")
+    assert s.annual_eps[2026].value == Decimal("0.24")
+    assert s.ttm_eps == Decimal("0.24")
+    assert s.shares_outstanding.value == Decimal("196077880")
+    assert s.annual_share_counts[2025].value == Decimal("196077880")
+    assert s.annual_share_counts[2026].value == Decimal("196077880")
+    assert s.pays_dividend is False
+    assert s.dividend is None
+    assert s.dividend_record is None
+    assert s.basis_conflict is None

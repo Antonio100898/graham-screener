@@ -4,9 +4,12 @@
 // than reading it as zero — a company shown debt-free on no evidence is the
 // worst answer of the three.
 
+import { valuationPrice } from "./screen.js";
+
 /** Market value of the common plus the debt ahead of it. */
 export function totalCapitalisation(row) {
-  const marketCap = row.price != null && row.shares != null ? row.price * row.shares : null;
+  const price = valuationPrice(row);
+  const marketCap = price != null && row.shares != null ? price * row.shares : null;
   if (marketCap == null || row.debt == null) return null;
   return marketCap + row.debt;
 }

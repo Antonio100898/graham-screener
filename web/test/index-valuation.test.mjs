@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { currentRatio, indexValuation, medianPositive, priceToBook, reportedRate } from "../src/screen.js";
+import { currentRatio, indexValuation, medianPositive, priceToBook, reportedRate, valuationPrice } from "../src/screen.js";
 
 const row = ({ index = "S&P 500", pe = null, pe3 = null, ...extra } = {}) => ({
   idx: index ? [index] : [],
@@ -27,6 +27,19 @@ test("Research balance-sheet ratios preserve missing and invalid denominators", 
   assert.equal(priceToBook({ price: 20, bvps: 8 }), 2.5);
   assert.equal(priceToBook({ price: 20, bvps: -8 }), null);
   assert.equal(priceToBook({ price: null, bvps: 8 }), null);
+});
+
+test("valuation ratios use the explicitly converted statement-currency price", () => {
+  const foreign = {
+    price: 200,
+    price_reporting_currency: 30000,
+    reporting_currency: "JPY",
+    quote_currency: "USD",
+    bvps: 12000,
+  };
+  assert.equal(valuationPrice(foreign), 30000);
+  assert.equal(priceToBook(foreign), 2.5);
+  assert.equal(valuationPrice({ ...foreign, price_reporting_currency: null }), null);
 });
 
 test("index valuation uses the full named-index cohort and reports usable denominators", () => {

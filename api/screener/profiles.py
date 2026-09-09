@@ -175,6 +175,30 @@ def _number(value) -> Decimal | None:
         return None
 
 
+def _valuation_price(row: dict) -> Decimal | None:
+    """Price expressed in the same currency as filed per-share figures."""
+    reporting = row.get("reporting_currency") or row.get("currency") or "USD"
+    quote = row.get("quote_currency") or row.get("currency") or "USD"
+    if reporting != quote:
+        return _number(row.get("price_reporting_currency"))
+    return _number(row.get("price"))
+
+
+def _amount_in_usd(row: dict, value: Decimal | None) -> Decimal | None:
+    """Convert a reported total only for Graham's explicitly dollar size floor."""
+    if value is None:
+        return None
+    reporting = row.get("reporting_currency") or row.get("currency") or "USD"
+    if reporting == "USD":
+        return value
+    fx = row.get("fx") or {}
+    rate = _number(fx.get("rate"))
+    if (fx.get("base") != "USD" or fx.get("counter") != reporting
+            or rate is None or rate <= 0):
+        return None
+    return value / rate
+
+
 def _status(pass_: bool | None) -> str:
     if pass_ is None:
         return "INSUFFICIENT_DATA"
@@ -213,7 +237,7 @@ def _criterion_status(row: dict, number: int) -> str:
 
 def _pe3(row: dict) -> Decimal | None:
     """Current price over the three latest consecutive fiscal-year EPS values."""
-    price = _number(row.get("price"))
+    price = _valuation_price(row)
     eps = _eps_series(row)
     if price is None or not eps:
         return None
@@ -625,15 +649,19 @@ def _defensive(row: dict, profile: str) -> dict:
     ltd = _number(row.get("long_term_debt"))
     shares = _number(row.get("shares"))
     bvps = _number(row.get("bvps"))
-    price = _number(row.get("price"))
+    price = _valuation_price(row)
     pe3 = _pe3(row)
 
     if profile == PROFILE_UTILITY:
-        size = _status(assets >= Decimal("50000000") if assets is not None else None)
+        assets_usd = _amount_in_usd(row, assets)
+        size = _status(assets_usd >= Decimal("50000000")
+                       if assets_usd is not None else None)
         equity = assets - liabilities if assets is not None and liabilities is not None else None
         financial = _status(ltd <= Decimal("2") * equity if ltd is not None and equity is not None else None)
     elif profile == PROFILE_OPERATING:
-        size = _status(revenue >= Decimal("100000000") if revenue is not None else None)
+        revenue_usd = _amount_in_usd(row, revenue)
+        size = _status(revenue_usd >= Decimal("100000000")
+                       if revenue_usd is not None else None)
         if ca is None or cl is None or ltd is None or cl <= 0:
             financial = "INSUFFICIENT_DATA"
         else:
@@ -795,7 +823,7 @@ def prose_gaps(row: dict) -> list[dict]:
     if (row.get("receipt") or {}).get("title"):
         return gaps
 
-    if foreign:
+    if foreign and row.get("security_basis") != "PRIMARY_ORDINARY_SHARE":
         gaps.append({
             "what": "Whether the listed security is a depositary receipt, and how many "
                     "ordinary shares one receipt stands for"
@@ -817,7 +845,7 @@ def prose_gaps(row: dict) -> list[dict]:
             "accn": latest_filing,
         })
 
-    if row.get("listed") != "y":
+    if row.get("listed") not in {"y", "external"}:
         gaps.append({
             "what": "Whether this symbol is still tradable. SEC's ticker file no longer "
                     "assigns it to this company — the equity may have been delisted, "

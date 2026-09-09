@@ -39,8 +39,15 @@ export function currentRatio(row) {
     : null;
 }
 
+export function valuationPrice(row) {
+  const reporting = row.reporting_currency ?? row.currency ?? "USD";
+  const quote = row.quote_currency ?? row.currency ?? "USD";
+  return reporting === quote ? row.price : row.price_reporting_currency;
+}
+
 export function priceToBook(row) {
-  return row.price != null && row.bvps > 0 ? row.price / row.bvps : null;
+  const price = valuationPrice(row);
+  return price != null && row.bvps > 0 ? price / row.bvps : null;
 }
 
 /** A missing operating margin is materially different from a zero margin.
@@ -135,7 +142,12 @@ export function priceToPass(row) {
   // only meaningful when nothing else blocks it
   const other = row.criteria.filter((c) => c.status !== "PASS" && !PRICE_CRITERIA.has(c.n));
   if (other.length) return null;
-  return Math.min(...limits);
+  const reportingLimit = Math.min(...limits);
+  const reporting = row.reporting_currency ?? row.currency ?? "USD";
+  const quote = row.quote_currency ?? row.currency ?? "USD";
+  if (reporting === quote) return reportingLimit;
+  const rate = row.fx?.base === quote && row.fx?.counter === reporting ? row.fx.rate : null;
+  return rate > 0 ? reportingLimit / rate : null;
 }
 
 /** Graham smoothed a lucky or disastrous single year by pricing the average of
@@ -145,13 +157,14 @@ export function priceToPass(row) {
  * is too old to price (dormant filers keep tickers and stale earnings). */
 export function pe3(row) {
   const eps = row.annual_eps;
-  if (!eps || !row.price) return null;
+  const price = valuationPrice(row);
+  if (!eps || !price) return null;
   const years = Object.keys(eps).map(Number).sort((a, b) => b - a).slice(0, 3);
   if (years.length < 3) return null;
   const priceYear = Number((row.price_asof ?? "").slice(0, 4));
   if (priceYear && years[0] < priceYear - 2) return null;
   const avg = (eps[years[0]] + eps[years[1]] + eps[years[2]]) / 3;
-  return avg > 0 ? row.price / avg : null;
+  return avg > 0 ? price / avg : null;
 }
 
 /** Median of usable valuation multiples. A loss-making company has no meaningful

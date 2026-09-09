@@ -63,6 +63,19 @@ def _float(value: Decimal | None) -> float | None:
     return None if value is None else float(value)
 
 
+def _price_on_reporting_basis(row: dict, price: Decimal) -> Decimal | None:
+    reporting = row.get("reporting_currency") or row.get("currency") or "USD"
+    quote = row.get("quote_currency") or row.get("currency") or "USD"
+    if reporting == quote:
+        return price
+    fx = row.get("fx") or {}
+    rate = _number(fx.get("rate"))
+    if (fx.get("base") != quote or fx.get("counter") != reporting
+            or rate is None or rate <= 0):
+        return None
+    return price * rate
+
+
 def _quote_after_trade(price_asof: str | None, executed_at: str | None) -> bool | None:
     """Whether a quote can measure performance after the latest ledger event."""
     if not price_asof or not executed_at:
@@ -92,14 +105,16 @@ def _pe3(row: dict, price: Decimal) -> Decimal | None:
 def valuation_at_price(row: dict, price) -> dict:
     """Multiples tied to the actual execution price and the row's filing basis."""
     price_d = decimal_value(price, "price", positive=True)
-    pe = _ratio(price_d, row.get("ttm_eps"))
-    pe3 = _pe3(row, price_d)
-    pb = _ratio(price_d, row.get("bvps"))
-    ptbv = _ratio(price_d, row.get("tbvps"))
-    pncav = _ratio(price_d, row.get("ncavps"))
+    financial_price = _price_on_reporting_basis(row, price_d)
+    pe = _ratio(financial_price, row.get("ttm_eps")) if financial_price else None
+    pe3 = _pe3(row, financial_price) if financial_price else None
+    pb = _ratio(financial_price, row.get("bvps")) if financial_price else None
+    ptbv = _ratio(financial_price, row.get("tbvps")) if financial_price else None
+    pncav = _ratio(financial_price, row.get("ncavps")) if financial_price else None
 
     recurring = _number(row.get("recurring_dividend_per_share"))
-    dividend_yield = recurring / price_d * 100 if recurring is not None and recurring >= 0 else None
+    dividend_yield = (recurring / financial_price * 100
+                      if recurring is not None and recurring >= 0 and financial_price else None)
 
     all_capex_floor_per_share = maintenance_estimate_per_share = free_cash_flow_per_share = None
     owner = row.get("owner_earnings") or {}
@@ -111,7 +126,7 @@ def valuation_at_price(row: dict, price) -> dict:
         free_cash_flow_per_share = _number(cell.get("free_cash_flow_per_share"))
 
     def cash_yield(value):
-        return value / price_d * 100 if value is not None else None
+        return value / financial_price * 100 if value is not None and financial_price else None
 
     defensive_product = pe3 * pb if pe3 is not None and pb is not None else None
     defensive_valuation = None
@@ -125,6 +140,7 @@ def valuation_at_price(row: dict, price) -> dict:
 
     return {
         "price": float(price_d),
+        "price_reporting_currency": _float(financial_price),
         "pe": _float(pe),
         "pe3": _float(pe3),
         "pb": _float(pb),
@@ -135,12 +151,15 @@ def valuation_at_price(row: dict, price) -> dict:
         # primary XBRL, so none of the available figures is definitive owner earnings.
         "price_to_owner_earnings": None,
         "owner_earnings_yield": None,
-        "price_to_all_capex_floor": _float(_ratio(price_d, all_capex_floor_per_share)),
+        "price_to_all_capex_floor": _float(
+            _ratio(financial_price, all_capex_floor_per_share)) if financial_price else None,
         "all_capex_floor_yield": _float(cash_yield(all_capex_floor_per_share)),
         "price_to_maintenance_estimate": _float(
-            _ratio(price_d, maintenance_estimate_per_share)),
+            _ratio(financial_price, maintenance_estimate_per_share)
+            if financial_price else None),
         "maintenance_estimate_yield": _float(cash_yield(maintenance_estimate_per_share)),
-        "price_to_free_cash_flow": _float(_ratio(price_d, free_cash_flow_per_share)),
+        "price_to_free_cash_flow": _float(
+            _ratio(financial_price, free_cash_flow_per_share)) if financial_price else None,
         "free_cash_flow_yield": _float(cash_yield(free_cash_flow_per_share)),
         "defensive_product": _float(defensive_product),
         "defensive_valuation": defensive_valuation,
@@ -150,20 +169,23 @@ def valuation_at_price(row: dict, price) -> dict:
 def criteria_at_price(row: dict, price) -> list[dict]:
     """Keep filing tests intact and resettle only criteria 1 and 7 at the fill."""
     price_d = decimal_value(price, "price", positive=True)
+    financial_price = _price_on_reporting_basis(row, price_d)
     criteria = deepcopy(row.get("criteria") or [])
     by_number = {criterion.get("n"): criterion for criterion in criteria}
 
     earnings = _number(row.get("ttm_eps"))
     c1 = by_number.get(1)
-    if c1 is not None and earnings is not None and earnings > 0 and c1.get("value") is not None:
-        c1["value"] = float((price_d / earnings).quantize(CENT, rounding=ROUND_HALF_UP))
-        c1["status"] = "PASS" if price_d < Decimal("10") * earnings else "FAIL"
+    if (c1 is not None and financial_price is not None and earnings is not None
+            and earnings > 0 and c1.get("value") is not None):
+        c1["value"] = float((financial_price / earnings).quantize(CENT, rounding=ROUND_HALF_UP))
+        c1["status"] = "PASS" if financial_price < Decimal("10") * earnings else "FAIL"
 
     tbvps = _number(row.get("tbvps"))
     c7 = by_number.get(7)
-    if c7 is not None and tbvps is not None and tbvps > 0 and c7.get("value") is not None:
-        c7["value"] = float((price_d / tbvps).quantize(CENT, rounding=ROUND_HALF_UP))
-        c7["status"] = "PASS" if price_d < Decimal("1.2") * tbvps else "FAIL"
+    if (c7 is not None and financial_price is not None and tbvps is not None
+            and tbvps > 0 and c7.get("value") is not None):
+        c7["value"] = float((financial_price / tbvps).quantize(CENT, rounding=ROUND_HALF_UP))
+        c7["status"] = "PASS" if financial_price < Decimal("1.2") * tbvps else "FAIL"
 
     return criteria
 

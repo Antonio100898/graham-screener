@@ -18,7 +18,7 @@ const YEARS = 13;
 const W = 620, H = 190;
 const PAD = { left: 46, right: 16, top: 14, bottom: 24 };
 
-export default function EpsCurve({ annualEps, ttmEps }) {
+export default function EpsCurve({ annualEps, ttmEps, currency = "USD" }) {
   const years = Object.keys(annualEps ?? {})
     .map(Number).filter(Number.isFinite).sort((a, b) => a - b).slice(-YEARS);
   if (years.length < 3) return null;   // two points are a line, not a record
@@ -77,9 +77,9 @@ export default function EpsCurve({ annualEps, ttmEps }) {
         </div>
       </div>
       <svg className="eps-curve-svg" viewBox={`0 0 ${W} ${H}`} role="img"
-           aria-label={points.map((p) => `${p.label} ${fmt(p.value)}`).join(", ")}>
+           aria-label={points.map((p) => `${p.label} ${fmt(p.value, currency)}`).join(", ")}>
         <line x1={PAD.left} x2={W - PAD.right} y1={y(top)} y2={y(top)} className="eps-grid" />
-        <text x={PAD.left - 8} y={y(top) + 4} className="eps-axis" textAnchor="end">{fmt(top)}</text>
+        <text x={PAD.left - 8} y={y(top) + 4} className="eps-axis" textAnchor="end">{fmt(top, currency)}</text>
         {bottom < 0 && (
           <>
             <line x1={PAD.left} x2={W - PAD.right} y1={y(0)} y2={y(0)} className="eps-zero" />
@@ -87,7 +87,7 @@ export default function EpsCurve({ annualEps, ttmEps }) {
           </>
         )}
         <line x1={PAD.left} x2={W - PAD.right} y1={y(bottom)} y2={y(bottom)} className="eps-grid" />
-        <text x={PAD.left - 8} y={y(bottom) + 4} className="eps-axis" textAnchor="end">{fmt(bottom)}</text>
+        <text x={PAD.left - 8} y={y(bottom) + 4} className="eps-axis" textAnchor="end">{fmt(bottom, currency)}</text>
 
         <polygon points={area} fill={colour} opacity="0.07" />
         <polyline points={line} fill="none" stroke={colour} strokeWidth="2"
@@ -100,7 +100,7 @@ export default function EpsCurve({ annualEps, ttmEps }) {
           <g key={p.label}>
             <circle cx={x(i)} cy={y(p.value)} r={p.audited ? 3 : 4}
                     fill={p.audited ? "var(--bg)" : colour} stroke={colour} strokeWidth="2">
-              <title>{`${p.label}  ${fmt(p.value)}`}</title>
+              <title>{`${p.label}  ${fmt(p.value, currency)}`}</title>
             </circle>
             {shown(i) && (
               <text x={x(i)} y={H - 6} className="eps-axis" textAnchor="middle">{p.short}</text>
@@ -112,7 +112,8 @@ export default function EpsCurve({ annualEps, ttmEps }) {
   );
 }
 
-function fmt(value) {
-  return `$${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2,
-                                                      maximumFractionDigits: 2 })}`;
+function fmt(value, currency) {
+  const symbol = ({ EUR: "€", GBP: "£", JPY: "¥" }[currency] ?? "$");
+  return `${symbol}${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2,
+                                                               maximumFractionDigits: 2 })}`;
 }

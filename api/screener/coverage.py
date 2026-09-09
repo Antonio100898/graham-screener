@@ -51,6 +51,10 @@ PINNED = (
     "KO", "MPLX", "SUN", "KRP", "BSM", "SYF", "BXSL", "MAIN", "PNNT", "WFC",
     "HBAN", "TOL", "ULTA", "BRT", "KDP", "HEI", "UDR", "TEVA", "UAL", "AAL",
     "AFL", "TRV", "O", "PLD", "GS", "CAT", "DE", "NEE", "ET", "ARLP",
+    "JNJ", "FUSB", "VRT", "WLK", "VALU", "MAMA", "MAGN", "WFRD",
+    "RUSHA", "CODI", "TKR", "UHAL", "GCO", "PPIH", "AAP", "EML", "BBW",
+    "LFCR", "AVD", "OPK", "BMRN", "BRKR", "DPZ", "JBHT",
+    "RDAR", "MHUAF", "SHGI",
 )
 STRATA = ("Technology", "Industrials", "Financials", "Utilities", "Real estate",
           "Consumer staples", "Consumer discretionary", "Energy", "Healthcare & pharma",
@@ -94,8 +98,8 @@ OUT_OF_SCOPE = (
      "expense lines between revenue and the income totals we do read"),
     (r"EarningsPerShareBasic$|IncomeLossFromContinuingOperationsPerBasicShare$|WeightedAverageNumberOfSharesOutstandingBasic$|WeightedAverageNumberDilutedSharesOutstandingAdjustment|AntidilutiveSecurities|DilutiveSecurities|UndistributedEarnings|ParticipatingSecurities|DistributedEarnings",
      "EPS mechanics: diluted is read; basic/adjustment/allocation lines restate it"),
-    (r"IncomeLossFromEquityMethodInvestments|EquityMethodInvestment|EquitySecuritiesFvNi|AvailableForSaleSecuritiesDebtSecurities$|DebtSecuritiesAvailableForSaleExcludingAccruedInterest$|HeldToMaturitySecurities$|MarketableSecuritiesNoncurrent|OtherLongTermInvestments|LongTermInvestments|ShortTermInvestments\w+|InvestmentsFairValueDisclosure|AlternativeInvestment|DebtSecuritiesTradingAndEquity|EquitySecuritiesWithoutReadilyDeterminableFairValue|InvestmentOwnedAtFairValue|InvestmentOwnedAtCost|InvestmentInterestRate|InvestmentBasisSpreadVariableRate|InvestmentCompanyTotalReturn|InvestmentIncomeInterest$|InvestmentIncomeDividend$|InvestmentIncomeInterestAndDividend",
-     "investment portfolio detail: noncurrent holdings are inside Assets; current chain reads the current tags"),
+    (r"IncomeLossFromEquityMethodInvestments|EquityMethodInvestment(?!s$)|EquitySecuritiesFvNi|AvailableForSaleSecuritiesDebtSecurities$|DebtSecuritiesAvailableForSaleExcludingAccruedInterest$|HeldToMaturitySecurities$|ShortTermInvestments\w+|InvestmentsFairValueDisclosure|AlternativeInvestment|DebtSecuritiesTradingAndEquity|EquitySecuritiesWithoutReadilyDeterminableFairValue|InvestmentOwnedAtFairValue|InvestmentOwnedAtCost|InvestmentInterestRate|InvestmentBasisSpreadVariableRate|InvestmentCompanyTotalReturn|InvestmentIncomeInterest$|InvestmentIncomeDividend$|InvestmentIncomeInterestAndDividend",
+     "investment portfolio detail: one filed noncurrent balance feeds RONTA; overlapping footnote categories remain unread"),
     (r"FairValue|MeasurementInput|ValuationTechnique|BusinessCombination|BusinessAcquisition|AssetAcquisition|Derivative|Hedg|InterestRateSwap|InterestRateCap|ForeignCurrencyContract|CommodityContract|NotionalAmount|EmbeddedDerivative|WarrantsAndRightsOutstanding$|ClassOfWarrantOrRight",
      "measurement/M&A/derivative disclosure fabric: fair-value hierarchies and notionals are not balance-sheet stocks"),
     (r"ConcentrationRisk|NumberOf|Sic|EntityWideRevenue|RevenueFromExternalCustomer|SegmentReporting|ReportableSegment|GeographicAreas|MajorCustomer",
@@ -353,6 +357,49 @@ OUT_OF_SCOPE = (
      "layer (c): purchase commitments — flagged for a human"),
     (r"NetIncomeLossIncludingPortionAttributableToNonredeemableNoncontrollingInterest",
      "income scope variant beside the read NetIncomeLoss chain"),
+    (r"^LongTermInvestmentsAndReceivablesNet$",
+     "mixed noncurrent rollup: Exxon explicitly combines investments and affiliate advances "
+     "with long-term receivables; pure investment tags feed RONTA where available, while "
+     "subtracting this whole line would remove operating receivables from its denominator"),
+    (r"^(InterestAndDividendIncomeSecurities|ProvisionForLoanAndLeaseLosses|RelatedPartyDepositLiabilities|OtherPayablesToBrokerDealersAndClearingOrganizations)$",
+     "bank and broker operating/funding detail inside the income and liability totals; Graham "
+     "operating-return ratios are not presented for financial firms and these are not borrowed "
+     "money or standalone non-operating assets"),
+    (r"^(GainLossOnSaleOfAccountsReceivable|DeferredIncomeRevenueRecognized)$",
+     "income-statement components already inside the reported income/revenue totals"),
+    (r"^DepositAssets$",
+     "sector-specific asset composition already inside total assets; not a proved separate "
+     "non-operating investment deduction"),
+    (r"^(NontradeReceivables|NontradeReceivablesNoncurrent)$",
+     "nontrade receivable composition inside total assets; CODI reports the current and "
+     "noncurrent pieces in the same balance-sheet totals the screen already reads"),
+    (r"^SaleLeasebackTransactionHistoricalCost$",
+     "historical cost of an asset already sold in a sale-and-leaseback transaction; it is "
+     "neither a current asset nor a second gain/loss"),
+    (r"^(InterestCreditedToPolicyOwnerAccount|SalesCommissionsAndFees|EquipmentExpense|"
+     r"DirectCommunicationsAndUtilitiesCosts|DirectTaxesAndLicensesCosts|"
+     r"OperatingInsuranceAndClaimsCostsProduction)$",
+     "operating-expense components inside the reported income totals; adding them separately "
+     "would double count UHAL's insurance/equipment-rental costs or JBHT's directly printed "
+     "operating-cost detail"),
+    (r"^ShortdurationInsuranceContractsDiscountedLiabilitiesAggregateDiscount$",
+     "measurement detail inside the filed insurance-liability carrying amount and total "
+     "liabilities, not a separate liability"),
+    (r"^RetailRelatedInventoryMerchandise$",
+     "retail merchandise is one component of InventoryNet and current assets; GCO separately "
+     "reports wholesale finished goods and the consolidated inventory rollup"),
+    (r"^IntangibleAssetsCurrent$",
+     "documented EML tag misuse: the value is the note's gross finite-lived intangible cost, "
+     "not a current balance-sheet asset; net finite and indefinite stocks are read instead"),
+    (r"^DeferredSalesInducementsAmortizationExpense$",
+     "documented EML tag misuse for ordinary intangible amortization already included in its "
+     "reported DepreciationAndAmortization total"),
+    (r"^ClosedBlockAssetsAndLiabilitiesMaximumFutureEarningsToBeRecognized$",
+     "documented EML tag misuse for its operating-lease liability; the lease balance is already "
+     "inside total liabilities and is not an insurer closed-block asset"),
+    (r"^ReportingUnitZeroOrNegativeCarryingAmountAmountOfAllocatedGoodwill$",
+     "documented EML tag misuse for the consolidated goodwill balance, which the direct "
+     "Goodwill element already supplies"),
 )
 
 # Genuine coverage gaps the harness has already proven, tracked for release 3.
@@ -400,6 +447,7 @@ def _consumed_tags(snap) -> set[str]:
                  "shares_outstanding", "dividend", "total_debt"):
         take(getattr(snap, name))
     for series in (snap.annual_eps, snap.annual_net_income, snap.annual_revenue,
+                   snap.annual_gross_profit,
                    snap.annual_operating_income):
         for fact in series.values():
             take(fact)
@@ -479,6 +527,19 @@ _CONTAINS = (
     ("ProfitLoss", "NetIncomeLoss"),
 )
 
+# Filing-backed exceptions to a taxonomy containment relation. These are not
+# generic semantic guesses: EML prints the two lines separately and uses the
+# nominal total tag for only the finite-lived line.
+_VERIFIED_CONTAINMENT_EXCEPTIONS = frozenset({
+    ("EML", "IntangibleAssetsNetExcludingGoodwill",
+     "IndefiniteLivedIntangibleAssetsExcludingGoodwill"),
+    ("EML", "IntangibleAssetsNetExcludingGoodwill", "IndefiniteLivedTrademarks"),
+})
+
+
+def _verified_containment_exception(ticker: str, parent: str, child: str) -> bool:
+    return (ticker, parent, child) in _VERIFIED_CONTAINMENT_EXCEPTIONS
+
 _CONSTRUCTED_FIELDS = (
     "total_assets", "total_liabilities", "current_assets", "current_liabilities",
     "long_term_debt", "short_term_debt", "total_debt", "goodwill", "intangibles",
@@ -491,6 +552,31 @@ def _tags_of(prov) -> list[str]:
     """Every element name a figure rests on, composites split apart."""
     return [t.split(":", 1)[1] if ":" in t else t
             for t in re.split(r" [+/-] ", prov.tag)]
+
+
+def _dimensioned_duplicates_are_distinct(tags: list[str], components: list) -> bool:
+    """Whether repeated tag names are separate, explicitly named dimensions.
+
+    Adding the UHAL and UHAL.B counts legitimately uses the same XBRL element
+    twice; the two ``ClassOfStock`` members are what make them disjoint.  A
+    repeated bare tag or repeated member remains a double-counting failure.
+    """
+    duplicates = {tag for tag in tags if tags.count(tag) > 1}
+    if not duplicates:
+        return False
+
+    def field(component, name):
+        return (component.get(name, "") if isinstance(component, dict)
+                else getattr(component, name, ""))
+
+    for tag in duplicates:
+        matching = [component for component in components
+                    if field(component, "tag").split(":", 1)[-1] == tag]
+        segments = [field(component, "segments") for component in matching]
+        if (len(matching) != tags.count(tag) or not all(segments)
+                or len(segments) != len(set(segments))):
+            return False
+    return True
 
 
 _NEVER_NEGATIVE = ("total_assets", "current_assets", "goodwill", "intangibles",
@@ -525,30 +611,43 @@ def audit_payload() -> list[str]:
             raw = source.get("tag", "")
             tags = [t.split(":", 1)[1] if ":" in t else t
                     for t in re.split(r" [+/-] ", raw)]
+            components = source.get("components") or []
             # containment is a double count only when the parts are ADDED; a
             # derivation subtracts or divides by the container deliberately
             added = [t.split(":", 1)[1] if ":" in t else t for t in raw.split(" + ")]
-            if len(tags) != len(set(tags)):
+            # A ratio can legitimately reuse one input in its numerator and
+            # denominator: fixed-charge coverage is (EBIT + lease cost) /
+            # (interest + lease cost). Duplicate protection applies to an
+            # additive balance construction, not to both sides of a quotient.
+            if ("/" not in raw and len(tags) != len(set(tags))
+                    and not _dimensioned_duplicates_are_distinct(tags, components)):
                 dupes = sorted({t for t in tags if tags.count(t) > 1})
                 problems.append(f"{ticker}: {name} counts {', '.join(dupes)} twice")
             for parent, child in _CONTAINS:
-                if parent in added and child in added:
+                if (parent in added and child in added
+                        and not _verified_containment_exception(ticker, parent, child)):
                     problems.append(f"{ticker}: {name} adds {child} to {parent}, which contains it")
-            components = source.get("components") or []
             # Share-basis repairs retain the reported share fact plus the EPS
             # and income facts that prove its scale.  The latter two are audit
             # witnesses, not arithmetic leaves named by the resulting figure.
-            witness_components = (
-                "reconciled to EPS and income" in (source.get("concept") or "")
-            )
+            witness_components = "reconciled" in (source.get("concept") or "").lower()
             if components and not witness_components:
-                leaf_tags = sorted(t for c in components
-                                   for t in re.split(r" [+/-] ", c.get("tag", "")))
-                named = sorted(source.get("tag", "").split(" + "))
-                if len(leaf_tags) != len(named):
-                    problems.append(f"{ticker}: {name} names {len(named)} tags but its components "
-                                    f"account for {len(leaf_tags)}")
-        for series_name in ("annual_eps", "annual_net_income", "annual_revenue"):
+                component_tags = {c.get("tag", "") for c in components}
+                unaccounted = sorted(tag for tag in component_tags if tag not in raw)
+                # SEC expression tags have no spaces, so every named token can
+                # also be checked in the other direction. Company-specific
+                # adapters retain exact source-row labels after their namespace;
+                # the substring check above is the lossless check for those.
+                named_xbrl = set(re.findall(
+                    r"(?:us-gaap|dei|ifrs-full):[A-Za-z][A-Za-z0-9]*", raw))
+                missing_sources = sorted(named_xbrl - component_tags)
+                if unaccounted or missing_sources:
+                    problems.append(
+                        f"{ticker}: {name} provenance mismatch; "
+                        f"unaccounted components={unaccounted}, "
+                        f"named tags without sources={missing_sources}")
+        for series_name in ("annual_eps", "annual_net_income", "annual_revenue",
+                            "annual_gross_profit"):
             series = row.get(series_name) or {}
             years = [int(y) for y in series]
             if len(years) != len(set(years)):
@@ -583,17 +682,19 @@ def _audit_constructions(ticker: str, snap) -> list[str]:
             return
         prov = fact.provenance
         tags = _tags_of(prov)
+        components = _leaves(prov)
         # no element counted twice inside one figure
-        if len(tags) != len(set(tags)):
+        if (len(tags) != len(set(tags))
+                and not _dimensioned_duplicates_are_distinct(tags, components)):
             dupes = sorted({t for t in tags if tags.count(t) > 1})
             problems.append(f"{ticker}: {label} counts {', '.join(dupes)} more than once")
         # no element that another component already contains — only across sums,
         # since a derivation subtracts its container on purpose
         added = [t.split(":", 1)[1] if ":" in t else t for t in prov.tag.split(" + ")]
         for parent, child in _CONTAINS:
-            if parent in added and child in added:
+            if (parent in added and child in added
+                    and not _verified_containment_exception(ticker, parent, child)):
                 problems.append(f"{ticker}: {label} adds {child} to {parent}, which contains it")
-        components = _leaves(prov)
         if components:
             # a component may itself be a sum, so compare against the flattened
             # leaves: every element in the tag string must have a filing behind it
@@ -615,7 +716,8 @@ def _audit_constructions(ticker: str, snap) -> list[str]:
 
     # an annual series must hold one fact per year, and a derived year must not
     # sit beside a reported one for the same period
-    for series_name in ("annual_eps", "annual_net_income", "annual_revenue"):
+    for series_name in ("annual_eps", "annual_net_income", "annual_revenue",
+                        "annual_gross_profit"):
         series = getattr(snap, series_name, {}) or {}
         for year, fact in series.items():
             end = fact.provenance.period_end
@@ -639,6 +741,29 @@ def _identity_implied_shares(snap, common_income: dict, year: int) -> Decimal | 
               snap.annual_net_income[year].value
               - snap.annual_preferred_dividends.get(year, Decimal(0)))
     return common / eps_fact.value
+
+
+def _identity_reported_shares(snap, year: int) -> Decimal | None:
+    """The same-year weighted count, never a later outstanding balance.
+
+    SOPAQ issued shares after FY2024: NI/EPS correctly implies about 2.96m
+    weighted shares, while the following September balance is 6.11m. Comparing
+    that duration identity to a later instant turns ordinary issuance into a
+    false split/basis failure.
+    """
+    source = (getattr(snap, "annual_share_counts", {}) or {}).get(year)
+    return source.value if source is not None and source.value > 0 else None
+
+
+def _balance_sheet_period_failure(ticker: str, snap) -> str | None:
+    """Reject an accounting identity assembled from two balance-sheet dates."""
+    assets = snap.total_assets
+    liabilities = snap.total_liabilities
+    if (assets and liabilities
+            and assets.provenance.period_end != liabilities.provenance.period_end):
+        return (f"{ticker}: assets {assets.provenance.period_end} and liabilities "
+                f"{liabilities.provenance.period_end} use different balance sheets")
+    return None
 
 
 def verify(limit: int | None = None) -> dict:
@@ -697,7 +822,9 @@ def verify(limit: int | None = None) -> dict:
 
         # layer (b): identities the filing itself must satisfy
         a, li = snap.total_assets, snap.total_liabilities
-        if a and li:
+        if period_failure := _balance_sheet_period_failure(row["ticker"], snap):
+            identity_failures.append(period_failure)
+        elif a and li:
             # negative equity is real (AAL); the failure mode is A-L disagreeing
             # with the equity the filer actually tagged at the same period end
             end_iso = li.provenance.period_end.isoformat() if li.provenance.period_end else None
@@ -749,17 +876,17 @@ def verify(limit: int | None = None) -> dict:
         # identity without redefining the profit series used by UI margins.
         common_income = _annual_dollar_series(gaap, COMMON_INCOME_TAGS)
         shared_years = sorted(set(snap.annual_eps) & set(snap.annual_net_income))
-        if shared_years and snap.shares_outstanding:
+        if shared_years:
             # Compare one fiscal year's income and EPS, never a newer trailing
             # income window with an older annual-only EPS (GIPR). EPS nets that
             # year's preferred dividends from income; the NI tag does not.
             year = shared_years[-1]
             implied = _identity_implied_shares(snap, common_income, year)
-            actual = snap.shares_outstanding.value
-            if (implied is not None and actual > 0
+            actual = _identity_reported_shares(snap, year)
+            if (implied is not None and actual is not None
                     and not (Decimal("0.5") <= implied / actual <= Decimal("2"))):
                 line = (f"{row['ticker']}: FY{year} NI/EPS implies {implied:,.0f} shares "
-                        f"vs {actual:,.0f} extracted")
+                        f"vs {actual:,.0f} same-year weighted shares")
                 if snap.basis_conflict:
                     # The engine reached the same conclusion from the other side and
                     # withheld criterion 1 for it, so no per-share figure built on

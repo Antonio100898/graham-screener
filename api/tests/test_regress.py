@@ -1,6 +1,6 @@
 """The real-company regression gate must include final UI calculations."""
 
-from screener.regress import _flat, _price_history_for_row
+from screener.regress import _flat, _fx_history_for_row, _price_history_for_row
 
 
 def test_only_current_quote_fields_are_volatile_not_historical_multiples():
@@ -39,3 +39,21 @@ def test_regression_prices_history_only_for_resolved_listings(monkeypatch):
         {"date": "2025-12-31", "close": 10.0}
     ]
     assert calls == [(conn, "0000000002")]
+
+
+def test_regression_reuses_export_fx_history_for_foreign_statements(monkeypatch):
+    calls = []
+
+    def fake_fx_history(conn, base, counter):
+        calls.append((conn, base, counter))
+        return {"closes": [{"date": "2025-12-31", "close": 0.8}]}
+
+    monkeypatch.setattr("screener.regress.store.fx_history", fake_fx_history)
+
+    conn = object()
+    assert _fx_history_for_row(conn, {"reporting_currency": "USD"}) == []
+    assert calls == []
+    assert _fx_history_for_row(conn, {"reporting_currency": "GBP"}) == [
+        {"date": "2025-12-31", "close": 0.8}
+    ]
+    assert calls == [(conn, "USD", "GBP")]

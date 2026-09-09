@@ -44,6 +44,9 @@ function number(value) { return Number(value).toLocaleString(undefined, { maximu
 function money(value) {
   const absolute = Math.abs(value);
   for (const [divisor, suffix] of [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]])
-    if (absolute >= divisor) return `$${(value / divisor).toFixed(Math.abs(value / divisor) < 10 ? 1 : 0)}${suffix}`;
+    if (absolute >= divisor) {
+      const scaled = value / divisor;
+      return `$${scaled.toFixed(suffix === "B" ? 2 : (Math.abs(scaled) < 10 ? 1 : 0))}${suffix}`;
+    }
   return `$${number(value)}`;
 }

@@ -37,6 +37,14 @@ class Provenance:
     # the dimension a fact was reported under, when it has one — "which slice of
     # the company is this" is part of what the number means
     segments: str = ""
+    # Reporting unit and source document are explicit for non-SEC adapters. SEC
+    # Company Facts already identifies units in its outer JSON key and documents
+    # through accession; retaining both here makes the canonical boundary honest.
+    unit: str | None = None
+    document: str | None = None
+    # Rule-selection identity can differ from the exact reported element/row
+    # shown in ``tag`` when an IFRS adapter maps into a canonical concept.
+    canonical_tag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,11 @@ class AnnualOwnerEarnings:
     maintenance≈D&A estimate therefore remain separate; neither is serialized as
     a definitive owner-earnings figure.
     """
+    reported_earnings: Fact
+    depreciation_and_amortisation: Fact
+    total_capital_expenditure: Fact
+    operating_cash_flow: Fact | None
+    other_operating_cash_flow_adjustments: Fact | None
     all_capex_floor: Fact
     maintenance_estimate: Fact
     free_cash_flow: Fact | None
@@ -86,16 +99,56 @@ class AnnualOwnerEarnings:
     expanded_free_cash_flow: Fact | None
     stock_compensation: Fact | None
     cash_acquisitions: Fact | None
+    share_repurchases: Fact | None
     capitalized_intangible_investment: Fact | None
     working_capital_cash_effect: Fact | None
     operating_cash_flow_before_working_capital: Fact | None
-    diluted_shares: Fact
-    all_capex_floor_per_share: Fact
-    maintenance_estimate_per_share: Fact
+    diluted_shares: Fact | None
+    all_capex_floor_per_share: Fact | None
+    maintenance_estimate_per_share: Fact | None
     free_cash_flow_per_share: Fact | None
     free_cash_flow_after_stock_compensation_per_share: Fact | None
     free_cash_flow_after_acquisitions_per_share: Fact | None
     expanded_free_cash_flow_per_share: Fact | None
+
+
+@dataclass(frozen=True)
+class AnnualOperatingReturn:
+    """One fiscal year's filing-backed NOPAT and capital-return evidence.
+
+    These measures are independent of owner earnings: NOPAT needs operating
+    income and tax evidence, not D&A, capital expenditure, or a diluted-share
+    denominator.  Keeping the exact endpoint facts here lets every historical
+    return retain the balance sheets that produced its average denominator.
+    """
+    fiscal_year: int
+    operating_income: Fact | None
+    normalized_tax_rate: Decimal | None
+    tax_expense_inputs: tuple[Fact, ...]
+    pretax_income_inputs: tuple[Fact, ...]
+    nopat: Fact | None
+    invested_capital_beginning: Fact | None
+    invested_capital_ending: Fact | None
+    invested_capital: Decimal | None
+    capital_including_cash_beginning: Fact | None
+    capital_including_cash_ending: Fact | None
+    capital_including_cash: Decimal | None
+    net_tangible_operating_assets_beginning: Fact | None
+    net_tangible_operating_assets_ending: Fact | None
+    average_net_tangible_operating_assets: Decimal | None
+    lease_neutral_net_tangible_operating_assets_beginning: Fact | None
+    lease_neutral_net_tangible_operating_assets_ending: Fact | None
+    average_lease_neutral_net_tangible_operating_assets: Decimal | None
+    nopat_roic: Decimal | None
+    nopat_return_including_cash: Decimal | None
+    ronta: Decimal | None
+    lease_neutral_ronta: Decimal | None
+    # True only for the query-gated detail rebuild. The static dashboard remains
+    # filing-strict; this lets serialization distinguish an explicit all-missing-
+    # inputs-as-zero request from a filed zero.
+    assumption_mode: bool = False
+    assumed_zero: tuple[str, ...] = ()
+    caveats: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +165,7 @@ class OwnerEarnings:
     all_capex_floor: Fact
     maintenance_estimate: Fact
     free_cash_flow: Fact | None
+    cash_taxes_paid: Fact | None
     free_cash_flow_after_stock_compensation: Fact | None
     free_cash_flow_after_acquisitions: Fact | None
     expanded_free_cash_flow: Fact | None
@@ -143,6 +197,20 @@ class OwnerEarnings:
     nopat: Decimal | None
     nopat_roic: Decimal | None
     nopat_return_including_cash: Decimal | None
+    # RONTA uses a narrower denominator than ROIC: tangible operating assets
+    # net of non-interest-bearing operating liabilities. Both exact endpoints
+    # retain the filing inputs behind the average.
+    net_tangible_operating_assets_beginning: Fact | None
+    net_tangible_operating_assets_ending: Fact | None
+    average_net_tangible_operating_assets: Decimal | None
+    ronta: Decimal | None
+    # A presentation-comparability view. Post-ASC-842 operating-lease ROU assets
+    # are removed after the current lease liability has been kept with financing;
+    # pre-recognition years remain on their filed off-balance-sheet presentation.
+    lease_neutral_net_tangible_operating_assets_beginning: Fact | None
+    lease_neutral_net_tangible_operating_assets_ending: Fact | None
+    average_lease_neutral_net_tangible_operating_assets: Decimal | None
+    lease_neutral_ronta: Decimal | None
     # signed contributions in statement order, so the UI can show the derivation
     components: tuple[tuple[str, Decimal], ...]
     free_cash_flow_components: tuple[tuple[str, Decimal], ...]
@@ -212,6 +280,7 @@ class FinancialSnapshot:
     # chapter-13 comparison inputs: sales, operating income, dividend continuity
     annual_revenue: dict[int, Fact] = field(default_factory=dict)
     ttm_revenue: Decimal | None = None
+    annual_gross_profit: dict[int, Fact] = field(default_factory=dict)
     annual_operating_income: dict[int, Fact] = field(default_factory=dict)
     # {"first", "latest", "streak_from", "paid_years"} — calendar years with a
     # positive common dividend; None when the record holds none
@@ -233,9 +302,19 @@ class FinancialSnapshot:
     # profitable years against years that carried effectively no income tax
     # {"window_from", "window_to", "profitable_years", "untaxed_years", "pass_through"}
     tax_record: dict | None = None
+    # Ten fiscal-year slots of operating returns, calculated independently of
+    # owner-earnings/FCF availability and retaining every endpoint fact.
+    annual_operating_returns: dict[int, AnnualOperatingReturn] = field(default_factory=dict)
     # set when the earnings series and the share count cannot be the same security:
     # every per-share figure would be wrong by the factor between them
     basis_conflict: str | None = None
+    # Currency of every monetary statement figure. USD remains the default for
+    # SEC Company Facts; foreign canonical adapters must state this explicitly.
+    reporting_currency: str = "USD"
+    # The filing intentionally has no current/noncurrent balance-sheet split
+    # (banks and similar filers). Keep this structural fact even when one stale
+    # current total is withheld from display for a cross-period mismatch.
+    unclassified_balance_sheet: bool = False
 
 
 @dataclass(frozen=True)

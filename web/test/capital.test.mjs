@@ -12,6 +12,18 @@ test("total capitalisation adds the debt to the market value of the common", () 
   assert.equal(Math.round(totalCapitalisation(KO) / 1e9), 436);
 });
 
+test("foreign-filer capitalisation is measured on the statement-currency basis", () => {
+  const toyota = {
+    price: 200,
+    price_reporting_currency: 30000,
+    reporting_currency: "JPY",
+    quote_currency: "USD",
+    shares: 10,
+    debt: 50000,
+  };
+  assert.equal(totalCapitalisation(toyota), 350000);
+});
+
 test("an unknown debt withholds both figures instead of reading as debt-free", () => {
   const aes = { ...KO, debt: null };          // AES: no bucket the engine will settle
   assert.equal(totalCapitalisation(aes), null);

@@ -35,11 +35,17 @@ dasd
   Use `make derive-all` only for exhaustive cache maintenance.
 - Instant facts more than 400 days older than the balance sheet are missing.
   Fundamentals more than 450 days older than the quote withhold price criteria.
-- Current 20-F/40-F filers enter only when the annual filing carries a USD US-GAAP
-  or standard IFRS balance sheet and its current cover exactly matches the ticker
-  to supported common equity. A depositary security also requires a positive
-  filing-backed underlying-shares-per-receipt ratio; non-USD statements stay
-  unsupported.
+- Current 20-F/40-F filers enter only when the annual filing carries a coherent
+  US-GAAP or standard IFRS balance sheet in one identifiable ISO currency and its
+  current cover exactly matches the ticker to supported common equity. A
+  depositary security also requires a positive filing-backed
+  underlying-shares-per-receipt ratio. For a USD-listed security with non-USD
+  statements, price arithmetic requires an explicit current or fiscal-date FX
+  rate; unavailable FX withholds price ratios instead of guessing.
+- A non-SEC IFRS company can enter only through an explicit company-specific
+  adapter/import. It must retain statement currency, source document and exact
+  source row, declare the configured primary security, and emit the same
+  canonical contract as SEC normalization.
 - Every extracted figure carries provenance: tag, form, accession, and period end.
   New figures must preserve it. Disclose assumptions and weaker tags in the
   payload rather than silently guessing.

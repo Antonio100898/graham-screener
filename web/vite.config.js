@@ -8,6 +8,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/dashboard.json": "http://127.0.0.1:8000",
+      "/company": "http://127.0.0.1:8000",
       "/fundamentals": "http://127.0.0.1:8000",
       "/screen": "http://127.0.0.1:8000",
       "/health": "http://127.0.0.1:8000",

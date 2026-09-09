@@ -36,7 +36,7 @@ from . import normalize
 from .normalize import PendingFilingFactsError, UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
                                    YIELD_IMPLAUSIBLE, evaluate, settled_debt)
-from .sources import cover, dera, indexes
+from .sources import cover, dera, indexes, ifrs_workbook
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError
 from .sources.prices import YahooPriceProvider
 
@@ -44,6 +44,20 @@ BULK_FACTS_URL = "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfac
 BULK_SUBMISSIONS_URL = "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip"
 DAILY_INDEX_URL = "https://www.sec.gov/Archives/edgar/daily-index/{year}/QTR{qtr}/form.{ymd}.idx"
 DASHBOARD_JSON = Path(__file__).parent / "static" / "dashboard.json"
+PRICEABLE_LISTINGS = frozenset({"y", "external"})
+
+
+def _statement_source_namespace(snap) -> str:
+    """Source taxonomy for history, independent of one withheld current total."""
+    statement_anchor = next(
+        (fact for fact in (
+            snap.total_assets, snap.total_liabilities,
+            snap.current_assets, snap.current_liabilities,
+        ) if fact is not None),
+        None,
+    )
+    return (statement_anchor.provenance.tag.partition(":")[0]
+            if statement_anchor is not None else "us-gaap")
 
 
 def _print_progress(message: str, done: int = 0, total: int = 0) -> None:
@@ -54,9 +68,10 @@ def _facts_path(edgar: EdgarClient, cik: str) -> Path:
     return edgar.cache_dir / f"companyfacts_{cik}.json"
 
 
-def _derive_cached_worker(task: tuple[str, str, dict | None, str]):
+def _derive_cached_worker(task: tuple):
     """Read and derive one cached filer in a process with no database handle."""
-    cik, ticker, receipt, cache_dir = task
+    cik, ticker, receipt, cache_dir, *options = task
+    assume_absent_zero = bool(options[0]) if options else False
     cache = Path(cache_dir)
     fp = cache / f"companyfacts_{cik}.json"
     if not fp.exists():
@@ -68,7 +83,8 @@ def _derive_cached_worker(task: tuple[str, str, dict | None, str]):
         dimensioned=dera.load_sidecar(cache, cik),
         receipt=receipt,
     )
-    return cik, _derive_evidence(bundle)
+    return cik, _derive_evidence(
+        bundle, assume_absent_zero=assume_absent_zero)
 
 
 def _source(fact) -> dict | None:
@@ -84,6 +100,12 @@ def _source(fact) -> dict | None:
         src = {"tag": p.tag, "form": p.form, "accn": p.accession,
                "end": p.period_end.isoformat() if p.period_end else None,
                "filed": p.filed.isoformat() if p.filed else None}
+        if p.unit:
+            src["unit"] = p.unit
+        if p.document:
+            src["document"] = p.document
+        if p.canonical_tag and p.document:
+            src["canonical_tag"] = p.canonical_tag
         # A fact read on a share-class axis is not the one that tag holds without a
         # dimension: BCSS files 1,500,000 weighted shares dimension-free and
         # 10,000,000 for the class its ticker names. Provenance that omits the axis
@@ -120,7 +142,7 @@ def _duration_source(fact, unit: str | None = None) -> dict | None:
     if src is not None and fact.provenance.period_start is not None:
         src["start"] = fact.provenance.period_start.isoformat()
     if src is not None and unit is not None:
-        src["unit"] = unit
+        src.setdefault("unit", unit)
     return src
 
 
@@ -164,11 +186,12 @@ def _without_filing(companyfacts: dict, filing: tuple[str, str]) -> dict:
 
 def _derive(cik: str, ticker: str, facts: dict, quote=None,
             dimensioned: dict | None = None,
-            receipt: dict | None = None) -> tuple[str, dict | None]:
+            receipt: dict | None = None, *,
+            assume_absent_zero: bool = False) -> tuple[str, dict | None]:
     """Snapshot + screen result, flattened for the dashboard."""
     pending: dict | None = None
     try:
-        snap = build_snapshot(ticker, cik, facts, assume_absent_zero=False,
+        snap = build_snapshot(ticker, cik, facts, assume_absent_zero=assume_absent_zero,
                               dimensioned=dimensioned, receipt=receipt)
     except PendingFilingFactsError as exc:
         filed, accession = exc.filing
@@ -182,7 +205,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         try:
             snap = build_snapshot(
                 ticker, cik, _without_filing(facts, exc.filing),
-                assume_absent_zero=False, dimensioned=dimensioned, receipt=receipt)
+                assume_absent_zero=assume_absent_zero,
+                dimensioned=dimensioned, receipt=receipt,
+                foreign_identity_filing=exc.filing)
         except UnsupportedFilerError:
             return "pending_facts", {"data_pending": pending}
         except Exception as fallback_exc:
@@ -192,18 +217,39 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
     except Exception as exc:  # a malformed filing must not stop a 4,000-company run
         return "error", {"error": repr(exc)[:200]}
     r = evaluate(snap, quote)
-    source_namespace = (snap.total_assets.provenance.tag.partition(":")[0]
-                        if snap.total_assets is not None else "us-gaap")
-    statement_taxonomy = (
-        normalize._ifrs_as_us_gaap(facts.get("facts", {}).get("ifrs-full", {}))
-        if source_namespace == "ifrs-full"
-        else facts.get("facts", {}).get("us-gaap", {})
-    )
+    # A current cross-period balance mismatch can deliberately withhold total
+    # assets from the UI. Statement history is independent evidence, so infer its
+    # namespace from any surviving core balance fact instead of silently falling
+    # back to US-GAAP (which erased BCS's valid IFRS annual ratios).
+    source_namespace = _statement_source_namespace(snap)
+    if (facts.get("_adapter") or {}).get("statement_basis") == "canonical":
+        statement_taxonomy = normalize._with_fiscal_calendar(
+            facts.get("facts", {}).get("canonical", {}))
+        statement_taxonomy.canonical_adapter = True
+    else:
+        statement_taxonomy = (
+            normalize._ifrs_as_us_gaap(facts.get("facts", {}).get("ifrs-full", {}))
+            if source_namespace == "ifrs-full"
+            else facts.get("facts", {}).get("us-gaap", {})
+        )
+        statement_taxonomy = normalize._with_fiscal_calendar(statement_taxonomy)
+    statement_taxonomy.reporting_currency = snap.reporting_currency
+    statement_taxonomy.currency_adapter = snap.reporting_currency != "USD" or bool(
+        getattr(statement_taxonomy, "canonical_adapter", False))
     historical_ratios = normalize.annual_ratios(
         statement_taxonomy, snap.annual_net_income,
         snap.annual_revenue, snap.annual_operating_income,
         annual_eps=snap.annual_eps,
-        annual_share_counts=snap.annual_share_counts)
+        annual_share_counts=snap.annual_share_counts,
+        annual_gross_profit=snap.annual_gross_profit)
+    operating_return_history = _operating_return_history(snap)
+    for year, values in operating_return_history.items():
+        historical_ratios.setdefault(year, {}).update(values)
+    latest_operating_return = (
+        {key: value for key, value in
+         operating_return_history[max(operating_return_history)].items()
+         if key != "operating_return_evidence"}
+        if operating_return_history else None)
     if receipt and receipt.get("ratio"):
         _restate_historical_ratios(historical_ratios, Decimal(str(receipt["ratio"])))
     settled_debt_value = settled_debt(snap)[0]
@@ -268,22 +314,28 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # can show working capital and capitalization without a second request
         "annual_revenue": {str(y): float(f.value)
                            for y, f in sorted(snap.annual_revenue.items())},
+        "annual_gross_profit": {str(y): float(f.value)
+                                for y, f in sorted(snap.annual_gross_profit.items())},
         "ttm_revenue": float(snap.ttm_revenue) if snap.ttm_revenue is not None else None,
         "annual_operating_income": {str(y): float(f.value)
                                     for y, f in sorted(snap.annual_operating_income.items())},
         "dividend_record": snap.dividend_record,
         "ch13": ch13.eps_stats({y: f.value for y, f in snap.annual_eps.items()}),
         # profitability: never a criterion, the same way ROIC is not
-        "profitability": _profitability(snap),
+        "profitability": _profitability(snap, historical_ratios),
+        "debt_to_equity": _debt_to_equity(snap),
         # the same ratios at each of the last fiscal year ends, each struck on its
         # own year's report. The price multiples are completed at export, where the
         # price history lives; the vintage EPS series is their denominator.
         "annual_ratios": historical_ratios,
+        "operating_returns": latest_operating_return,
         "current_assets": float(snap.current_assets.value) if snap.current_assets else None,
         "current_liabilities": (float(snap.current_liabilities.value)
                                 if snap.current_liabilities else None),
-        "long_term_debt": float(snap.long_term_debt.value) if snap.long_term_debt else None,
-        "total_debt": float(snap.total_debt.value) if snap.total_debt else None,
+        "long_term_debt": (float(snap.long_term_debt.value) if snap.long_term_debt
+                           else 0.0 if "debt" in snap.assumed_zero else None),
+        "total_debt": (float(snap.total_debt.value) if snap.total_debt
+                       else 0.0 if "debt" in snap.assumed_zero else None),
         "operating_lease_liability": (
             float(snap.operating_lease_liability.value)
             if snap.operating_lease_liability else None),
@@ -323,7 +375,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             float(snap.recurring_dividend_per_share.value)
             if snap.recurring_dividend_per_share is not None else None),
         "owner_earnings": _owner_earnings_row(snap),
-        "short_term_debt": float(snap.short_term_debt.value) if snap.short_term_debt else None,
+        "short_term_debt": (float(snap.short_term_debt.value) if snap.short_term_debt
+                            else 0.0 if {"debt", "short_term_debt"}
+                            & snap.assumed_zero else None),
         "goodwill": float(snap.goodwill.value) if snap.goodwill else None,
         "intangibles": float(snap.intangibles.value) if snap.intangibles else None,
         "noncontrolling_interest": (float(snap.noncontrolling_interest.value)
@@ -342,6 +396,8 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             # common, which their statements never print beside the consolidated line
             ("net_income", _source(_newest(snap.annual_net_income))),
             ("revenue", _source(_newest(snap.annual_revenue))),
+            ("gross_profit", _source(_newest(snap.annual_gross_profit))),
+            ("operating_income", _source(_newest(snap.annual_operating_income))),
             ("total_assets", _source(snap.total_assets)),
             ("total_liabilities", _source(snap.total_liabilities)),
             ("current_assets", _source(snap.current_assets)),
@@ -350,7 +406,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("short_term_debt", _source(snap.short_term_debt)),
             ("total_debt", _source(snap.total_debt)),
             ("operating_lease_liability", _source(snap.operating_lease_liability)),
-            ("lease_cost", _duration_source(snap.lease_cost, "USD")),
+            ("lease_cost", _duration_source(snap.lease_cost, snap.reporting_currency)),
             ("fixed_charge_coverage", _source(snap.fixed_charge_coverage)),
             *((name, _source(fact)) for name, fact in asset_sources.items()),
             ("options", _source(snap.options_outstanding)),
@@ -364,7 +420,9 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("weighted_shares", _source(_newest(snap.annual_share_counts))),
             ("dividend", _source(snap.dividend)),
             ("recurring_dividend_per_share",
-             _duration_source(snap.recurring_dividend_per_share, "USD/shares")),
+             _duration_source(
+                 snap.recurring_dividend_per_share,
+                 f"{snap.reporting_currency}/shares")),
             # the newest annual earnings figure: which element stated it, and in
             # which filing — a restatement changes both
             ("eps", _source(snap.annual_eps[max(snap.annual_eps)]) if snap.annual_eps else None),
@@ -375,17 +433,38 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
             ("weighted_shares", _series_mix(snap.annual_share_counts)),
             ("net_income", _series_mix(snap.annual_net_income)),
             ("revenue", _series_mix(snap.annual_revenue)),
+            ("gross_profit", _series_mix(snap.annual_gross_profit)),
         ) if mix is not None} or None,
     }
+    adapter = facts.get("_adapter") or {}
+    if snap.reporting_currency != "USD":
+        row.update(
+            currency=snap.reporting_currency,
+            reporting_currency=snap.reporting_currency,
+            quote_currency=(adapter.get("quote_currency", snap.reporting_currency)
+                            if adapter.get("statement_basis") == "canonical"
+                            else "USD"),
+        )
+    if adapter.get("statement_basis") == "canonical":
+        row.update(
+            currency=snap.reporting_currency,
+            reporting_currency=snap.reporting_currency,
+            quote_currency=adapter.get("quote_currency", snap.reporting_currency),
+            data_source=adapter.get("kind"),
+            security_basis=adapter.get("security_basis"),
+            source_reports=adapter.get("reports"),
+        )
     if pending is not None:
         row["data_pending"] = pending
     return ("pending_facts" if pending is not None else "ok"), row
 
 
-def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None) -> tuple[str, dict | None]:
+def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None, *,
+                     assume_absent_zero: bool = False) -> tuple[str, dict | None]:
     """The sole production entry point from assembled evidence to a snapshot."""
     return _derive(bundle.cik, bundle.ticker, bundle.facts, quote=quote,
-                   dimensioned=bundle.dimensioned, receipt=bundle.receipt)
+                   dimensioned=bundle.dimensioned, receipt=bundle.receipt,
+                   assume_absent_zero=assume_absent_zero)
 
 
 def _restate_historical_ratios(ratios: dict, receipt_ratio: Decimal) -> None:
@@ -409,10 +488,10 @@ _MARGIN_FLOOR = Decimal("1000000")     # revenue below this makes the percentage
 _RETURN_ON_BOOK_LAG = 800              # a year's earnings over a balance sheet this much newer is not a return
 
 
-def _profitability(snap) -> dict | None:
-    """Graham's two profitability ratios: profit against sales, profit against book.
+def _profitability(snap, historical_ratios: dict | None = None) -> dict | None:
+    """Profit against sales, book, and Finkle's net tangible assets.
 
-    Chapter 13 compares four companies on exactly these — the margin says how much
+    Chapter 13 compares four companies on the first two — the margin says how much
     of each dollar of sales the business keeps, and the return on book value says
     what the shareholders' own capital earns. Neither decides anything here: the six
     criteria are cheapness, stability and solvency, and a company earning two cents
@@ -437,19 +516,32 @@ def _profitability(snap) -> dict | None:
     series = {y: round(float(income[y].value / revenue[y].value * 100), 2) for y in years[-10:]}
 
     equity = _common_equity(snap)
+    tangible = _net_tangible_assets(snap)
     year_end = income[latest].provenance.period_end
     stale = (snap.balance_sheet_date is None or year_end is None
              or (snap.balance_sheet_date - year_end).days > _RETURN_ON_BOOK_LAG)
     on_book = (round(float(income[latest].value / equity * 100), 2)
                if equity and equity > 0 and not stale else None)
+    on_net_tangible_assets = (
+        round(float(income[latest].value / tangible * 100), 2)
+        if tangible and tangible > 0 and not stale else None)
+    historical = (historical_ratios or {}).get(latest, {})
+    gross_margin = historical.get("gross_margin")
+    on_equity = historical.get("return_on_equity")
+    average_equity = historical.get("average_common_equity")
     return {
         "fiscal_year": latest,
         "net": round(pct(income, latest), 2),
+        "gross": round(gross_margin, 2) if gross_margin is not None else None,
         "operating": round(pct(operating, latest), 2) if latest in operating else None,
         "on_book": on_book,
+        "on_equity": round(on_equity, 2) if on_equity is not None else None,
+        "on_net_tangible_assets": on_net_tangible_assets,
         "revenue": float(revenue[latest].value),
         "net_income": float(income[latest].value),
         "book_value": float(equity) if equity else None,
+        "average_common_equity": average_equity,
+        "net_tangible_assets": float(tangible) if tangible is not None else None,
         # the direction matters more than the level: Graham's warning is a margin
         # that erodes while the earnings still look adequate
         "by_year": series,
@@ -464,6 +556,31 @@ def _common_equity(snap):
     other = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
                                   snap.temporary_equity) if f)
     return snap.total_assets.value - snap.total_liabilities.value - other
+
+
+def _net_tangible_assets(snap):
+    """Common equity left after goodwill and other intangibles are removed.
+
+    This is the denominator in Todd Finkle's return-on-net-tangible-assets
+    measure and the numerator behind this screener's tangible book per share.
+    Missing intangible evidence stays missing rather than being assumed zero.
+    """
+    equity = _common_equity(snap)
+    if equity is None or snap.goodwill is None or snap.intangibles is None:
+        return None
+    return equity - snap.goodwill.value - snap.intangibles.value
+
+
+def _debt_to_equity(snap) -> float | None:
+    """Reconciled current plus noncurrent debt / common shareholders' equity."""
+    equity = _common_equity(snap)
+    debt = settled_debt(snap)[0]
+    if (debt is None or equity is None or equity <= 0
+            or debt < 0
+            or (snap.total_assets is not None
+                and debt > snap.total_assets.value)):
+        return None
+    return round(float(debt / equity), 4)
 
 
 def _ttm_basis(snap) -> str:
@@ -543,6 +660,266 @@ def _asset_quality(snap, gaap: dict) -> tuple[dict, dict]:
     return {key: value for key, value in values.items() if value is not None}, sources
 
 
+def _fcf_reconciliation(snap, oe) -> dict:
+    """Finkle's three FCF equations, independently assembled where evidence permits.
+
+    Methods two and three are algebraic rearrangements. Method one comes from the
+    cash-flow statement, so agreement with it is the useful cross-statement check.
+    A mismatch is disclosed; no value is adjusted to make the equations agree.
+    """
+    year = oe.fiscal_year
+    target = oe.all_capex_floor.provenance
+
+    def aligned(fact):
+        return (fact if fact is not None
+                and fact.provenance.period_start == target.period_start
+                and fact.provenance.period_end == target.period_end else None)
+
+    cash_flow = aligned(oe.free_cash_flow)
+    revenue = aligned(snap.annual_revenue.get(year))
+    operating_income = aligned(snap.annual_operating_income.get(year))
+    cash_taxes = aligned(oe.cash_taxes_paid)
+    beginning, ending = oe.invested_capital_beginning, oe.invested_capital_ending
+    net_investment = (ending.value - beginning.value
+                      if beginning is not None and ending is not None else None)
+
+    methods = {
+        "cash_flow_statement": {
+            "label": "CFO − capital expenditure",
+            "formula": "Cash flow from operating activities − capital expenditures",
+            "value": float(cash_flow.value) if cash_flow is not None else None,
+            "components": ([[label, float(value)]
+                            for label, value in oe.free_cash_flow_components]
+                           if cash_flow is not None else []),
+        },
+        "nopat_less_investment": {
+            "label": "Operating profit after cash taxes − net operating-capital investment",
+            "formula": "Operating income − cash taxes paid − net investment in operating capital",
+            "value": None,
+            "components": [],
+        },
+        "revenue_less_costs_and_investment": {
+            "label": "Revenue − operating costs/taxes − operating-capital investment",
+            "formula": "Revenue − operating costs − cash taxes paid − net investment in operating capital",
+            "value": None,
+            "components": [],
+        },
+    }
+    if operating_income is not None and cash_taxes is not None and net_investment is not None:
+        value = operating_income.value - cash_taxes.value - net_investment
+        methods["nopat_less_investment"].update(
+            value=float(value),
+            components=[
+                ["operating income", float(operating_income.value)],
+                ["- cash taxes paid", float(-cash_taxes.value)],
+                ["- net investment in operating capital", float(-net_investment)],
+            ],
+        )
+    if (revenue is not None and operating_income is not None
+            and cash_taxes is not None and net_investment is not None):
+        operating_costs = revenue.value - operating_income.value
+        value = revenue.value - operating_costs - cash_taxes.value - net_investment
+        methods["revenue_less_costs_and_investment"].update(
+            value=float(value),
+            components=[
+                ["revenue", float(revenue.value)],
+                ["- operating costs", float(-operating_costs)],
+                ["- cash taxes paid", float(-cash_taxes.value)],
+                ["- net investment in operating capital", float(-net_investment)],
+            ],
+        )
+
+    values = [method["value"] for method in methods.values() if method["value"] is not None]
+    complete = len(values) == 3
+    spread = max(values) - min(values) if complete else None
+    scale = max((abs(value) for value in values), default=0.0)
+    tolerance = max(scale * 0.01, 1.0) if complete else None
+    status = ("MATCH" if complete and spread <= tolerance
+              else "MISMATCH" if complete else "INCOMPLETE")
+    missing = []
+    if cash_flow is None:
+        missing.append("same-period operating cash flow and cash capital expenditure")
+    if revenue is None:
+        missing.append("same-period revenue")
+    if operating_income is None:
+        missing.append("same-period operating income")
+    if cash_taxes is None:
+        missing.append("same-period cash taxes paid")
+    if net_investment is None:
+        missing.append("exact beginning and ending operating capital")
+    return {
+        "fiscal_year": year,
+        "status": status,
+        "methods": methods,
+        "spread": spread,
+        "tolerance": tolerance,
+        "net_investment_in_operating_capital": (
+            float(net_investment) if net_investment is not None else None),
+        "missing": missing,
+    }
+
+
+def _operating_return_history(snap) -> dict[int, dict]:
+    """Serialize the independent ten-year NOPAT/ROIC/RONTA record.
+
+    Dollar inputs and endpoint denominators remain beside the percentages so
+    audits can recompute every result. Compact source objects retain the filing,
+    accession, period, and any leaf components behind a reconciled subtotal.
+    """
+    pass_through = bool((snap.tax_record or {}).get("pass_through"))
+
+    def number(value, *, percent: bool = False):
+        if value is None:
+            return None
+        result = float(value * 100 if percent else value)
+        return round(result, 4) if percent else result
+
+    def source_point(provenance) -> list:
+        # [tag, form, accession, period start, period end]. Arrays keep ten years
+        # of repeated provenance practical in the one-shot dashboard payload.
+        return [
+            provenance.tag,
+            provenance.form,
+            provenance.accession,
+            (provenance.period_start.isoformat()
+             if provenance.period_start else None),
+            provenance.period_end.isoformat() if provenance.period_end else None,
+        ]
+
+    def source_leaves(provenance) -> list:
+        if not provenance.components:
+            return [source_point(provenance)]
+        out = []
+        for child in provenance.components:
+            out.extend(source_leaves(child))
+        return out
+
+    def fact_source(fact) -> list | None:
+        if fact is None:
+            return None
+        return source_leaves(fact.provenance)
+
+    def capital_point(fact) -> dict | None:
+        if fact is None:
+            return None
+        return {
+            "value": float(fact.value),
+            "end": (fact.provenance.period_end.isoformat()
+                    if fact.provenance.period_end else None),
+            "formula": fact.provenance.tag,
+            "sources": source_leaves(fact.provenance),
+        }
+
+    out: dict[int, dict] = {}
+    for year, item in sorted(snap.annual_operating_returns.items()):
+        caveats = list(item.caveats)
+        if pass_through:
+            caveats.append(
+                "the filing record indicates pass-through or persistently untaxed "
+                "profits; the strict screen withholds corporate NOPAT, while the "
+                "explicit detail assumption mode displays the zero-tax calculation"
+                if item.assumption_mode else
+                "the filing record indicates pass-through or persistently untaxed "
+                "profits, so a corporate NOPAT tax normalization is not applicable")
+        numeric_allowed = not pass_through or item.assumption_mode
+        nopat_value = item.nopat.value if item.nopat is not None else None
+
+        def undefined_return(value, denominator, label):
+            if not item.assumption_mode or value is not None or nopat_value is None:
+                return None
+            if denominator is not None and denominator <= 0:
+                return (f"{label} is not mathematically measurable: NOPAT is "
+                        f"{nopat_value} but the assumed/reported denominator is "
+                        f"{denominator}, not greater than 0")
+            if denominator is None:
+                return (f"{label} is not mathematically measurable after all absent "
+                        "inputs were replaced by 0 because the resulting denominator "
+                        "is still invalid; see the calculation warnings")
+            return None
+
+        sources = {key: value for key, value in {
+            "operating_income": fact_source(item.operating_income),
+            "tax_expense": [fact_source(fact)
+                            for fact in item.tax_expense_inputs],
+            "pretax_income": [fact_source(fact)
+                               for fact in item.pretax_income_inputs],
+            "invested_capital_beginning": capital_point(
+                item.invested_capital_beginning),
+            "invested_capital_ending": capital_point(
+                item.invested_capital_ending),
+            "capital_including_cash_beginning": capital_point(
+                item.capital_including_cash_beginning),
+            "capital_including_cash_ending": capital_point(
+                item.capital_including_cash_ending),
+            "net_tangible_operating_assets_beginning": capital_point(
+                item.net_tangible_operating_assets_beginning),
+            "net_tangible_operating_assets_ending": capital_point(
+                item.net_tangible_operating_assets_ending),
+            "lease_neutral_net_tangible_operating_assets_beginning": capital_point(
+                item.lease_neutral_net_tangible_operating_assets_beginning),
+            "lease_neutral_net_tangible_operating_assets_ending": capital_point(
+                item.lease_neutral_net_tangible_operating_assets_ending),
+            "nopat_formula": (item.nopat.provenance.tag
+                              if item.nopat is not None else None),
+        }.items() if value not in (None, [], ())}
+        cell = {
+            "operating_income_for_nopat": (
+                float(item.operating_income.value)
+                if item.operating_income is not None else None),
+            "normalized_tax_rate": (
+                number(item.normalized_tax_rate, percent=True)
+                if numeric_allowed else None),
+            "nopat": (number(item.nopat.value)
+                      if numeric_allowed and item.nopat is not None else None),
+            "invested_capital": number(item.invested_capital),
+            "capital_including_cash": number(item.capital_including_cash),
+            "average_net_tangible_operating_assets": number(
+                item.average_net_tangible_operating_assets),
+            "average_lease_neutral_net_tangible_operating_assets": number(
+                item.average_lease_neutral_net_tangible_operating_assets),
+            "nopat_roic": (number(item.nopat_roic)
+                           if numeric_allowed else None),
+            "nopat_return_including_cash": (
+                number(item.nopat_return_including_cash)
+                if numeric_allowed else None),
+            "ronta": (number(item.ronta) if numeric_allowed else None),
+            "lease_neutral_ronta": (
+                number(item.lease_neutral_ronta) if numeric_allowed else None),
+            "nopat_roic_undefined": undefined_return(
+                item.nopat_roic, item.invested_capital, "NOPAT ROIC"),
+            "nopat_return_including_cash_undefined": undefined_return(
+                item.nopat_return_including_cash, item.capital_including_cash,
+                "NOPAT return including cash"),
+            "ronta_undefined": undefined_return(
+                item.ronta, item.average_net_tangible_operating_assets, "RONTA"),
+            "lease_neutral_ronta_undefined": undefined_return(
+                item.lease_neutral_ronta,
+                item.average_lease_neutral_net_tangible_operating_assets,
+                "Lease-neutral RONTA"),
+            "operating_return_assumptions": list(item.assumed_zero),
+            "operating_return_caveats": list(dict.fromkeys(caveats)),
+            "operating_return_evidence": sources,
+        }
+        out[year] = {
+            key: value for key, value in cell.items()
+            if value not in (None, [], ())
+        }
+    return out
+
+
+def _strip_detail_only_evidence(row: dict) -> None:
+    """Keep the one-shot universe payload small; detail rebuilds retain evidence.
+
+    The browser automatically requests the per-company evidence row when a panel
+    opens. Repeating six endpoint provenance trees across every company and year
+    in ``dashboard.json`` roughly doubles an already large universe download.
+    Values, assumptions, and exact missing reasons remain in the static payload.
+    """
+    for cell in (row.get("annual_ratios") or {}).values():
+        if isinstance(cell, dict):
+            cell.pop("operating_return_evidence", None)
+
+
 def _owner_earnings_row(snap) -> dict | None:
     """Serialize owner-earnings evidence without inventing maintenance capex.
 
@@ -555,7 +932,7 @@ def _owner_earnings_row(snap) -> dict | None:
         return None
 
     def source_row(provenance) -> dict:
-        return {
+        source = {
             "tag": provenance.tag,
             "form": provenance.form,
             "accn": provenance.accession,
@@ -563,6 +940,11 @@ def _owner_earnings_row(snap) -> dict | None:
                     if provenance.period_end else None),
             "filed": provenance.filed.isoformat() if provenance.filed else None,
         }
+        if provenance.unit:
+            source["unit"] = provenance.unit
+        if provenance.document:
+            source["document"] = provenance.document
+        return source
 
     def fact_value(fact) -> float | None:
         return float(fact.value) if fact is not None else None
@@ -598,17 +980,39 @@ def _owner_earnings_row(snap) -> dict | None:
         ("cash_acquisitions", oe.cash_acquisitions),
         ("capitalized_intangible_investment", oe.capitalized_intangible_investment),
         ("working_capital_cash_effect", oe.working_capital_cash_effect),
+        ("cash_taxes_paid", oe.cash_taxes_paid),
+        ("revenue", snap.annual_revenue.get(oe.fiscal_year)),
+        ("operating_income", snap.annual_operating_income.get(oe.fiscal_year)),
     ):
         if fact is not None:
-            owner_sources[name] = source_row(fact.provenance)
+            # A reported fact has one filing location. The NIKE operating-income
+            # fallback is a reconciled subtotal, so retain every filed component
+            # instead of reducing its provenance to the newest component alone.
+            owner_sources[name] = (_source(fact) if name == "operating_income"
+                                   else source_row(fact.provenance))
 
     def annual_cell(year: int) -> dict:
         item = oe.annual[year]
-        shares = item.diluted_shares.value
+        shares = (item.diluted_shares.value
+                  if item.diluted_shares is not None else None)
 
         def per_share(fact) -> float | None:
             return (float(fact.value / shares)
-                    if fact is not None and shares > 0 else None)
+                    if fact is not None and shares is not None and shares > 0 else None)
+
+        def bridge_point(fact, *, absolute: bool = False) -> list | None:
+            if fact is None:
+                return None
+            value = abs(fact.value) if absolute else fact.value
+            source = source_row(fact.provenance)
+            # This structure occurs hundreds of thousands of times in the UI
+            # payload. Keep the required provenance without repeating JSON keys:
+            # [value, tag, form, accession, period end].
+            point = [float(value), source.get("tag"), source.get("form"),
+                     source.get("accn"), source.get("end")]
+            if source.get("unit") or source.get("document"):
+                point.extend([source.get("unit"), source.get("document")])
+            return point
 
         cell = {
             # Compatibility names are retained while the clearer display names
@@ -623,13 +1027,13 @@ def _owner_earnings_row(snap) -> dict | None:
             "free_cash_flow_after_acquisitions": fact_value(
                 item.free_cash_flow_after_acquisitions),
             "expanded_free_cash_flow": fact_value(item.expanded_free_cash_flow),
-            "all_capex_floor_per_share": float(item.all_capex_floor_per_share.value),
-            "maintenance_estimate_per_share": float(
-                item.maintenance_estimate_per_share.value),
-            "earnings_after_total_capex_per_share": float(
-                item.all_capex_floor_per_share.value),
-            "reported_earnings_assumption_per_share": float(
-                item.maintenance_estimate_per_share.value),
+            "all_capex_floor_per_share": fact_value(item.all_capex_floor_per_share),
+            "maintenance_estimate_per_share": fact_value(
+                item.maintenance_estimate_per_share),
+            "earnings_after_total_capex_per_share": fact_value(
+                item.all_capex_floor_per_share),
+            "reported_earnings_assumption_per_share": fact_value(
+                item.maintenance_estimate_per_share),
             "free_cash_flow_per_share": fact_value(item.free_cash_flow_per_share),
             "free_cash_flow_after_stock_compensation_per_share": fact_value(
                 item.free_cash_flow_after_stock_compensation_per_share),
@@ -645,9 +1049,31 @@ def _owner_earnings_row(snap) -> dict | None:
                 item.working_capital_cash_effect),
             "operating_cash_flow_before_working_capital_per_share": per_share(
                 item.operating_cash_flow_before_working_capital),
-            "diluted_shares": float(shares),
-            "end": (item.maintenance_estimate_per_share.provenance.period_end.isoformat()
-                    if item.maintenance_estimate_per_share.provenance.period_end
+            # Direct filing facts and audited derivations for the transposed
+            # ten-year cash bridge. Each direct figure owns compact provenance;
+            # the two derived values reconcile from the direct rows beside them.
+            "cash_flow_bridge": {key: value for key, value in {
+                "net_income": bridge_point(item.reported_earnings),
+                "depreciation_and_amortisation": bridge_point(
+                    item.depreciation_and_amortisation),
+                "stock_compensation": bridge_point(
+                    item.stock_compensation, absolute=True),
+                "working_capital_cash_effect": bridge_point(
+                    item.working_capital_cash_effect),
+                "operating_cash_flow": bridge_point(item.operating_cash_flow),
+                "total_capital_expenditure": bridge_point(
+                    item.total_capital_expenditure, absolute=True),
+                # Both are derived from direct rows already carrying provenance.
+                "other_operating_cash_flow_adjustments": fact_value(
+                    item.other_operating_cash_flow_adjustments),
+                "free_cash_flow": fact_value(item.free_cash_flow),
+                # A financing use shown after FCF; it does not change FCF.
+                "share_repurchases": bridge_point(
+                    item.share_repurchases, absolute=True),
+            }.items() if value is not None},
+            "diluted_shares": float(shares) if shares is not None else None,
+            "end": (item.maintenance_estimate.provenance.period_end.isoformat()
+                    if item.maintenance_estimate.provenance.period_end
                     else None),
         }
         # Preserve the original three per-share keys even when FCF is unavailable;
@@ -676,6 +1102,7 @@ def _owner_earnings_row(snap) -> dict | None:
         "all_capex_floor": float(oe.all_capex_floor.value),
         "maintenance_estimate": float(oe.maintenance_estimate.value),
         "free_cash_flow": fact_value(oe.free_cash_flow),
+        "fcf_reconciliation": _fcf_reconciliation(snap, oe),
         "free_cash_flow_after_stock_compensation": fact_value(
             oe.free_cash_flow_after_stock_compensation),
         "free_cash_flow_after_acquisitions": fact_value(
@@ -741,6 +1168,36 @@ def _owner_earnings_row(snap) -> dict | None:
             float(oe.nopat_return_including_cash)
             if oe.nopat_return_including_cash is not None
             and not (snap.tax_record or {}).get("pass_through") else None),
+        "average_net_tangible_operating_assets": (
+            float(oe.average_net_tangible_operating_assets)
+            if oe.average_net_tangible_operating_assets is not None else None),
+        "net_tangible_operating_assets_basis": (
+            "AVERAGE_BEGINNING_END_ASSETS_LESS_GOODWILL_INTANGIBLES_CASH_"
+            "SHORT_AND_NONCURRENT_INVESTMENTS_AND_NIB_CURRENT_LIABILITIES_"
+            "WITH_REPORTED_CURRENT_OPERATING_LEASE_LIABILITY_AS_FINANCING"),
+        "net_tangible_operating_assets_evidence": {
+            "beginning": capital_point(oe.net_tangible_operating_assets_beginning),
+            "ending": capital_point(oe.net_tangible_operating_assets_ending),
+        },
+        "ronta": (float(oe.ronta) if oe.ronta is not None
+                  and not (snap.tax_record or {}).get("pass_through") else None),
+        "average_lease_neutral_net_tangible_operating_assets": (
+            float(oe.average_lease_neutral_net_tangible_operating_assets)
+            if oe.average_lease_neutral_net_tangible_operating_assets is not None
+            else None),
+        "lease_neutral_net_tangible_operating_assets_basis": (
+            "RONTA_NTOA_LESS_REPORTED_OPERATING_LEASE_ROU_ASSETS;_"
+            "PRE_RECOGNITION_YEARS_UNCHANGED;_OFF_BALANCE_LEASES_NOT_REBUILT"),
+        "lease_neutral_net_tangible_operating_assets_evidence": {
+            "beginning": capital_point(
+                oe.lease_neutral_net_tangible_operating_assets_beginning),
+            "ending": capital_point(
+                oe.lease_neutral_net_tangible_operating_assets_ending),
+        },
+        "lease_neutral_ronta": (
+            float(oe.lease_neutral_ronta)
+            if oe.lease_neutral_ronta is not None
+            and not (snap.tax_record or {}).get("pass_through") else None),
         "components": [[label, float(v)] for label, v in oe.components],
         "free_cash_flow_components": [
             [label, float(value)] for label, value in oe.free_cash_flow_components],
@@ -786,14 +1243,10 @@ def _bvps(snap) -> float | None:
 
 
 def _tbvps(snap) -> float | None:
-    need = (snap.total_assets, snap.total_liabilities, snap.goodwill,
-            snap.intangibles, snap.shares_outstanding)
-    if any(f is None for f in need) or snap.shares_outstanding.value <= 0:
+    tangible = _net_tangible_assets(snap)
+    if (tangible is None or snap.shares_outstanding is None
+            or snap.shares_outstanding.value <= 0):
         return None
-    optional = sum(f.value for f in (snap.preferred_stock, snap.noncontrolling_interest,
-                                     snap.temporary_equity) if f)
-    tangible = (snap.total_assets.value - snap.total_liabilities.value
-                - snap.goodwill.value - snap.intangibles.value - optional)
     return float(tangible / snap.shares_outstanding.value)
 
 
@@ -801,10 +1254,42 @@ def _index_tickers(conn, edgar: EdgarClient) -> dict[str, tuple[str, str]]:
     """CIK -> (ticker, name) from SEC's mapping; refreshed with the ticker file."""
     store.migrate(conn)
     mapping = edgar._cached("company_tickers", "https://www.sec.gov/files/company_tickers.json")
-    out = {}
+    candidates: dict[str, list[tuple[str, str]]] = {}
     for row in mapping.values():
         cik = f"{int(row['cik_str']):010d}"
-        out.setdefault(cik, (row["ticker"], row["title"]))
+        candidates.setdefault(cik, []).append((row["ticker"], row["title"]))
+    covers = store.covers_by_cik(conn)
+    existing = {
+        row["cik"]: row["ticker"]
+        for row in conn.execute("SELECT cik, ticker FROM company WHERE ticker IS NOT NULL")
+    }
+    out = {}
+    for cik, choices in candidates.items():
+        # SEC lists every live symbol for a CIK and commonly puts a SPAC unit
+        # before its common share. The screener prices common equity, so an exact
+        # current cover match outranks JSON order. LPAAU is a unit containing a
+        # warrant; LPAA is the Class A ordinary share whose earnings/book we own.
+        cover_by_symbol = {
+            security["symbol"]: security for security in covers.get(cik, ())
+        }
+        supported = {
+            symbol
+            for symbol, security in cover_by_symbol.items()
+            if cover.is_common_equity_security(security.get("title") or "")
+            and not cover.is_untraded_underlying(security.get("title") or "")
+        }
+        current = existing.get(cik)
+        # Preserve an established live SEC symbol. A partial or historically
+        # malformed cover must not move UNM to a listed debt symbol, or a saved
+        # common row to a warrant/preferred ticker. Cover rank resolves only a
+        # newly encountered multi-symbol CIK; explicit security cleanup remains a
+        # separate audited operation.
+        keep_current = current in {choice[0] for choice in choices}
+        out[cik] = (
+            next(choice for choice in choices if choice[0] == current)
+            if keep_current else
+            next((choice for choice in choices if choice[0] in supported), choices[0])
+        )
     for cik, (ticker, name) in out.items():
         store.upsert_company(conn, cik, ticker, name)
     # ...and take the symbol back from whoever used to hold it
@@ -942,6 +1427,7 @@ def _dera_tags() -> tuple[frozenset[str], frozenset[str]]:
         + tuple(normalize._WEIGHTED_SHARE_TAGS)
         + normalize.NET_INCOME_TAGS + normalize.REVENUE_TAGS
         + normalize.OPERATING_INCOME_TAGS + normalize.PRETAX_TAGS
+        + normalize.DA_EXTENSION_TAGS
         + tuple(tag for tag, _ in normalize.DIVIDEND_TAGS)
         + tuple(normalize.IFRS_SOURCE_TAGS)
         + ("Assets", "Liabilities", "AssetsCurrent", "LiabilitiesCurrent",
@@ -1086,16 +1572,36 @@ def events(conn, progress=_print_progress) -> None:
 
 
 def _current_supported_annual(facts: dict) -> tuple[str, str] | None:
-    """Newest foreign annual filing when it carries supported USD statements.
+    """Newest foreign annual accession whose cover should settle its security.
 
-    Old facts from another reporting basis can remain after a transition, so the
-    accession must match the newest 20-F/40-F represented anywhere in Company Facts.
+    Cover identity is useful even while numeric Company Facts lag the filing, so
+    the newest represented 20-F/40-F is returned before its statement basis is
+    complete. Normalization independently refuses an incoherent statement.
     """
     namespaces = (facts.get("facts") or {})
-    newest, statement_basis = normalize._current_supported_foreign_annual(namespaces)
-    if newest is None or statement_basis is None or not newest[1]:
+    newest, _ = normalize._current_supported_foreign_annual(namespaces)
+    if newest is None or not newest[1]:
         return None
     return newest[1], newest[0]
+
+
+def _cover_accession(row: dict) -> str | None:
+    """Newest annual cover the security-identity cache must represent.
+
+    A usable fallback snapshot can carry an older statement while SEC Company
+    Facts is still ingesting a new 20-F. Its pending accession nevertheless owns
+    today's listed class and ADS ratio, so source provenance from the old
+    statement must not make the cover scanner stop one filing early (TM 2026).
+    """
+    pending = row.get("data_pending") or {}
+    if pending.get("accession"):
+        return pending["accession"]
+    filings = [
+        (source.get("filed"), source.get("accn"))
+        for source in (row.get("sources") or {}).values()
+        if source.get("accn")
+    ]
+    return max(filings)[1] if filings else None
 
 
 def _submissions_identity(d: dict) -> tuple[str | None, str | None, str | None, str | None]:
@@ -1133,22 +1639,21 @@ def cover_pages(conn, progress=_print_progress, *, foreign_only: bool = False,
     # the NEWEST filing, not the one that happened to supply the earnings: a filer
     # whose per-share element is dimension-only has an EPS accession years old, and
     # Hershey's was a 2015 cover that predates cover-page tagging entirely
-    def newest(row):
-        filings = [(s.get("filed"), s.get("accn"))
-                   for s in (row.get("sources") or {}).values() if s.get("accn")]
-        return max(filings)[1] if filings else None
-
     todo = [] if foreign_only else [
-        (r["cik"], r["ticker"], newest(r), False) for r in store.dashboard_rows(conn)
+        (r["cik"], r["ticker"], _cover_accession(r), False)
+        for r in store.dashboard_rows(conn)
+        if ciks is None or r["cik"] in ciks
     ]
 
     # Foreign-form rows are not on the dashboard yet, so they cannot be reached
     # through dashboard_rows(). Read the cached facts just far enough to select
-    # current USD US-GAAP/IFRS 20-F/40-F filers.
+    # current coherent US-GAAP/IFRS 20-F/40-F filers.
     foreign_rows = conn.execute(
         """SELECT c.cik, c.ticker, c.name
            FROM snapshot s JOIN company c USING (cik)
-           WHERE s.status = 'foreign' AND c.listed = 'y' AND c.ticker IS NOT NULL
+             LEFT JOIN pending_filing p USING (cik)
+           WHERE (s.status IN ('foreign', 'pending_facts') OR p.cik IS NOT NULL)
+             AND c.listed = 'y' AND c.ticker IS NOT NULL
              AND NOT (c.ticker GLOB '*-P' OR c.ticker GLOB '*-P[A-Z]')
            ORDER BY c.cik"""
     ).fetchall()
@@ -1176,16 +1681,28 @@ def cover_pages(conn, progress=_print_progress, *, foreign_only: bool = False,
         for cik, securities in store.covers_by_cik(conn).items()
         for security in securities
     }
+    todo = list({
+        (cik, ticker, accn): (cik, ticker, accn, foreign)
+        for cik, ticker, accn, foreign in todo if accn
+    }.values())
     todo = [(cik, ticker, accn, foreign) for cik, ticker, accn, foreign in todo
-            if accn and (cik, ticker, accn) not in covered]
+            if (cik, ticker, accn) not in covered]
     progress(f"reading cover pages for {len(todo)} companies", 0, len(todo))
 
     def read(item):
         cik, ticker, accn, foreign = item
         identity = (None, None, None, None)
+        primary_document = None
         if foreign:
             try:
-                identity = _submissions_identity(edgar.submissions(cik))
+                submissions = edgar.submissions(cik)
+                identity = _submissions_identity(submissions)
+                recent = (submissions.get("filings") or {}).get("recent") or {}
+                accessions = recent.get("accessionNumber") or []
+                if accn in accessions:
+                    primary = recent.get("primaryDocument") or []
+                    position = accessions.index(accn)
+                    primary_document = primary[position] if position < len(primary) else None
             except Exception:
                 pass
         for n in cover.COVER_REPORTS:
@@ -1197,6 +1714,25 @@ def cover_pages(conn, progress=_print_progress, *, foreign_only: bool = False,
             if found:
                 for security in found:
                     security["ratio"] = cover.depositary_ratio(security["title"])
+                unresolved = [security for security in found
+                              if cover.is_depositary_security(security["title"])
+                              and not security.get("ratio")]
+                if foreign and primary_document and len(unresolved) == 1:
+                    # Toyota puts the 10:1 ratio in a starred cover footnote, not
+                    # inside dei:Security12bTitle. It is still filing-cover
+                    # evidence; read the primary cover only when the rendered
+                    # title proves exactly which one depositary class needs it.
+                    try:
+                        primary_url = (
+                            "https://www.sec.gov/Archives/edgar/data/"
+                            f"{int(cik)}/{accn.replace('-', '')}/{primary_document}"
+                        )
+                        filing_ratio = cover.depositary_ratio(
+                            cover.text_of(edgar._get_text(primary_url)))
+                    except Exception:
+                        filing_ratio = None
+                    if filing_ratio is not None:
+                        unresolved[0]["ratio"] = filing_ratio
                 return cik, accn, found, identity
         return cik, accn, [], identity
 
@@ -1287,6 +1823,46 @@ def daily(conn, days: int = 7, progress=_print_progress) -> None:
         derive(conn, progress)
 
 
+def import_ifrs_workbooks(
+    conn, directory: str | Path, *, ticker: str = ifrs_workbook.DEFAULT_TICKER,
+    entity_id: str = ifrs_workbook.DEFAULT_ENTITY_ID, progress=_print_progress,
+) -> tuple[str, dict | None]:
+    """Import and derive the explicitly configured adidas primary listing."""
+    edgar = EdgarClient()
+    destination = _facts_path(edgar, entity_id)
+    progress(f"mapping adidas IFRS workbooks from {Path(directory).resolve()}")
+    facts = ifrs_workbook.write_adidas_companyfacts(
+        directory, destination, entity_id=entity_id, ticker=ticker)
+    facts["_adapter"]["security_basis"] = "PRIMARY_ORDINARY_SHARE"
+    # Persist the security declaration added above, atomically, beside the
+    # canonical facts. It is configuration provenance, not a workbook-derived
+    # financial figure.
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(json.dumps(facts, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(destination)
+    latest = max(report["published"] for report in facts["_adapter"]["reports"])
+    store.upsert_company(
+        conn, entity_id, ticker, facts.get("entityName"),
+        last_filing=latest, facts_synced=True)
+    store.set_metadata(
+        conn, entity_id, sic=None, industry="Footwear and sporting goods",
+        exchange="XETRA", filer_size=None, ticker=ticker,
+        name=facts.get("entityName"))
+    conn.execute(
+        "UPDATE company SET listed = 'external', incorporation = ? WHERE cik = ?",
+        ("DE|Germany", entity_id),
+    )
+    result = _derive_evidence(evidence.EvidenceBundle(
+        cik=entity_id, ticker=ticker, facts=facts,
+        dimensioned=None, receipt=None))
+    store.put_snapshot(conn, entity_id, *result)
+    conn.commit()
+    progress(
+        f"imported {len(facts['_adapter']['reports'])} reports and derived {ticker} "
+        f"as {result[0]}"
+    )
+    return result
+
 def derive(conn, progress=_print_progress, *, all_snapshots: bool = False,
            workers: int = 4) -> None:
     """Recompute snapshots after an engine change from cached raw facts.
@@ -1353,20 +1929,26 @@ def apply_price(row: dict, price: float | None) -> dict:
     # the symbol for another issuer; neither may be joined to this CIK's filings.
     # Rows without a `listed` key are direct/unit-test callers and retain the
     # historical API contract.  Exported rows always carry the key.
-    if "listed" in row and row.get("listed") != "y":
+    if "listed" in row and row.get("listed") not in PRICEABLE_LISTINGS:
         price = None
         for field in ("price", "price_asof", "price_session", "market_state",
                       "market_timezone", "market_state_asof", "price_source"):
             row.pop(field, None)
     crit = {c["n"]: c for c in row["criteria"]}
+    valuation_price = _valuation_price(row, price)
+    if (_quote_currency(row) != _reporting_currency(row)
+            and valuation_price is not None):
+        row["price_reporting_currency"] = float(valuation_price)
+    else:
+        row.pop("price_reporting_currency", None)
     asset_quality = row.get("asset_quality") or {}
     asset_quality.pop("market_cap_to_net_cash", None)
-    if (price is not None and price > 0 and row.get("shares") is not None
+    if (valuation_price is not None and row.get("shares") is not None
             and asset_quality.get("net_cash") is not None
             and asset_quality["net_cash"] > 0):
         asset_quality["market_cap_to_net_cash"] = (
-            price * row["shares"] / asset_quality["net_cash"])
-    if price is not None and price > 0 and not row.get("basis_conflict"):
+            float(valuation_price) * row["shares"] / asset_quality["net_cash"])
+    if valuation_price is not None and not row.get("basis_conflict"):
         eps, tbvps = row.get("ttm_eps"), row.get("tbvps")
         # Snapshots are intentionally price-free.  Once export has supplied a
         # live price, do not retain a stale "price quote" token in an otherwise
@@ -1405,13 +1987,13 @@ def apply_price(row: dict, price: float | None) -> dict:
                 crit[1].update(status="FAIL", value=None,
                                note="TTM EPS non-positive; P/E undefined")
             else:
-                price_d, eps_d = Decimal(str(price)), Decimal(str(eps))
-                pe = round(price / eps, 2)  # display only
+                price_d, eps_d = valuation_price, Decimal(str(eps))
+                pe = round(float(price_d) / eps, 2)  # display only
                 crit[1].update(status="PASS" if price_d < PE_MAX * eps_d else "FAIL",
                                value=pe, note=None)
         dps = row.get("recurring_dividend_per_share")
         if dps is not None and crit[5]["status"] == "PASS":
-            pct = round(dps / price * 100, 2)
+            pct = round(dps / float(valuation_price) * 100, 2)
             # The engine refuses to publish a yield above par — it means the price
             # and the payment describe different securities — and this pass used to
             # publish it anyway, up to 2,240,506%.
@@ -1421,13 +2003,18 @@ def apply_price(row: dict, price: float | None) -> dict:
                 # keeps the aggregate-tag and unknown-payer disclosures it wrote.
                 source = ((row.get("sources") or {}).get("recurring_dividend_per_share") or {})
                 quarter = source.get("end")
-                paid = (f"${dps:,.2f} per share annualized from the latest ordinary "
+                currency = _reporting_currency(row)
+                amount = (f"${dps:,.2f}" if currency == "USD"
+                          else f"{dps:,.2f} {currency}")
+                paid = (f"{amount} per share annualized from the latest ordinary "
                         "quarterly rate"
                         + (f" reported for the quarter ended {quarter}" if quarter else "")
                         + "; special dividends excluded")
                 trailing = row.get("dividend_per_share")
                 if trailing is not None and trailing != dps:
-                    paid += (f"; trailing cash was ${trailing:,.2f} per share "
+                    trailing_amount = (f"${trailing:,.2f}" if currency == "USD"
+                                       else f"{trailing:,.2f} {currency}")
+                    paid += (f"; trailing cash was {trailing_amount} per share "
                              "including any specials")
                 crit[5]["note"] = f"{crit[5]['note']}; {paid}" if crit[5].get("note") else paid
             else:
@@ -1445,10 +2032,19 @@ def apply_price(row: dict, price: float | None) -> dict:
             if tbvps <= 0:
                 crit[7].update(status="FAIL", value=None, note="non-positive tangible book value")
             else:
-                price_d, tbvps_d = Decimal(str(price)), Decimal(str(tbvps))
-                ptbv = round(price / tbvps, 2)  # display only
+                price_d, tbvps_d = valuation_price, Decimal(str(tbvps))
+                ptbv = round(float(price_d) / tbvps, 2)  # display only
                 crit[7].update(status="PASS" if price_d < PRICE_TO_TBV_MAX * tbvps_d else "FAIL",
                                value=ptbv, note=None)
+    elif price is not None and _quote_currency(row) != _reporting_currency(row):
+        missing_fx = (f"{_quote_currency(row)} to {_reporting_currency(row)} "
+                      "exchange rate")
+        for number in (1, 7):
+            note = crit[number].get("note")
+            if isinstance(note, str) and note.startswith("missing: "):
+                items = [item.strip() for item in note.removeprefix("missing: ").split(",")]
+                items = [missing_fx if item == "price quote" else item for item in items]
+                crit[number]["note"] = "missing: " + ", ".join(dict.fromkeys(items))
     statuses = {c["status"] for c in row["criteria"]}
     row["n_pass"] = sum(1 for c in row["criteria"] if c["status"] == "PASS")
     # a measured failure outranks an unknown: see _verdict in screens/enterprising
@@ -1604,7 +2200,7 @@ def _equity_awards(snap) -> dict:
     return {"equity_awards": float(total), "awards_basis": basis}
 
 
-def _price_the_ratio_history(row: dict, closes) -> None:
+def _price_the_ratio_history(row: dict, closes, fx_closes=()) -> None:
     """Turn each past year's book figures into the multiples the panel shows.
 
     The price of that year comes from the stored weekly closes, and the earnings
@@ -1625,6 +2221,11 @@ def _price_the_ratio_history(row: dict, closes) -> None:
         return
     vintage = row.get("ttm_eps_vintage") or {}
     by_date = sorted((d.isoformat() if hasattr(d, "isoformat") else str(d), c) for d, c in closes)
+    cross_currency = _quote_currency(row) != _reporting_currency(row)
+    fx_by_date = sorted(
+        (day.isoformat() if hasattr(day, "isoformat") else str(day), rate)
+        for day, rate in fx_closes
+    )
     for year, values in ratios.items():
         # the fiscal year end this row's figures were struck at; only a December
         # filer's is the December the label suggests
@@ -1632,7 +2233,18 @@ def _price_the_ratio_history(row: dict, closes) -> None:
         prior = [c for d, c in by_date if d <= cutoff]
         if not prior:
             continue
-        price = float(prior[-1])
+        quote_price = float(prior[-1])
+        price = quote_price
+        if cross_currency:
+            prior_fx = [rate for day, rate in fx_by_date if day <= cutoff]
+            if not prior_fx:
+                continue
+            rate = float(prior_fx[-1])
+            if not rate > 0:
+                continue
+            price = quote_price * rate
+            values["quote_price"] = round(quote_price, 4)
+            values["fx_rate"] = round(rate, 8)
         values["price"] = round(price, 4)
         eps = vintage.get(cutoff)
         if eps and eps > 0:
@@ -1767,10 +2379,58 @@ def _set_quote(row: dict, quote) -> None:
     })
 
 
+def _reporting_currency(row: dict) -> str:
+    return (row.get("reporting_currency") or row.get("currency") or "USD").upper()
+
+
+def _quote_currency(row: dict) -> str:
+    return (row.get("quote_currency") or row.get("currency") or "USD").upper()
+
+
+def _set_fx(row: dict, record: dict | None) -> None:
+    """Attach an explicit USD-to-reporting-currency rate to one payload row."""
+    reporting = _reporting_currency(row)
+    if reporting == "USD" or record is None:
+        return
+    row["fx"] = {
+        "base": record["base"],
+        "counter": record["counter"],
+        "rate": float(record["rate"]),
+        "asof": record["asof"],
+        "source": record["source"],
+    }
+
+
+def _valuation_price(row: dict, price) -> Decimal | None:
+    """Raw traded price restated into the monetary statement unit."""
+    try:
+        value = Decimal(str(price))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    quote_currency = _quote_currency(row)
+    reporting_currency = _reporting_currency(row)
+    if quote_currency == reporting_currency:
+        return value
+    fx = row.get("fx") or {}
+    try:
+        rate = Decimal(str(fx.get("rate")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if (fx.get("base") != quote_currency or fx.get("counter") != reporting_currency
+            or not rate.is_finite() or rate <= 0):
+        return None
+    return value * rate
+
+
 def _retain_previous_quote(row: dict, previous: dict | None) -> bool:
     if previous is None or previous.get("price") is None:
         return False
     for field in _QUOTE_FIELDS:
+        if field in previous:
+            row[field] = previous[field]
+    for field in ("fx", "price_reporting_currency", "fx_warning"):
         if field in previous:
             row[field] = previous[field]
     return True
@@ -1795,7 +2455,8 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
     quote_failed = 0
     if with_prices:
         prices = YahooPriceProvider()
-        priceable = [r for r in rows if r.get("ticker") and r.get("listed") == "y"]
+        priceable = [r for r in rows
+                     if r.get("ticker") and r.get("listed") in PRICEABLE_LISTINGS]
         label = "quotes" if quote_only else "prices and history"
         progress(f"fetching {label} for {len(priceable)} verified tickers", 0,
                  len(priceable))
@@ -1805,7 +2466,15 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
         try:
             with ThreadPoolExecutor(max_workers=12) as pool:
                 fetch = prices.quote if quote_only else prices.history
-                futures = {pool.submit(fetch, r["ticker"]): r for r in priceable}
+
+                def fetch_row(row):
+                    currency = _quote_currency(row)
+                    # Preserve compatibility with simple one-argument providers
+                    # used in tests and local substitutions for ordinary USD rows.
+                    return (fetch(row["ticker"]) if currency == "USD"
+                            else fetch(row["ticker"], expected_currency=currency))
+
+                futures = {pool.submit(fetch_row, r): r for r in priceable}
                 for fut in as_completed(futures):
                     row = futures[fut]
                     try:
@@ -1835,6 +2504,48 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
                     done += 1
                     if done % 25 == 0 or done == len(futures):
                         progress(f"fetching {label}", done, len(futures))
+
+                reporting_currencies = sorted({
+                    _reporting_currency(row) for row in priceable
+                    if _reporting_currency(row) != "USD"
+                })
+                fx_futures = {
+                    pool.submit(prices.exchange_rate_history, "USD", currency): currency
+                    for currency in reporting_currencies
+                }
+                fx_records = {}
+                for future in as_completed(fx_futures):
+                    currency = fx_futures[future]
+                    try:
+                        history = future.result()
+                    except Exception:
+                        history = None
+                    if history is not None:
+                        store.set_fx_history(conn, "USD", currency, history)
+                        fx_records[currency] = {
+                            "base": "USD", "counter": currency,
+                            "rate": float(history.quote.price),
+                            "asof": history.quote.asof.isoformat(),
+                            "source": history.quote.source,
+                            "closes": list(history.closes),
+                        }
+                    else:
+                        cached = store.fx_history(conn, "USD", currency)
+                        if cached is not None:
+                            fx_records[currency] = cached
+                for row in rows:
+                    reporting = _reporting_currency(row)
+                    if reporting == "USD":
+                        continue
+                    record = fx_records.get(reporting)
+                    _set_fx(row, record)
+                    if record is None:
+                        row["fx_warning"] = {
+                            "kind": "FX_UNAVAILABLE",
+                            "note": (f"No USD to {reporting} exchange rate was available; "
+                                     "accounting ratios remain usable, but price-based "
+                                     "valuation is withheld"),
+                        }
         finally:
             prices.close()
         # the series is written once per company, so a later `derive` can rebuild
@@ -1862,7 +2573,7 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
                 if prior.get("price_history_warning"):
                     row["price_history_warning"] = prior["price_history_warning"]
             apply_price(row, row.get("price"))
-            closes_by_cik[row["cik"]] = [] if row.get("listed") != "y" else (
+            closes_by_cik[row["cik"]] = [] if row.get("listed") not in PRICEABLE_LISTINGS else (
                 closes or store.price_history(conn, row["cik"])
             )
             row["price_stats"] = _price_stats_row(row, closes_by_cik[row["cik"]])
@@ -1870,7 +2581,7 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
     else:
         closes_by_cik = {
             r["cik"]: (store.price_history(conn, r["cik"])
-                       if r.get("listed") == "y" else [])
+                       if r.get("listed") in PRICEABLE_LISTINGS else [])
             for r in rows
         }
         for row in rows:
@@ -1887,9 +2598,15 @@ def export(conn, with_prices: bool = True, progress=_print_progress,
     for row in rows:
         row.update(profiles.enrich(row))
     for row in rows:
-        _price_the_ratio_history(row, closes_by_cik.get(row["cik"]) or [])
+        reporting = _reporting_currency(row)
+        fx_record = (store.fx_history(conn, "USD", reporting)
+                     if reporting != "USD" else None)
+        _price_the_ratio_history(
+            row, closes_by_cik.get(row["cik"]) or [],
+            (fx_record or {}).get("closes") or [])
     for row in rows:  # engine-internal series with no reader in the payload
         row.pop("ttm_eps_vintage", None)
+        _strip_detail_only_evidence(row)
         # the event scan is read by the notes above; the raw item codes would be
         # a second, unrendered copy of what those notes already say
         row.pop("filing_events", None)
@@ -1923,13 +2640,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
                                         "derive", "export", "quotes", "listing-age", "events",
-                                        "cover", "dera", "status"])
+                                        "cover", "dera", "ifrs-import", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
     ap.add_argument("--all-snapshots", action="store_true",
                     help="with derive, include cached filers that cannot enter the dashboard")
     ap.add_argument("--from", dest="start", help="first quarter for dera, e.g. 2021q1")
+    ap.add_argument("--path", help="directory containing IFRS statement workbooks")
+    ap.add_argument("--ticker", default=ifrs_workbook.DEFAULT_TICKER)
+    ap.add_argument("--entity-id", default=ifrs_workbook.DEFAULT_ENTITY_ID)
     args = ap.parse_args(argv)
     conn = store.connect()
     if args.command == "bootstrap":
@@ -1950,6 +2670,11 @@ def main(argv=None) -> int:
         cover_pages(conn)
     elif args.command == "dera":
         dera_sync(conn, args.start)
+    elif args.command == "ifrs-import":
+        if not args.path:
+            ap.error("ifrs-import requires --path")
+        import_ifrs_workbooks(
+            conn, args.path, ticker=args.ticker, entity_id=args.entity_id)
     elif args.command == "export":
         export(conn, not args.no_prices)
     elif args.command == "quotes":

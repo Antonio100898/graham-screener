@@ -85,6 +85,19 @@ def test_bank_without_classified_balance_sheet():
     assert r.verdict == Verdict.INDETERMINATE  # N/A never permits overall PASS
 
 
+def test_bank_classification_survives_a_withheld_asset_total():
+    r = evaluate(
+        snap(current_assets=None, current_liabilities=None,
+             total_assets=None, total_liabilities=F("Liabilities", 400),
+             unclassified_balance_sheet=True,
+             long_term_debt=None, short_term_debt=None),
+        QUOTE,
+    )
+    c = crit(r)
+    assert c[2].status == Status.NOT_APPLICABLE
+    assert c[3].status == Status.NOT_APPLICABLE
+
+
 def test_missing_goodwill_is_insufficient_never_pass():
     r = evaluate(snap(goodwill=None), QUOTE)
     c = crit(r)

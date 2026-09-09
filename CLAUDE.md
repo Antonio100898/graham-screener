@@ -37,12 +37,16 @@ web/   React SPA (Vite, no runtime deps beyond React). One fetch of dashboard.js
 - **Stale facts are missing facts.** Instant facts >400 days older than the
   balance sheet are dropped; fundamentals >450 days older than the quote withhold
   the price criteria.
-- **Foreign forms require a common basis.** A current 20-F/40-F filer enters only
-  when that annual filing carries a USD US-GAAP or standard IFRS balance sheet and
-  its current cover exactly matches the ticker to supported common equity.
-  Depositary securities additionally require a positive filing-backed
-  underlying-shares-per-receipt ratio. Non-USD statements remain unsupported,
-  never converted or guessed.
+- **Foreign forms require a coherent basis.** A current 20-F/40-F filer enters
+  only when that annual filing carries a US-GAAP or standard IFRS balance sheet
+  in one identifiable ISO currency and its current cover exactly matches the
+  ticker to supported common equity. Depositary securities additionally require
+  a positive filing-backed underlying-shares-per-receipt ratio. A USD quote is
+  converted into the statement currency with an explicit current or fiscal-date
+  FX rate; missing FX withholds price arithmetic rather than guessing.
+- **External IFRS imports are explicit adapters.** A company-specific non-SEC
+  import must retain reporting currency, source document and exact source row,
+  declare the configured primary security, and emit the same canonical contract.
 
 ## Proving a change
 

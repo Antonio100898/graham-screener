@@ -38,7 +38,7 @@ _WORDS = {
 }
 _NUMBER_WORD = "|".join(sorted((re.escape(word) for word in _WORDS), key=len, reverse=True))
 _RATIO = re.compile(
-    r"(?:each\s+(?:\w+\s+){0,2}?|(?:one|an?)\s+(?:american\s+)?depositary\s+share\s+)"
+    r"(?:each\s+(?:\w+\s+){0,3}?|(?:one|an?)\s+(?:american\s+)?depositary\s+share\s+)"
     r"repr\w*\s+(?:the\s+right\s+to\s+\w+\s+)?"
     rf"(?:(?P<num>[\d,.]+)|(?P<word>{_NUMBER_WORD}))\s+"
     r"(?:(?:ordinary|common)\s+shares?|(?:class|series)\s+\w+\s+"
@@ -64,12 +64,56 @@ def text_of(document: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", document)))
 
 
+def _table_securities(document: str) -> list[dict]:
+    """Pair title and symbol values without flattening their table boundaries.
+
+    SEC rendered covers do not use one stable row order.  Many put title before
+    symbol, Toyota puts symbol before title, and OACC puts exchange between them.
+    Flattening the whole report lets a title consume facts from the following
+    share-class block.  At the cell level the label/value relationship is
+    unambiguous, including covers that put several classes in parallel columns.
+    """
+    out: list[dict] = []
+    for table in re.findall(r"<table\b[^>]*>(.*?)</table\s*>", document,
+                            flags=re.I | re.S):
+        titles: list[str] | None = None
+        symbols: list[str] | None = None
+        for row in re.findall(r"<tr\b[^>]*>(.*?)</tr\s*>", table,
+                              flags=re.I | re.S):
+            cells = [text_of(cell).strip(" |\xa0") for cell in re.findall(
+                r"<t[dh]\b[^>]*>(.*?)</t[dh]\s*>", row, flags=re.I | re.S
+            )]
+            if len(cells) < 2:
+                continue
+            label = cells[0]
+            values = [value for value in cells[1:] if value]
+            if re.search(r"(?:Title of (?:12\(b\) Security|each class)|Security12bTitle)",
+                         label, re.I):
+                titles = values
+            elif re.search(r"Trading Symbol\(?s?\)?", label, re.I):
+                symbols = values
+            if titles is not None and symbols is not None:
+                if len(titles) == len(symbols):
+                    out.extend(
+                        {"title": title, "symbol": symbol}
+                        for title, symbol in zip(titles, symbols)
+                        if title and symbol
+                    )
+                titles = None
+                symbols = None
+    return unique_securities(out)
+
+
 def securities(document: str) -> list[dict]:
     """Every registered class the cover names, with the symbol attached to it.
 
     The rendered cover repeats one block per class, so title and symbol pair by
     position: the symbol that follows a title belongs to that title.
     """
+    table_rows = _table_securities(document)
+    if table_rows:
+        return table_rows
+
     flat = text_of(document)
     out: list[dict] = []
     # Filers label the same two elements either way: "Title of 12(b) Security"
@@ -85,9 +129,32 @@ def securities(document: str) -> list[dict]:
         r"Trading Symbol\(?s?\)?\s*(.+?)\s*"
         r"(?:Security Exchange Name|Name of each exchange)", re.I,
     )
-    matches = list(block.finditer(flat)) or list(re.finditer(
+    matches = list(block.finditer(flat))
+    if not matches:
+        # Some rendered 20-F covers expose the dimension member before the line
+        # items and put TradingSymbol before Security12bTitle. Toyota's R1 is:
+        # "American Depositary Shares [Member] ... Trading Symbol TM Title of
+        # 12(b) Security American Depositary Shares Security Exchange Name NYSE".
+        # Reading only the title-first layout misread the later boolean
+        # "Trading Symbol Flag" as a ticker.
+        symbol_first = re.compile(
+            r"Trading Symbol\(?s?\)?\s+(?!Flag\b)([A-Z0-9.\-]{1,12})\s+"
+            r"(?:Title of (?:12\(b\) Security|each class)|Security12bTitle)\s*"
+            r"(.+?)\s+(?:Security Exchange Name|Name of each exchange)", re.I,
+        )
+        reversed_matches = list(symbol_first.finditer(flat))
+        if reversed_matches:
+            out = [
+                {"title": match.group(2).strip(" |"),
+                 "symbol": match.group(1).strip(" |")}
+                for match in reversed_matches
+                if 0 < len(match.group(2).strip(" |")) < 400
+            ]
+            if out:
+                return unique_securities(out)
+    matches = matches or list(re.finditer(
         r"(?:Title of (?:12\(b\) Security|each class)|Security12bTitle)\s*(.+?)\s*"
-        r"Trading Symbol\(?s?\)?\s*([A-Z0-9.\-]{1,12})", flat
+        r"Trading Symbol\(?s?\)?\s*(?!Flag\b)([A-Z0-9.\-]{1,12})", flat
     ))
     for match in matches:
         title = match.group(1).strip(" |")

@@ -6,9 +6,9 @@ how it was produced:
 
   SOURCED   the value is really in the filing its own provenance names. The row
             says `total_assets` came from tag `Assets` in accession X for period
-            ending Y; this opens the raw Company Facts JSON, finds that exact fact,
-            and compares the number. Catches a value that drifted away from the
-            evidence recorded beside it.
+            ending Y; this opens raw Company Facts (or the SEC DERA sidecar for an
+            exact dimensioned fact), finds that exact fact, and compares the
+            number. Catches a value that drifted away from its recorded evidence.
 
   DERIVED   the figures computed from those facts are the arithmetic they claim.
             The current ratio is current assets over current liabilities and
@@ -23,6 +23,7 @@ UNCHECKED rather than silently counted as passing.
     python -m screener.audit                    # a spread of 20 companies
     python -m screener.audit --ticker KO,MSFT
     python -m screener.audit --sample 200 --quiet
+    python -m screener.audit --all --quiet
 """
 from __future__ import annotations
 
@@ -63,7 +64,25 @@ TOLERANCE = 0.005          # a rounded display figure, not a different number
 
 def _facts(cik: str, cache: Path) -> dict:
     path = cache / f"companyfacts_{cik}.json"
-    return json.loads(path.read_text()) if path.exists() else {}
+    facts = json.loads(path.read_text()) if path.exists() else {"facts": {}}
+    # Company Facts omits dimensioned observations. The independent SEC DERA
+    # sidecar retains them, so an exact share-class source can still be checked
+    # against accession, period, unit and dimension instead of being waived.
+    sidecar = cache / f"dimensioned_{cik}.json"
+    if not sidecar.exists():
+        return facts
+    try:
+        dimensioned = json.loads(sidecar.read_text())
+    except ValueError:
+        return facts
+    for namespace, tags in (dimensioned.get("facts") or {}).items():
+        for tag, data in tags.items():
+            for unit, entries in (data.get("units") or {}).items():
+                target = (facts.setdefault("facts", {}).setdefault(namespace, {})
+                          .setdefault(tag, {"units": {}}).setdefault("units", {})
+                          .setdefault(unit, []))
+                target.extend(entries)
+    return facts
 
 
 def _payload_field(row: dict, path: str):
@@ -144,6 +163,11 @@ def _values_in_filing(facts: dict, ns: str, tag: str, source: dict) -> list[floa
     those the check asks whether the figure is one of the numbers in the filing.
     New duration sources that carry a start are matched to that exact context.
     """
+    # A canonical adapter displays its exact workbook row as the provenance tag.
+    # The normalized concept is retained separately so the audit can locate the
+    # cached value without pretending that row was a US-GAAP element.
+    if source.get("canonical_tag"):
+        ns, tag = "canonical", source["canonical_tag"]
     out = []
     available_units = (facts.get("facts", {}).get(ns, {}).get(tag) or {}).get("units", {})
     selected_units = ({source["unit"]: available_units.get(source["unit"], [])}
@@ -153,7 +177,14 @@ def _values_in_filing(facts: dict, ns: str, tag: str, source: dict) -> list[floa
             if (e.get("accn") == source.get("accn")
                     and e.get("end") == source.get("end")
                     and (source.get("start") is None
-                         or e.get("start") == source.get("start"))):
+                         or e.get("start") == source.get("start"))
+                    and (e.get("segments") or "")
+                    == (source.get("segments") or "")
+                    and (not source.get("document")
+                         or e.get("_source_document") == source.get("document"))
+                    and (not source.get("canonical_tag")
+                         or e.get("_source_tag")
+                         == (source.get("tag") or "").partition(":")[2])):
                 out.append(float(e["val"]))
     return out
 
@@ -167,6 +198,8 @@ def _source_values(facts: dict, source: dict) -> list[float]:
     engine selected instead of silently taking whichever unit appears first.
     """
     tag_text = source.get("tag") or ""
+    if source.get("canonical_tag"):
+        return _values_in_filing(facts, "canonical", source["canonical_tag"], source)
     parts = source.get("components") or ()
     operator = " + " if " + " in tag_text else " - " if " - " in tag_text else None
     operands = list(parts)
@@ -218,7 +251,21 @@ def _identities(row: dict) -> list[tuple]:
             out.append((name, shown, expected, formula))
 
     ca, cl = row.get("current_assets"), row.get("current_liabilities")
-    shares, price = row.get("shares"), row.get("price")
+    shares, quote_price = row.get("shares"), row.get("price")
+    reporting_currency = (row.get("reporting_currency") or row.get("currency")
+                          or "USD").upper()
+    quote_currency = (row.get("quote_currency") or row.get("currency")
+                      or "USD").upper()
+    if quote_currency != reporting_currency:
+        price = row.get("price_reporting_currency")
+        fx = row.get("fx") or {}
+        if (quote_price is not None and fx.get("base") == quote_currency
+                and fx.get("counter") == reporting_currency and fx.get("rate")):
+            check("price_reporting_currency", price,
+                  quote_price * fx["rate"],
+                  f"{quote_currency} quote x {quote_currency}/{reporting_currency} rate")
+    else:
+        price = quote_price
     assets, liabilities = row.get("total_assets"), row.get("total_liabilities")
     # the same three deductions `_common_equity` makes — what is left is the
     # common's, and omitting the preferred overstates it by exactly that claim
@@ -259,6 +306,28 @@ def _identities(row: dict) -> list[tuple]:
         year = shared[0]
         check("net_margin", (row.get("profitability") or {}).get("net"),
               income[year] / revenue[year] * 100, f"FY{year} net income / FY{year} revenue x 100")
+    profitability = row.get("profitability") or {}
+    goodwill, intangibles = row.get("goodwill"), row.get("intangibles")
+    if equity is not None and goodwill is not None and intangibles is not None:
+        tangible = equity - goodwill - intangibles
+        check("profitability.net_tangible_assets", profitability.get("net_tangible_assets"),
+              tangible, "common equity - goodwill - intangibles")
+        profit_year = str(profitability.get("fiscal_year"))
+        if tangible > 0 and income.get(profit_year) is not None:
+            check("return_on_net_tangible_assets",
+                  profitability.get("on_net_tangible_assets"),
+                  income[profit_year] / tangible * 100,
+                  f"FY{profit_year} net income / current net tangible assets x 100")
+    average_equity = profitability.get("average_common_equity")
+    profit_year = str(profitability.get("fiscal_year"))
+    if average_equity is not None and average_equity > 0 and income.get(profit_year) is not None:
+        check("return_on_equity", profitability.get("on_equity"),
+              income[profit_year] / average_equity * 100,
+              f"FY{profit_year} net income / average common equity x 100")
+    combined_debt = row.get("debt")
+    if equity is not None and equity > 0 and combined_debt is not None:
+        check("debt_to_equity", row.get("debt_to_equity"), combined_debt / equity,
+              "combined interest-bearing debt / common equity")
     if row.get("options") is not None and row.get("rsus") is None and shares:
         check("equity_awards", row.get("equity_awards"), row["options"],
               "options alone, no restricted stock on file")
@@ -323,6 +392,7 @@ PRINTED_INCOME = (
                  "total revenues and other income", "net operating revenues",
                  "revenues and other income", "net revenues", "net sales",
                  "revenues", "sales")),
+    ("gross_profit", ("gross profit", "gross profit (loss)", "gross margin")),
     # the parent's share first: Apollo prints consolidated net income of $5,401M
     # and $3,492M attributable to itself, and `NetIncomeLoss` is the second
     # The parent company by name first, then the after-preferred line, then the
@@ -420,19 +490,139 @@ def _by_element(tagged: dict, provenance_tag: str | None, columns: list) -> list
         key = part.strip().replace(":", "_")
         values = tagged.get(key)
         if values:
-            out += [(key, values[col]) for col in columns if col < len(values)]
+            out += [(key, values[col]) for col in columns
+                    if col < len(values) and values[col] is not None]
     return out
 
 
-def _read_statement(row: dict, edgar, kind: str):
+def _element_row_is_incomplete(tagged: dict, provenance_tag: str | None,
+                               statement_width: int) -> bool:
+    """Whether the renderer linked a concept to fewer cells than the statement.
+
+    EXDW's FY2025 balance sheet visibly prints both current and comparative
+    intangibles, but the SEC-rendered element link covers only the comparative
+    cell. Indexing that one value as column zero reverses the year.
+    """
+    if not provenance_tag or not tagged or statement_width <= 1:
+        return False
+    for part in re.split(r" [-+] ", provenance_tag):
+        values = tagged.get(part.strip().replace(":", "_"))
+        if (values and
+                (len(values) < statement_width
+                 or sum(value is not None for value in values) < statement_width)):
+            return True
+    return False
+
+
+def _reconciled_operating_income(tagged: dict, source: dict,
+                                 column: int) -> list[tuple[str, float]]:
+    """Independently rebuild a derived operating-income statement subtotal.
+
+    The extractor accepts gross profit less operating expenses only when the
+    filed nonoperating lines bridge that subtotal exactly to pretax income. The
+    payload records those component tags; verify both equations from the rendered
+    statement rather than looking for an operating-income line that does not
+    exist.
+    """
+    if "derived and reconciled" not in (source.get("concept") or "").lower():
+        return []
+
+    by_name: dict[str, list[float]] = {}
+    for component in source.get("components") or []:
+        tag = component.get("tag") or ""
+        local = tag.rsplit(":", 1)[-1]
+        by_name.setdefault(local, []).extend(
+            float(value) for _, value in _by_element(tagged, tag, [column])
+        )
+
+    gross = by_name.get("GrossProfit") or []
+    expenses = [
+        *by_name.get("OperatingExpenses", []),
+        *by_name.get("SellingGeneralAndAdministrativeExpense", []),
+    ]
+    pretax = [
+        value for name, values in by_name.items()
+        if "BeforeIncomeTax" in name
+        for value in values
+    ]
+    aggregate = by_name.get("NonoperatingIncomeExpense") or []
+    interest = by_name.get("InterestIncomeExpenseNonoperatingNet") or []
+    other = by_name.get("OtherNonoperatingIncomeExpense") or []
+    separate_interest_income = [
+        *by_name.get("InvestmentIncomeInterest", []),
+        *by_name.get("InterestIncomeNonoperating", []),
+    ]
+    separate_interest_expense = [
+        *by_name.get("InterestExpenseNonoperating", []),
+        *by_name.get("InterestExpense", []),
+    ]
+    research = [
+        *by_name.get("ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost", []),
+    ]
+    restructuring = by_name.get("RestructuringCharges") or []
+
+    def close(left: float, right: float) -> bool:
+        return abs(left - right) <= FILING_TOLERANCE * max(
+            abs(left), abs(right), 1e-9)
+
+    out = []
+    if "pretax less complete nonoperating lines" in (
+            source.get("concept") or "").lower():
+        selling = by_name.get("SellingGeneralAndAdministrativeExpense") or []
+        for pretax_value in pretax:
+            for income_value in separate_interest_income:
+                for expense_value in separate_interest_expense:
+                    for other_value in other:
+                        # Rendered income statements present the three rows on an
+                        # expense basis: income is parenthesized/negative and an
+                        # expense is positive. Adding those printed values back to
+                        # pretax therefore removes the complete nonoperating bridge.
+                        operating = (pretax_value + income_value + expense_value
+                                     + other_value)
+                        for gross_value in gross:
+                            for selling_value in selling:
+                                for research_value in research:
+                                    restructuring_values = restructuring or [0.0]
+                                    for restructuring_value in restructuring_values:
+                                        known_costs = (selling_value + research_value
+                                                       + restructuring_value)
+                                        residual = gross_value - operating - known_costs
+                                        if (gross_value > 0 and residual >= 0
+                                                and residual <= gross_value * 0.05):
+                                            out.append((
+                                                "tagged pretax less complete "
+                                                "nonoperating lines", operating))
+        return out
+
+    for gross_value in gross:
+        for expense_value in expenses:
+            operating = gross_value - expense_value
+            # SEC's rendered statement applies the presentation/calculation sign:
+            # NIKE's Company Facts value for interest income is +50m while the
+            # published expense row displays (50m), parsed here as -50m. Preserve
+            # the filed magnitude and allow either statement orientation for each
+            # bridge component.
+            bridges = ([signed * value for value in aggregate for signed in (1, -1)]
+                       if aggregate else
+                       [a_sign * a + b_sign * b
+                        for a in interest for b in other
+                        for a_sign in (1, -1) for b_sign in (1, -1)])
+            if any(close(operating + bridge, pretax_value)
+                   for bridge in bridges for pretax_value in pretax):
+                out.append(("tagged gross profit less operating expenses", operating))
+    return out
+
+
+def _read_statement(row: dict, edgar, kind: str, source_override: dict | None = None):
     """The published statement's rows and the column the panel's date belongs to.
 
     Not every filer prints the newest period first, and one emerging from Chapter 11
     prints successor and predecessor periods side by side, so the column is chosen
     by its own heading rather than by position.
     """
-    source = (row.get("sources") or {}).get("total_assets" if kind == "balance_sheet"
-                                            else "eps") or {}
+    source = source_override or (
+        (row.get("sources") or {}).get(
+            "total_assets" if kind == "balance_sheet" else "eps") or {})
     accn, end = source.get("accn"), source.get("end")
     if not accn:
         return (None, {}), None, None, "no provenance for the statement"
@@ -481,6 +671,8 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     mis-tagged fact passes them all. This one reads the document a person opens and
     asks whether the number on the page is the number on the panel.
     """
+    sources = row.get("sources") or {}
+    anchor_source = sources.get("total_assets") or {}
     try:
         (printed, tagged), wanted_columns, headings, why = _read_statement(
             row, edgar, "balance_sheet")
@@ -492,7 +684,10 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     out = []
     facts = facts or {}
     ratio = _ratio(row)
-    sources = row.get("sources") or {}
+    reports = {
+        anchor_source.get("accn"): (
+            (printed, tagged), wanted_columns, headings, why),
+    }
     for field, phrases, identity in PRINTED:
         shown = row.get(field)
         if shown is None:
@@ -501,15 +696,36 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
         # goodwill and intangibles, the engine puts all of it in the second and
         # zeroes the first, and says so. Comparing the zero against the combined
         # line it names is comparing a bookkeeping choice against a figure.
-        if "contained in" in ((sources.get(field) or {}).get("concept") or ""):
+        field_source = sources.get(field) or {}
+        if "contained in" in (field_source.get("concept") or ""):
+            continue
+        # A snapshot can legitimately combine exact-date facts from different
+        # filings. Verify each figure against the accession its own provenance
+        # names, not whichever accession happened to supply total assets. FOXF's
+        # later 10-Q reuses the intangibles tag for a narrower row and otherwise
+        # makes its correct 10-K total look wrong.
+        source_accn = field_source.get("accn")
+        if source_accn not in reports:
+            try:
+                reports[source_accn] = _read_statement(
+                    row, edgar, "balance_sheet", field_source)
+            except Exception as exc:
+                out.append(("FILING?", field, shown, None,
+                            f"could not read source accession: {exc!r}"[:110]))
+                continue
+        ((field_printed, field_tagged), field_columns,
+         field_headings, field_why) = reports[source_accn]
+        if field_printed is None:
+            out.append(("FILING?", field, shown, None, field_why))
             continue
         # each figure against the column of ITS OWN balance-sheet date: a filer may
         # carry one line from a later filing than another, and Fervent's current
         # assets are stated a quarter behind its total assets
-        own = (sources.get(field) or {}).get("end")
-        here = wanted_columns
+        own = field_source.get("end")
+        here = field_columns
         if own:
-            here = [i for i, heading in enumerate(headings) if heading.isoformat() == own]
+            here = [i for i, heading in enumerate(field_headings)
+                    if heading.isoformat() == own]
             if not here:
                 # The figure belongs to a balance sheet this filing does not print.
                 # ProtoKinetix states current assets a year behind its total assets,
@@ -527,8 +743,9 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
         # Labels were only ever a proxy for this: Apple prints its NON-CURRENT
         # intangibles under a caption reading like the whole, and Hercules its GROSS
         # ones, and no reading of the words separates those from a disagreement.
-        exact = _by_element(tagged, (sources.get(field) or {}).get("tag"), here)
-        if not exact and tagged and _absent_concept(tagged, (sources.get(field) or {}).get("tag")):
+        exact = _by_element(field_tagged, field_source.get("tag"), here)
+        if (not exact and field_tagged
+                and _absent_concept(field_tagged, field_source.get("tag"))):
             # The statement does not state this concept at all, and a caption that
             # reads like it is a different figure: Apple prints
             # `aapl_...NoncurrentIntangibleAssets` under "Intangible assets, net" and
@@ -539,12 +756,17 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                         "the statement tags no such concept; its nearest caption is "
                         "a different one"))
             continue
-        options = exact or [hit for col in here
-                            for hit in statements.all_matching(printed, *phrases, column=col)]
+        # A malformed renderer can attach the element link to only one comparative
+        # cell. Keep the exact concept first, but also admit the visible caption
+        # when it independently contains the shown value (EXDW FY2025).
+        labelled = [hit for col in here for hit in statements.all_matching(
+            field_printed, *phrases, column=col)]
+        options = exact + labelled
         scaled = [float(v) / (ratio if field == "shares" else 1) for _, v in options]
         note = f"printed as {options[0][0]!r}" if options else None
         if not scaled and identity:
-            halves = [statements.value_for(printed, name, column=here[0]) for name in identity]
+            halves = [statements.value_for(field_printed, name, column=here[0])
+                      for name in identity]
             if all(halves):
                 scaled = [float(halves[0][1] - halves[1][1])]
                 note = f"not printed; {identity[0]} - {identity[1]}"
@@ -574,7 +796,7 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
             out.append(("FILING?", field, shown, scaled[0],
                         "the total of finite and indefinite intangibles; the printed "
                         "line states the finite part"))
-        elif any(op in ((sources.get(field) or {}).get("tag") or "") for op in (" - ", " + ")):
+        elif any(op in (field_source.get("tag") or "") for op in (" - ", " + ")):
             # An assembled figure is not the line the statement prints. Total
             # liabilities from assets-minus-equity necessarily contains the mezzanine
             # a balance sheet shows between the two — Crawford Capital's $176.5M of
@@ -584,6 +806,11 @@ def against_filing(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
             # "Intangible assets, net" though tangible book must deduct both.
             out.append(("FILING?", field, shown, scaled[0],
                         "assembled from components; the printed line is one of them"))
+        elif _element_row_is_incomplete(
+                field_tagged, field_source.get("tag"), len(field_headings)):
+            out.append(("FILING?", field, shown, scaled[0],
+                        "the SEC-rendered element link covers fewer cells than the "
+                        "statement and cannot identify this fiscal column"))
         elif any(_only_the_scale_differs(shown, v) for v in scaled):
             out.append(("FILING?", field, shown, scaled[0],
                         "the same figure under the scale the statement's header "
@@ -615,6 +842,128 @@ def _by_subtraction(printed, column: int, shown: float) -> bool:
     return False
 
 
+def _by_fresh_start_periods(printed, headings: list[date], column: int,
+                            phrases: tuple[str, ...], shown: float) -> bool:
+    """Whether two same-year statement columns add to the displayed full year.
+
+    Fresh-start accounting presents the predecessor and successor as separate
+    columns even though an annual fact can state their combined fiscal-year
+    result. Spirit's 2025 statement, for example, prints +$72.216m through
+    March 12 beside -$2,832.669m from March 13 through year end; the annual-report
+    total is -$2,760.453m. Accept only one adjacent, earlier same-calendar-year
+    column and only the identical printed row label, so ordinary comparative
+    columns cannot be combined opportunistically.
+    """
+    if not (0 <= column < len(headings)):
+        return False
+    neighbours = [
+        other for other in (column - 1, column + 1)
+        if (0 <= other < len(headings)
+            and headings[other].year == headings[column].year
+            and headings[other] < headings[column])
+    ]
+    if len(neighbours) != 1:
+        return False
+    other = neighbours[0]
+    current = statements.all_matching(
+        printed, *phrases, column=column, only_the_parent=True)
+    earlier = statements.all_matching(
+        printed, *phrases, column=other, only_the_parent=True)
+    for label, value in current:
+        for earlier_label, earlier_value in earlier:
+            if label != earlier_label:
+                continue
+            combined = float(value) + float(earlier_value)
+            if _agrees(shown, combined, label):
+                return True
+    return False
+
+
+def _same_concept_in_another_filed_unit(facts: dict, source: dict,
+                                        shown: float,
+                                        printed_values: list[float]) -> bool:
+    """Whether a 20-F filed this exact fact in two currencies/units.
+
+    SEC's rendered statement chooses one presentation currency while Company
+    Facts can carry the issuer's convenience translation as a second unit. A USD
+    dashboard value and the same tagged CNY line are corroborating evidence, not
+    a scale error. Require both numbers in the exact accession/context and in
+    distinct units; a coincidental ratio is never enough.
+    """
+    tag_text = source.get("tag") or ""
+    if any(op in tag_text for op in (" - ", " + ")) or ":" not in tag_text:
+        return False
+    namespace, tag = tag_text.split(":", 1)
+    units = (facts.get("facts", {}).get(namespace, {}).get(tag) or {}).get(
+        "units", {})
+
+    def close(left: float, right: float) -> bool:
+        return abs(left - right) <= FILING_TOLERANCE * max(
+            abs(left), abs(right), 1e-9)
+
+    matching: dict[str, list[float]] = {}
+    for unit, entries in units.items():
+        values = []
+        for entry in entries:
+            if ((not source.get("accn")
+                 or entry.get("accn") == source.get("accn"))
+                    and entry.get("end") == source.get("end")
+                    and (source.get("start") is None
+                         or entry.get("start") == source.get("start"))):
+                values.append(float(entry["val"]))
+        if values:
+            matching[unit] = values
+    shown_units = {unit for unit, values in matching.items()
+                   if any(close(shown, value) for value in values)}
+    printed_units = {unit for unit, values in matching.items()
+                     if any(close(printed, value) for value in values
+                            for printed in printed_values)}
+    return bool(shown_units and printed_units and shown_units.isdisjoint(printed_units))
+
+
+def _historical_income_source(facts: dict, source: dict, end: str,
+                              shown: float) -> dict | None:
+    """The annual filing that actually supplied one historical series value.
+
+    The payload keeps one source record per series, for its newest value. Older
+    years can originate in an earlier annual report that a newer filing does not
+    repeat. Comparing such a year only with the newest rendered statement creates
+    a false scale defect (AHII FY2012: $16,375 was compared with FY2013's $13).
+    Locate the exact displayed value in raw Company Facts, then let the independent
+    statement reader verify the filing that carried it.
+    """
+    tag_text = source.get("tag") or ""
+    if any(op in tag_text for op in (" - ", " + ")) or ":" not in tag_text:
+        return None
+    namespace, tag = tag_text.split(":", 1)
+    units = (facts.get("facts", {}).get(namespace, {}).get(tag) or {}).get(
+        "units", {})
+
+    candidates = []
+    for entries in units.values():
+        for entry in entries:
+            if (entry.get("end") != end or "start" not in entry
+                    or not _is_annual_form(entry.get("form") or "")):
+                continue
+            value = float(entry.get("val") or 0)
+            if abs(shown - value) > FILING_TOLERANCE * max(
+                    abs(shown), abs(value), 1e-9):
+                continue
+            if entry.get("accn"):
+                candidates.append(entry)
+    if not candidates:
+        return None
+    entry = max(candidates, key=lambda item: (
+        item.get("filed", ""), item.get("accn", "")))
+    return {
+        **source,
+        "accn": entry["accn"],
+        "form": entry.get("form"),
+        "start": entry.get("start"),
+        "end": entry["end"],
+    }
+
+
 def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     """Every year the annual report prints, against the series the panel shows.
 
@@ -642,6 +991,7 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     facts = facts or {}
     series = {
         "revenue": row.get("annual_revenue") or {},
+        "gross_profit": row.get("annual_gross_profit") or {},
         "net_income": row.get("annual_net_income") or {},
         "eps": row.get("annual_eps") or {},
         "operating_income": row.get("annual_operating_income") or {},
@@ -655,19 +1005,44 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
     # month. Fifteen companies read as wrong for this alone.
     by_end = {v["end"]: y for y, v in (row.get("annual_ratios") or {}).items()
               if isinstance(v, dict) and v.get("end")}
+    visited = set()
     for column, heading in enumerate(headings):
         year = by_end.get(heading.isoformat())
-        if year is None:
+        if year is None or year in visited:
             continue                    # a column the panel holds no year for
+        visited.add(year)
+        # SEC's rendered report can expose both a quarter and the full year under
+        # the same end date (AZTA/DCO), or repeat the same annual block (GWLL).
+        # This audit asks whether the displayed annual value is present in any of
+        # those same-dated columns and emits one result per fiscal year.
+        columns = [i for i, candidate in enumerate(headings)
+                   if by_end.get(candidate.isoformat()) == year]
         for field, phrases in PRINTED_INCOME:
             shown = series[field].get(year)
             if shown is None:
                 continue
+            field_source = concepts.get(field) or {}
+            derived_operating = (
+                field == "operating_income"
+                and "derived and reconciled" in
+                (field_source.get("concept") or "").lower()
+            )
             # the parent-attribution guard is about whose profit a line states and
             # says nothing useful about a per-share figure, which it would exclude
             # outright for containing the words "per share"
-            exact = _by_element(tagged, (concepts.get(field) or {}).get("tag"), [column])
-            if not exact and tagged and _absent_concept(tagged, (concepts.get(field) or {}).get("tag")):
+            exact = (
+                [hit for candidate in columns
+                 for hit in _reconciled_operating_income(
+                     tagged, field_source, candidate)]
+                if derived_operating else
+                _by_element(tagged, field_source.get("tag"), columns)
+            )
+            if derived_operating and not exact:
+                out.append(("FILING?", f"FY{year} {field}", shown, None,
+                            "the tagged subtotal components do not reconcile on "
+                            "the rendered statement"))
+                continue
+            if not exact and tagged and _absent_concept(tagged, field_source.get("tag")):
                 # The statement does not state this concept. New Mountain Finance is
                 # a business development company and the panel carries its net
                 # investment income per share, while its statement prints earnings
@@ -676,14 +1051,78 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                 out.append(("FILING?", f"FY{year} {field}", shown, None,
                             "the statement tags no such concept"))
                 continue
-            options = exact or statements.all_matching(
-                printed, *phrases, column=column,
-                only_the_parent=(field != "eps"), money_only=(field == "eps"))
+            options = exact or [
+                hit for candidate in columns
+                for hit in statements.all_matching(
+                    printed, *phrases, column=candidate,
+                    only_the_parent=(field != "eps"), money_only=(field == "eps"))
+            ]
             if any(_agrees(shown, float(v), label) for label, v in options):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
                 continue
-            if field == "net_income" and _by_subtraction(printed, column, shown):
+            # One source record represents the newest member of a serialized
+            # series, not every historical year. If this value came from an older
+            # annual filing, verify that exact accession before calling the newer
+            # statement a contradiction.
+            historical_source = _historical_income_source(
+                facts, field_source, heading.isoformat(), shown)
+            if (historical_source is not None
+                    and historical_source.get("accn") != source.get("accn")):
+                try:
+                    ((historical_printed, historical_tagged), historical_columns,
+                     _, historical_why) = _read_statement(
+                        row, edgar, "income", historical_source)
+                except Exception:
+                    historical_printed, historical_tagged = None, {}
+                    historical_columns, historical_why = [], None
+                if historical_printed is not None:
+                    matched_historical = False
+                    for historical_column in historical_columns:
+                        historical_exact = _by_element(
+                            historical_tagged, field_source.get("tag"),
+                            [historical_column])
+                        historical_options = historical_exact or statements.all_matching(
+                            historical_printed, *phrases,
+                            column=historical_column,
+                            only_the_parent=(field != "eps"),
+                            money_only=(field == "eps"))
+                        if any(_agrees(shown, float(value), label)
+                               for label, value in historical_options):
+                            out.append((
+                                "FILING-OK", f"FY{year} {field}", shown, shown,
+                                f"printed in source accession "
+                                f"{historical_source['accn']}",
+                            ))
+                            matched_historical = True
+                            break
+                    if matched_historical:
+                        continue
+            period_source = {**field_source, "end": heading.isoformat()}
+            # Historical series do not serialize per-year provenance. Locate the
+            # displayed value among every filing for this exact period; a later
+            # 20-F often repeats only its CNY columns while the original annual
+            # report supplied the USD convenience translation shown by the UI.
+            if heading.isoformat() != field_source.get("end"):
+                period_source.pop("accn", None)
+                period_source.pop("start", None)
+            if _same_concept_in_another_filed_unit(
+                    facts, period_source, shown, [float(v) for _, v in options]):
+                out.append(("FILING?", f"FY{year} {field}", shown,
+                            float(options[0][1]) if options else None,
+                            "the same concept is filed in another currency/unit; "
+                            "the rendered statement chose that presentation"))
+                continue
+            if (field == "net_income"
+                    and any(_by_subtraction(printed, candidate, shown)
+                            for candidate in columns)):
                 out.append(("FILING-OK", f"FY{year} {field}", shown, shown, None))
+                continue
+            if (field == "net_income"
+                    and any(_by_fresh_start_periods(
+                        printed, headings, candidate, phrases, shown)
+                            for candidate in columns)):
+                out.append(("FILING-OK", f"FY{year} {field}", shown, shown,
+                            "sum of predecessor and successor statement periods"))
                 continue
             concept = (concepts.get(field) or {}).get("tag", "")
             if (field == "revenue" and "RevenueFromContractWithCustomer" in concept
@@ -713,8 +1152,11 @@ def against_income(row: dict, edgar, facts: dict | None = None) -> list[tuple]:
                 out.append(("FILING?", f"FY{year} {field}", shown, float(value),
                             f"per receipt, which is {ratio:g} ordinary shares"))
                 continue
-            if field == "eps" and _split_since(facts, heading, shown, float(value)):
-                out.append(("FILING?", f"FY{year} {field}", shown, float(value),
+            split_value = next((float(candidate) for _, candidate in options
+                                if field == "eps" and _split_since(
+                                    facts, heading, shown, float(candidate))), None)
+            if split_value is not None:
+                out.append(("FILING?", f"FY{year} {field}", shown, split_value,
                             "split-adjusted; this filing predates the split"))
                 continue
             if any(_only_the_scale_differs(shown, float(v)) for _, v in options):
@@ -846,6 +1288,7 @@ CASH_FLOW = {
         "us-gaap_DepreciationAmortizationAndAccretionNet",
         "us-gaap_DepreciationAndAmortization",
         "us-gaap_DepreciationDepletionAndAmortizationExcludingAmortizationOfDeferredFinancingFeesAndDebtDiscounts",
+        "fusb_DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms",
         "ifrs-full_AdjustmentsForDepreciationAndAmortisationExpense"),
     "- total capital expenditure": (
         "us-gaap_PaymentsToAcquirePropertyPlantAndEquipment",
@@ -890,6 +1333,7 @@ def against_cash_flow(row: dict, edgar) -> list[tuple]:
             continue
         values = [v for concept in concepts if concept in tagged
                   for col in columns if col < len(tagged[concept])
+                  if tagged[concept][col] is not None
                   for v in (float(tagged[concept][col]),)]
         if not values:
             out.append(("FILING?", f"all-capex evidence {name}", shown, None,
@@ -1032,6 +1476,18 @@ def _derived_series(row: dict) -> list[tuple]:
     if cash_parts and earnings.get("free_cash_flow") is not None:
         check("owner_earnings.free_cash_flow", earnings["free_cash_flow"],
               sum(cash_parts), "operating cash flow less total capex")
+    reconciliation = earnings.get("fcf_reconciliation") or {}
+    for method, detail in (reconciliation.get("methods") or {}).items():
+        components = [value for _, value in (detail.get("components") or [])]
+        if components and detail.get("value") is not None:
+            check(f"owner_earnings.fcf_reconciliation.{method}", detail["value"],
+                  sum(components), detail.get("formula") or "sum of displayed components")
+    methods = list((reconciliation.get("methods") or {}).values())
+    method_values = [method.get("value") for method in methods
+                     if method.get("value") is not None]
+    if len(method_values) == 3:
+        check("owner_earnings.fcf_reconciliation.spread", reconciliation.get("spread"),
+              max(method_values) - min(method_values), "maximum method less minimum method")
     capital = earnings.get("invested_capital")
     capital_evidence = earnings.get("invested_capital_evidence") or {}
     beginning = (capital_evidence.get("beginning") or {}).get("value")
@@ -1040,6 +1496,27 @@ def _derived_series(row: dict) -> list[tuple]:
         check("owner_earnings.invested_capital", capital,
               (beginning + ending) / 2,
               "average of exact beginning and ending invested capital")
+    ntoa = earnings.get("average_net_tangible_operating_assets")
+    ntoa_evidence = earnings.get("net_tangible_operating_assets_evidence") or {}
+    ntoa_beginning = (ntoa_evidence.get("beginning") or {}).get("value")
+    ntoa_ending = (ntoa_evidence.get("ending") or {}).get("value")
+    if ntoa_beginning is not None and ntoa_ending is not None:
+        check("owner_earnings.average_net_tangible_operating_assets", ntoa,
+              (ntoa_beginning + ntoa_ending) / 2,
+              "average of exact beginning and ending net tangible operating assets")
+    lease_neutral_ntoa = earnings.get(
+        "average_lease_neutral_net_tangible_operating_assets")
+    lease_neutral_evidence = (
+        earnings.get("lease_neutral_net_tangible_operating_assets_evidence") or {})
+    lease_neutral_beginning = (
+        lease_neutral_evidence.get("beginning") or {}).get("value")
+    lease_neutral_ending = (
+        lease_neutral_evidence.get("ending") or {}).get("value")
+    if lease_neutral_beginning is not None and lease_neutral_ending is not None:
+        check("owner_earnings.average_lease_neutral_net_tangible_operating_assets",
+              lease_neutral_ntoa,
+              (lease_neutral_beginning + lease_neutral_ending) / 2,
+              "average of exact beginning and ending lease-neutral NTOA")
     if earnings.get("all_capex_return") is not None and capital:
         check("owner_earnings.all_capex_return", earnings["all_capex_return"],
               earnings["all_capex_floor"] / capital * 100,
@@ -1066,9 +1543,49 @@ def _derived_series(row: dict) -> list[tuple]:
         check("owner_earnings.nopat_roic", earnings["nopat_roic"],
               earnings["nopat"] / capital * 100,
               "NOPAT over average invested capital")
+    if earnings.get("ronta") is not None and earnings.get("nopat") is not None and ntoa:
+        check("owner_earnings.ronta", earnings["ronta"],
+              earnings["nopat"] / ntoa * 100,
+              "NOPAT over average net tangible operating assets")
+    if (earnings.get("lease_neutral_ronta") is not None
+            and earnings.get("nopat") is not None and lease_neutral_ntoa):
+        check("owner_earnings.lease_neutral_ronta",
+              earnings["lease_neutral_ronta"],
+              earnings["nopat"] / lease_neutral_ntoa * 100,
+              "NOPAT over average lease-neutral net tangible operating assets")
     for year, cell in (earnings.get("annual_per_share") or {}).items():
         if not isinstance(cell, dict):
             continue
+        bridge = cell.get("cash_flow_bridge") or {}
+
+        def bridge_value(name):
+            point = bridge.get(name)
+            if isinstance(point, dict):       # engine <=117 compatibility
+                return point.get("value")
+            if isinstance(point, list):
+                return point[0] if point else None
+            return point if isinstance(point, (int, float)) else None
+
+        net_income = bridge_value("net_income")
+        depreciation = bridge_value("depreciation_and_amortisation")
+        stock_compensation = bridge_value("stock_compensation")
+        other_adjustments = bridge_value("other_operating_cash_flow_adjustments")
+        working_capital = bridge_value("working_capital_cash_effect")
+        operating_cash = bridge_value("operating_cash_flow")
+        if all(value is not None for value in (
+                net_income, depreciation, other_adjustments, operating_cash)):
+            check(f"owner_earnings.annual_per_share.{year}.cash_flow_bridge."
+                  "operating_cash_flow", operating_cash,
+                  net_income + depreciation + (stock_compensation or 0)
+                  + other_adjustments + (working_capital or 0),
+                  "net income + D&A + separately filed SBC + other residual "
+                  "+ working-capital cash effect")
+        capex = bridge_value("total_capital_expenditure")
+        free_cash_flow = bridge_value("free_cash_flow")
+        if operating_cash is not None and capex is not None and free_cash_flow is not None:
+            check(f"owner_earnings.annual_per_share.{year}.cash_flow_bridge."
+                  "free_cash_flow", free_cash_flow, operating_cash - capex,
+                  "operating cash flow less cash capital expenditure")
         shares = cell.get("diluted_shares")
         for total_key, share_key, label in (
             ("all_capex_floor", "all_capex_floor_per_share", "all-capex floor"),
@@ -1104,10 +1621,78 @@ def _derived_series(row: dict) -> list[tuple]:
                   "that year's price over its tangible book value per share",
                   _rounding_slack(price, tangible))
         revenue = (row.get("annual_revenue") or {}).get(year)
+        gross_profit = (row.get("annual_gross_profit") or {}).get(year)
         income = (row.get("annual_net_income") or {}).get(year)
+        if revenue is not None:
+            check(f"annual_ratios.{year}.revenue", cell.get("revenue"), revenue,
+                  "that year's reported revenue")
+        if revenue and gross_profit is not None:
+            check(f"annual_ratios.{year}.gross_margin", cell.get("gross_margin"),
+                  gross_profit / revenue * 100,
+                  "that year's gross profit over revenue")
         if revenue and income is not None:
             check(f"annual_ratios.{year}.net_margin", cell.get("net_margin"),
                   round(income / revenue * 100, 4), "that year's profit over its sales")
+        net_tangible_assets = cell.get("net_tangible_assets")
+        if net_tangible_assets is not None and net_tangible_assets > 0 and income is not None:
+            check(f"annual_ratios.{year}.return_on_net_tangible_assets",
+                  cell.get("return_on_net_tangible_assets"),
+                  income / net_tangible_assets * 100,
+                  "that year's profit over its net tangible assets")
+        average_equity = cell.get("average_common_equity")
+        if average_equity is not None and average_equity > 0 and income is not None:
+            check(f"annual_ratios.{year}.return_on_equity",
+                  cell.get("return_on_equity"), income / average_equity * 100,
+                  "that year's profit over average common equity")
+        common_equity, combined_debt = (cell.get("common_equity"),
+                                        cell.get("combined_debt"))
+        if common_equity is not None and common_equity > 0 and combined_debt is not None:
+            check(f"annual_ratios.{year}.debt_to_equity", cell.get("debt_to_equity"),
+                  combined_debt / common_equity,
+                  "that year's combined interest-bearing debt over common equity")
+        operating_income = cell.get("operating_income_for_nopat")
+        tax_rate = cell.get("normalized_tax_rate")
+        nopat = cell.get("nopat")
+        if operating_income is not None and tax_rate is not None:
+            check(f"annual_ratios.{year}.nopat", nopat,
+                  operating_income * (1 - tax_rate / 100),
+                  "operating income x (1 - normalized effective tax rate)")
+        evidence = cell.get("operating_return_evidence") or {}
+        for field, beginning_key, ending_key, label in (
+            ("invested_capital", "invested_capital_beginning",
+             "invested_capital_ending", "cash-excluded invested capital"),
+            ("capital_including_cash", "capital_including_cash_beginning",
+             "capital_including_cash_ending", "capital including cash"),
+            ("average_net_tangible_operating_assets",
+             "net_tangible_operating_assets_beginning",
+             "net_tangible_operating_assets_ending",
+             "net tangible operating assets"),
+            ("average_lease_neutral_net_tangible_operating_assets",
+             "lease_neutral_net_tangible_operating_assets_beginning",
+             "lease_neutral_net_tangible_operating_assets_ending",
+             "lease-neutral net tangible operating assets"),
+        ):
+            beginning = (evidence.get(beginning_key) or {}).get("value")
+            ending = (evidence.get(ending_key) or {}).get("value")
+            if (cell.get(field) is not None
+                    and beginning is not None and ending is not None):
+                check(f"annual_ratios.{year}.{field}", cell.get(field),
+                      (beginning + ending) / 2,
+                      f"average beginning and ending {label}")
+        for field, denominator, label in (
+            ("nopat_roic", cell.get("invested_capital"),
+             "NOPAT over average cash-excluded invested capital"),
+            ("nopat_return_including_cash", cell.get("capital_including_cash"),
+             "NOPAT over average capital including cash"),
+            ("ronta", cell.get("average_net_tangible_operating_assets"),
+             "NOPAT over average net tangible operating assets"),
+            ("lease_neutral_ronta",
+             cell.get("average_lease_neutral_net_tangible_operating_assets"),
+             "NOPAT over average lease-neutral net tangible operating assets"),
+        ):
+            if nopat is not None and denominator is not None and denominator > 0:
+                check(f"annual_ratios.{year}.{field}", cell.get(field),
+                      nopat / denominator * 100, label)
     return out
 
 
@@ -1119,7 +1704,7 @@ def _c(row: dict, n: int):
 # One of each shape the engine has to handle, so a pass means something: a
 # December mega-cap, a June filer, a financial, a REIT, a depositary receipt, a
 # dual-class, a loss-maker, a partnership, a small cap, a recent listing.
-SPREAD = ("KO", "MSFT", "JPM", "O", "ZLAB", "GOOGL", "RIVN", "ET", "EML", "AAPL",
+SPREAD = ("KO", "MSFT", "JPM", "O", "ZLAB", "GOOGL", "RIVN", "ET", "EML", "AAPL", "JNJ", "FUSB",
           "BRK-B", "PG", "XOM", "UNH", "T", "F", "PLTR", "MKL", "NKE", "ORCL")
 
 
@@ -1128,6 +1713,7 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
               "unchecked": 0, "mixed_dates": 0, "filing_ok": 0, "filing_bad": 0,
               "filing_unknown": 0}
     problems = []
+    uncheckable = []
     for row in rows:
         facts = _facts(row["cik"], cache)
         sources = row.get("sources") or {}
@@ -1146,16 +1732,6 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
             if not source or not source.get("accn"):
                 totals["unchecked"] += 1
                 lines.append(("UNCHECKED", field, shown, None, "no provenance recorded"))
-                continue
-            # A figure read on a share-class axis cannot be found in Company Facts,
-            # which drops every dimension: BCSS files 1,500,000 weighted shares
-            # without one and 10,000,000 for the class its ticker names, so looking
-            # up the bare tag finds a real number that is not this one.
-            if source.get("segments"):
-                totals["unchecked"] += 1
-                lines.append(("UNCHECKED", field, shown, None,
-                              f"filed under {source['segments'].rstrip(';')}, "
-                              "which the dimension-free API does not carry"))
                 continue
             ns, _, bare = (source.get("tag") or "").partition(":")
             ratio = _ratio(row) if field in ("shares", "cover_shares") else 1
@@ -1214,6 +1790,8 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
                 if line[0] != "FILING-OK":       # matches are counted, not printed
                     lines.append(line)
         bad = [ln for ln in lines if ln[0] not in ("UNCHECKED", "FILING?")]
+        uncheckable.extend((row["ticker"], line) for line in lines
+                           if line[0] == "UNCHECKED")
         if bad:
             problems.append((row["ticker"], bad))
         if not quiet:
@@ -1222,26 +1800,35 @@ def audit(rows: list[dict], cache: Path, quiet: bool = False, edgar=None) -> dic
             for kind, name, shown, expected, why in lines:
                 print(f"      {kind:9s} {name:16s} shows {shown!r} "
                       f"{'vs ' + repr(round(expected, 4)) if expected is not None else ''}   {why}")
-    return {"totals": totals, "problems": problems}
+    return {"totals": totals, "problems": problems,
+            "uncheckable": uncheckable}
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ticker", help="comma-separated, instead of the standard spread")
+    ap.add_argument("--all", action="store_true",
+                    help="audit every company in the selected UI payload")
     ap.add_argument("--sample", type=int, help="this many companies at random")
     ap.add_argument("--seed", type=int, default=0,
                     help="which random sample: the same seed always draws the same "
                          "companies, so a run is reproducible and a new seed covers new ground")
     ap.add_argument("--quiet", action="store_true", help="only the failures")
+    ap.add_argument("--show-unchecked", action="store_true",
+                    help="list values that the payload cannot independently substantiate")
     ap.add_argument("--filings", action="store_true",
                     help="also read each company's published statements (network)")
+    ap.add_argument("--dashboard", type=Path, default=Path(DASHBOARD_JSON),
+                    help="UI payload to audit without replacing the shipped dashboard")
     args = ap.parse_args(argv)
 
-    everything = json.loads(Path(DASHBOARD_JSON).read_text())["rows"]
+    everything = json.loads(args.dashboard.read_text())["rows"]
     by_ticker = {r["ticker"]: r for r in everything if r.get("ticker")}
     if args.ticker:
         wanted = [by_ticker[t.strip().upper()] for t in args.ticker.split(",")
                   if t.strip().upper() in by_ticker]
+    elif args.all:
+        wanted = everything
     elif args.sample:
         import random
         random.seed(args.seed)
@@ -1259,6 +1846,10 @@ def main(argv=None) -> int:
     print(f"  matching the published statement     : {t['filing_ok']} ok, {t['filing_bad']} wrong"
           f" ({t['filing_unknown']} lines not printed)")
     print(f"  not checkable from the payload       : {t['unchecked']}")
+    if args.show_unchecked and result.get("uncheckable"):
+        print("\n  uncheckable values:")
+        for ticker, (_, field, shown, _, why) in result["uncheckable"]:
+            print(f"    {ticker:8s} {field}: {shown!r} ({why})")
     if result["problems"]:
         print(f"\n  {len(result['problems'])} companies with at least one defect: "
               + ", ".join(t for t, _ in result["problems"]))

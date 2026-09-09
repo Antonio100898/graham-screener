@@ -1710,3 +1710,846 @@ wrong verdicts and four impossible numbers between them.
 *Audited against engine 58, payload of 2026-08-20. 43 filings read on sec.gov. 31 regression
 tests written and confirmed failing on HEAD; none was added to the repository. No file in the
 repository was modified by this audit.*
+
+---
+
+## 7. 2026-09-08 addendum — operating-income and published-statement sweep
+
+This is the first incremental pass of the new source-to-UI audit. It does not supersede the
+engine-58 findings above and is not a claim that the whole universe has been manually read.
+
+### Johnson & Johnson ground truth
+
+J&J's 2025 annual report, page 44, presents its consolidated earnings statement in millions.
+The reported rows reconcile operating income exactly even though the standard
+`OperatingIncomeLoss` Company Facts series stops after FY2014:
+
+| FY | Gross profit | SG&A | R&D excluding acquired IPR&D | IPR&D impairment | Restructuring | Reconciled operating income |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2025 | 63,937 | 23,676 | 14,665 | 81 | 228 | **25,287** |
+| 2024 | 61,350 | 22,869 | 17,232 | 211 | 234 | **20,804** |
+| 2023 | 58,606 | 21,512 | 15,085 | 313 | 489 | **21,207** |
+
+The independent bridge from pretax income through interest income, interest expense and other
+nonoperating income/expense produces the same three totals. Engine 132 accepts this inverse
+bridge only when gross profit, SG&A and the separately presented R&D row constrain all omitted
+operating costs to no more than 5% of gross profit. Every component keeps its accession, period,
+form and tag in provenance.
+
+The guard was attacked with FSTR FY2014. Its generic `ResearchAndDevelopmentExpense` comes from
+a note and is already contained in SG&A; treating it as a separately presented statement row
+would create a false operating-income subtotal. The generic tag is therefore excluded, and the
+FSTR case remains absent rather than guessed.
+
+### Audit-harness defects found by the sweep
+
+The first filing pass initially printed 12 apparent mismatches. Direct filing review showed all
+12 were audit-harness false positives, not payload errors:
+
+- the auditor compared every balance field with the accession chosen for total assets, even
+  when the field's own retained provenance pointed to a different annual filing;
+- USD convenience translations were compared with a published CNY or other filed-currency row;
+- a visibly printed current-period value was treated as wrong when the SEC element hyperlink
+  exposed only the comparative-period cell.
+
+The auditor now reads each field's retained source accession, recognizes the same concept and
+period in another filed unit, and reports incomplete SEC element links as `FILING?` rather than
+as false errors. The EXDW 2025 10-K was the concrete incomplete-link regression: both 121,590 and
+126,913 are visible in the statement, while the element link indexes only the comparative cell.
+
+### Historical presentation-scale findings
+
+A population scan found 91 isolated exact-scale flow/share observations and 230 years where
+`EPS × weighted shares` missed the matching income by approximately 1,000× or 1,000,000×. The
+neighbor-year pattern was used only to find candidates. A repair is accepted only when the same
+accession and fiscal period carry the weighted count, EPS and the economically matching income
+numerator and the exact rescale reconciles them within 5%. Continuing-operations EPS is paired
+with continuing-operations income rather than total net income.
+
+That proof corrected **21 company-years across 12 issuers**: DOV (1), MDU (2), NEON (1), SPXC
+(2), SENEA (1), PAR (2), CVSA (3), ESE (1), PESI (2), NNDM (3), FXHO (1), and ZSTK (2). Direct
+report checks covered four different statement shapes: Dover FY2009 and Perma-Fix FY2020 report
+their counts in thousands; Nano Dimension FY2025 reports 215,742 thousand shares against
+−$0.46 continuing-operations EPS and −$100.355m continuing loss; UTime FY2026 reports 56,302
+thousand shares against −$0.07 and −$4.035m. The corrected counts now read 186.736m, 12.347m,
+215.742m and 56.302m respectively. No approximate scale or cross-filing evidence is accepted.
+
+### Monetary scale and malformed subtotal findings
+
+- Bio-Techne's FY2013 `OperatingIncomeLoss` comparative appears in Company Facts as `$158,469`,
+  but its 2015 10-K states that the table is in thousands and prints `158,469`. Gross profit
+  `$231.110m` less operating expense `$72.641m` equals `$158.469m`; pretax `$160.662m` less
+  nonoperating income `$2.193m` independently gives the same number. Engine 134 corrects this
+  exact 1,000× contradiction and retains the bad direct fact in the derived provenance.
+- Dolphin Entertainment's reports do not print a gross-profit subtotal, yet Company Facts
+  supplied a repeated `$3m` in six years and `$3` in FY2022. Same-filing revenue and direct costs
+  contradict every one of those values, so all seven are now absent rather than displayed as a
+  margin. Financial Gravity's FY2021 `GrossProfit=0` was an Inline-XBRL `zerodash`, not a reported
+  zero, and is also withheld.
+- Two adverse controls remain untouched: Uranium Energy's FY2024 `$37,000` gross profit and
+  Rubicon Technology's FY2012 `$40,000` gross loss are visibly printed and exactly supported by
+  revenue less cost of revenue. This prevents a magnitude filter from erasing genuine weak years.
+
+### Cash-flow bridge scale findings
+
+The next incremental scan covered the seven direct rows in every available ten-year cash-flow
+bridge for all 6,586 UI companies. It produced only five isolated exact-scale candidates. Four
+were real extremes: SPXC's FY2022 net income is `$0.2m`; CWK's FY2019 net income is `$0.2m`;
+Immersion's FY2020 operating cash flow is `$22,000`; and AerSale's FY2022 operating cash flow is
+`-$113,000`. Each value is printed in its audited statement and remains unchanged. A separate
+net-income scan also checked CATO FY2022 (`$29,000`), Applied Optoelectronics FY2017 (`$9`) and
+Pure Bioscience FY2020 (`$4,000`) against their reports; those unusual profits are also real.
+
+FUSB was the one confirmed extraction defect. Its 2024 10-K cash-flow statement is in thousands
+and prints D&A of `1,590` for FY2024 and `1,581` for FY2023. The exact Inline-XBRL row is issuer
+extension `DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms` with scale
+3, but Company Facts omits issuer extensions. The standard `DepreciationAndAmortization` element
+instead belongs to the rounded note sentence “Depreciation expense of $1.6” and the filing tags it
+with scale 0. Engine 137 therefore admits that one semantically exact DERA extension below the
+generic $100m extension floor. The latest two DERA quarters supply exact values of `$1.581m`,
+`$1.590m`, and `$1.695m` for FY2023–FY2025.
+
+When the DERA quarter is not yet cached, the engine does not guess the extension value. It may
+retain an earlier standard fact for the identical annual period only if the newer comparative
+differs by exactly 1,000× or 1,000,000× and the earlier scale agrees within one order of magnitude
+with both adjacent years. This fallback yields the earlier filed `$1.6m`, preserves both versions
+in provenance, and never fires for a lone outlier. Ordinary restatements and the seven direct-
+report adverse controls above remain latest-filed-wins.
+
+### Working-capital cash-effect findings
+
+The UI-baseline population contains 31,466 annual cash-flow bridges with operating cash flow,
+but only 678 separately populated working-capital effects: 2.15% of company-years and 122 of
+3,990 companies with a usable bridge. Most blanks are therefore real extraction-policy gaps,
+not reported zeros. The original policy kept the working-capital movement inside the exact
+`Other OCF adjustments` residual unless one aggregate tag was available.
+
+Reviewing the aggregate exposed a sign defect. `IncreaseDecreaseInOperatingCapital` is the
+increase/decrease in the operating-capital balance; it is not the signed cash-flow-statement
+effect. Coca-Cola's 2025 10-K tags positive `$7.208bn`, while both its consolidated cash-flow
+statement and Note 21 print a negative `$7.208bn` cash effect. Engine 138 inverts this standard
+tag, repairing all retained years that used it while leaving the OCF reconciliation identity
+exact. Two opposite-direction controls confirm that this is semantic rather than a Coca-Cola
+presentation quirk: HNI's FY2025 Company Facts value is `-$23.9m` while its statement prints a
+positive `$23.9m` cash contribution, and Vertiv's raw `-$339.3m` likewise appears as positive
+`$339.3m` in both its statement and management's cash-flow discussion. The 2026 FASB taxonomy
+documentation independently defines the element as the asset/liability balance movement.
+
+Johnson & Johnson demonstrates one safe way to recover a missing rollup. Its 2025 statement
+prints five non-overlapping changes: receivables `-$1.781bn`, inventories `-$1.450bn`, accounts
+payable/accrued liabilities `+$2.377bn`, other operating assets `-$6.167bn`, and other operating
+liabilities `-$5.697bn`. The five values total **-$12.718bn**, which also agrees with management's
+cash-flow discussion. Boston Scientific FY2018 independently prints the same five-row shape and a
+`-$2.169bn` sum.
+
+A population scan found that the apparent five-tag pattern also occurs at Ennis, but its 2026
+statement has a sixth `+$72k` prepaid-expenses-and-income-taxes row carried by an issuer extension
+that Company Facts omits. The naive five-tag result would be wrong. Engine 138 therefore permits
+component reconstruction only for exact SEC accession/year contexts already read against the
+rendered statement; it does not infer completeness from the standard tags alone. The five facts
+must still have one annual period, accession and form, and any other visible same-context
+`IncreaseDecreaseIn*` fact vetoes the result. Unverified, incomplete or potentially overlapping
+sets remain blank and inside the residual; missing is not treated as zero. J&J remains in the
+real-company statement and coverage sets, and Ennis is a pinned refusal test.
+
+### Operating-return denominator findings
+
+The next whole-payload scan covered 48,339 annual company-years. Operating income is available
+for 77.06% of them and NOPAT for 37.64%, but the exact average cash-excluded invested-capital pair
+needed for NOPAT ROIC is available for only 7.89%; 5.31% produce the ratio. RONTA is narrower:
+2.43% have an exact average NTOA pair and 2.03% produce RONTA. The dominant cause is missing
+beginning/end investment evidence, not a reported zero. Strict UI blanks must therefore stay
+blank unless a filing proves every denominator input.
+
+Vertiv FY2025 exposed one real taxonomy-transition miss. Its audited balance sheet prints cash of
+`$1.7284bn`, a separate short-term-investment row of `$99.5m`, assets of `$12.2124bn`, current
+liabilities of `$4.4070bn`, and current debt of `$20.9m`; FY2024 prints `$1.2276bn`, zero,
+`$9.1325bn`, `$3.0970bn`, and `$21.0m`, respectively. The investment row uses the newer
+`DebtSecuritiesHeldToMaturityAmortizedCostAfterAllowanceForCreditLossCurrent` element, which the
+old chain did not read. Those statement values produce endpoint invested capital of `$4.8289bn`
+and `$5.9984bn`, hence an exact average of **$5.41365bn**. Operating profit of `$1.8297bn` and the
+median aligned FY2023–FY2025 effective tax rate produce NOPAT of `$1.399979bn` and **25.8602%
+NOPAT ROIC**.
+
+That modern tag cannot enter the global fallback chain. Westlake's 2025 filing uses the same
+held-to-maturity family for `$0` and `$1.009bn` of securities with original maturities of three
+months or less and explicitly classifies them as cash equivalents. Subtracting it as a separate
+investment would count the same cash twice. Engine 139 therefore admits the modern tag only for
+the exact Vertiv accession and statement dates already checked; Westlake is the pinned negative
+control. Both are now permanent coverage-sample companies.
+
+Johnson & Johnson is the opposite kind of correct blank. Its annual report discloses total
+operating-lease ROU assets of `$1.3bn`/`$1.1bn` and total lease liabilities of
+`$1.4bn`/`$1.2bn`, but says only that the current portion sits inside accrued liabilities and the
+noncurrent portion inside other liabilities. It does not disclose the exact split. NOPAT and
+NOPAT ROIC are computable after the operating-income repair; lease-consistent RONTA and
+lease-neutral RONTA remain withheld rather than inventing the current liability.
+
+The coverage run also exposed validator defects. Its duplicate-tag check interpreted the
+legitimate repeated lease-cost input in `(operating income + lease cost) / (interest + lease
+cost)` as 2,383 double counts. Its component counter could not parse reconciled operating-income
+expressions or a workbook-row subtraction, producing another 25 false failures. Duplicate
+protection now applies to additive constructions rather than both sides of a quotient, and
+provenance coverage compares the exact formula references with their source components. Tests
+preserve a genuinely duplicated sum and a deliberately extra reconciliation witness as opposite
+controls.
+
+The eight remaining material tag gaps were then read, not silently allowlisted. Exxon's
+`LongTermInvestmentsAndReceivablesNet` is the clearest: its `$45.317bn` balance-sheet line contains
+`$38.783bn` of equity-method investments and advances, `$271m` of other investments, and
+`$6.263bn` of long-term receivables. The pure investment tags already feed RONTA; subtracting the
+combined line would incorrectly remove operating receivables. The other seven are bank/broker
+operating and funding detail, income/revenue components, or asset composition already inside
+the read totals. Each now has a narrow documented scope rule.
+
+SOPAQ's apparent NI/EPS share mismatch was also a validator period error. FY2024 NI/EPS implies
+about `2.964m` weighted shares and the filing reports `2.963m`; the company then reports `4.968m`
+shares outstanding on March 31, 2025 and `6.106m` by September. Comparing a duration identity to
+that later instant mistook ordinary issuance for a split/basis defect. The identity now uses the
+same fiscal year's filed weighted count. Final `make verify-coverage` is **PASS**: all 6,586
+payload rows pass structural checks, the 117-company sample has no new material tag or identity
+failure, and only three already explained debt-representation disagreements are reported.
+
+An extreme-return sample then checked TEAD, ABBV and ABEO. All **39/39** provenance values,
+**440/440** arithmetic identities and **54/54** machine-readable published-statement comparisons
+matched; seven additional statement cells were not printed as one comparable concept. Their
+large ROIC/RONTA magnitudes come from small but positive cash- or intangible-excluded
+denominators, not scale or sign defects: ABEO's `$5.684m` invested capital is 3.78% of its
+`$150.246m` capital including cash; TEAD's average NTOA is `$46.002m`; ABBV's is `$4.075bn` after
+large goodwill/intangible deductions. These informational ratios remain visible beside the
+cash-included return and outside Graham scoring; an arbitrary new suppression threshold was not
+introduced from three examples.
+
+### Reproducible results and release gate
+
+- Python suite: **555 passed** (one Starlette deprecation warning).
+- Web suite: **75 passed**.
+- Fixed-seed 200-company arithmetic/source pass: **1,864/1,864 sourced figures** and
+  **16,074/16,074 derived checks**, with zero confirmed errors; two payload-only checks remain
+  unverified.
+- The same sample against SEC-rendered statements after the harness fixes:
+  **2,807/2,807 published-statement comparisons**, zero confirmed errors, 334 unavailable or
+  non-machine-comparable cells.
+- A fresh J&J row, round-tripped through the UI payload shape, matched all **15/15** statement
+  checks for revenue, gross profit, net income, EPS and reconciled operating income across
+  FY2023–FY2025.
+- Full-universe regression after engine 138 covered **6,586 companies** (6,585 cached rows could
+  be recomputed) and produced **3,656 field changes**. The preceding engine state accounted for
+  706 of those; the working-capital correction adds a net **2,950** changes. That large count is
+  expected because each corrected annual fact also changes its provenance, per-share value,
+  OCF-before-working-capital presentation and exactly offsetting `Other OCF adjustments`
+  residual. It does **not** change reported OCF, FCF, any Graham criterion or verdict. A separate
+  whole-population component scan produced exactly four new company-years: J&J FY2023–FY2025 and
+  Boston Scientific FY2018. Ennis remained absent. The earlier payload still contains 379
+  pre-existing dirty-tree changes, and eight later pre-engine-138 differences have not yet been
+  attributed independently in this pass. Therefore `derive`/`export` remains intentionally
+  blocked and the currently served `dashboard.json` has not been overwritten.
+- Full-universe regression after engine 139 again covered **6,586 companies** (6,585 recomputed)
+  and reported **3,685 cumulative changes** against the preserved pre-change baseline. A direct
+  engine-138/139 toggle isolated exactly **29 exported-field changes**, all on Vertiv; Westlake
+  and every other company were unchanged. The new fields are the exact capital endpoints and
+  averages, NOPAT ROIC, dependent owner-return/reconciliation fields, their caveats and
+  provenance. Independent audit of the freshly recomputed Vertiv row produced **13/13 sourced**
+  and **103/103 arithmetic** matches; the targeted JNJ/VRT/WLK filing audit produced **66/66
+  published-statement** matches, with one Vertiv D&A sum not printed as a single concept and no
+  wrong values. The served payload is still not overwritten because the earlier unrelated
+  dirty-tree changes remain unattributed.
+
+This phase fixes the fake-zero presentation as well: the detail panel is strict by default.
+Missing filing evidence remains blank; zero substitution happens only after the user explicitly
+selects the disclosed assumption mode. For J&J, NOPAT and NOPAT ROIC become meaningful once the
+new engine snapshot is exported. RONTA and lease-neutral RONTA correctly remain absent because
+their exact-date investment and lease inputs are not complete.
+
+## Fiscal-calendar follow-up — engine 141
+
+The historical-period sweep found two real losses introduced by the broader engine-140 calendar
+normalization. Dycom changed from a July year-end to a January year-end through a six-month
+transition period. Its audited reports identify July 29, 2017 as FY2017, the January 27, 2018
+period as the transition, and January 26, 2019 through January 29, 2022 as FY2019 through FY2022.
+Company Facts retains stale `fy` labels on the first post-transition accessions, which shifted
+the January regime backward and removed FY2022 from selected history. Engine 141 pins that one
+verified CIK/calendar boundary; it preserves FY2017, deliberately does not invent a comparable
+FY2018, and restores FY2019–FY2022.
+
+RBC Bearings' amended FY2022 10-K states that the fiscal year ended April 2, 2022. The same XBRL
+accession contains three contradictory duplicate revenue/gross-profit contexts ending April 30.
+Choosing the latest date erased the filing's net income, EPS, weighted shares, operating income
+and operating cash flow. Engine 141 pins the audited April 2 end for that exact accession and
+rejects only its conflicting sibling contexts. The selected values agree with the published
+statement: revenue `$942.937m`, gross profit `$357.068m`, operating income `$121.094m`, net income
+`$54.710m`, diluted EPS `$1.56`, and operating cash flow `$180.293m`. Later comparative filings
+round some of those values but do not change their meaning.
+
+Broad calendar heuristics were tested and rejected because they changed valid predecessor,
+merger, bankruptcy and short-transition histories. The final engine-140/141 isolation changes
+exactly two companies: **24 exported fields for DY and 7 for RBC**, with no third-company delta.
+
+Validation for this follow-up:
+
+- Focused normalization tests: **98 passed**.
+- Full Python suite: **570 passed** (one Starlette deprecation warning).
+- Web suite: **84 passed**.
+- Full-universe regression: **6,586 companies**, with **12,938 cumulative changes** against the
+  preserved engine-131 payload and criteria changes in 30 companies. These are accumulated dirty-
+  tree changes, not an engine-141 release delta; DY and RBC are the only newly isolated rows.
+- Fresh DY/RBC UI-shaped rows: **24/24 sourced** and **220/220 derived** audit checks, zero wrong;
+  filing audit **17/17 statement matches**, zero wrong, plus one informational all-capex tag that
+  is not a directly comparable printed total.
+- Broad filing audit against the preserved payload: **278/278 sourced**, **3,099/3,099 derived**,
+  and **376/376 published-statement** comparisons, zero wrong.
+
+The served `dashboard.json` remains the pre-change baseline. It was not overwritten because the
+12,938 cumulative payload differences have not all been attributed independently; engine 141 is
+verified as an isolated fix but the combined dirty tree is not yet release-ready.
+
+## Filing-detail and material-tag follow-up — engine 145
+
+Johnson & Johnson's missing operating-return numerators were first checked against the printed
+2025 annual report, not accepted merely because a Company Facts tag existed.  The statement does
+not publish one operating-income subtotal, but its revenue, cost of products sold, selling and
+administrative expense, separately presented research expense, and restructuring/IPR&D rows form
+the exact operating reconciliation.  Engine output retains every component in provenance.  Its
+NOPAT and cash-excluded NOPAT ROIC are consequently available; RONTA remains blank because the
+filing does not disclose the current/noncurrent operating-lease-liability split needed for an
+exact denominator.
+
+The next material-tag pass found a different defect at The Eastern Company (EML).  Its July 4,
+2026 10-Q balance sheet separately prints **$5,082,816 of trademarks** and **$4,121,143 of patents
+and other intangibles, net**.  The filer uses `IntangibleAssetsNetExcludingGoodwill` for only the
+finite-lived $4,121,143 line, despite the element's nominal roll-up meaning.  The correct
+ex-goodwill intangible balance is therefore **$9,203,959**.  Engine 145 sums the two lines only
+for this verified CIK and only when the nominal total exactly equals the same-period finite-lived
+fact.  A generic version of the rule was rejected: it altered historical tangible-book figures
+for 37 unrelated foreign/canonical filers.  The final v142/v145 isolation changes nine companies
+and 91 leaf fields; all 694 accidental v144/v145 historical-ratio differences restore the v142
+values.
+
+Four other EML extension/standard tags were read against the filing and explicitly kept out of
+unrelated chains.  `IntangibleAssetsCurrent` is the note's gross finite-lived cost, not a current
+asset; `DeferredSalesInducementsAmortizationExpense` is ordinary intangible amortization already
+inside D&A; the closed-block element is misused for the operating-lease liability; and the
+reporting-unit element is misused for total goodwill.  Ten further material tags at CODI, UHAL
+and GCO were likewise classified narrowly as asset composition, insurance/operating detail or
+already-included totals.  Two economically useful tags were admitted as earnings-quality
+disclosures: `OtherNonrecurringIncomeExpense` and `SaleAndLeasebackTransactionGainLossNet`.
+They add warnings at DD, Q, WHR, CE, IP and WFRD without changing reported profit or a Graham
+criterion.
+
+The foreign-cover sweep also found two corporate-action edges.  Toyota's 2026 20-F was indexed
+before Company Facts carried its full statements.  Cover refresh selected the older statement
+accession, so the current one-ADS-to-ten-shares ratio could never reach a fallback snapshot.  The
+cover job now prefers the pending annual accession and includes otherwise-usable snapshots with
+a pending filing; Toyota keeps the last complete financial statements, receives the explicit
+pending warning, and uses the current filing-backed ratio of 10.  YFOR is a separate unresolved
+case: its Nasdaq symbol changed from YYGH on September 2, 2026, after its latest 20-F.  The annual
+cover still says YYGH while the current metadata and quote use YFOR.  The strict exact-symbol
+identity gate therefore excludes it from the candidate instead of silently joining a current
+price to an old symbol.  Supporting a post-annual ticker rename requires explicit corporate-
+action continuity evidence and remains a tracked next fix; the gate was not weakened merely to
+restore the row.
+
+Validation for this follow-up:
+
+- Focused normalization, coverage and sync tests: **210 passed**.
+- Full Python suite: **576 passed** (one Starlette deprecation warning).
+- Web suite: **84 passed**.
+- Candidate payload audit: **6,585 companies**, no duplicate/impossible/non-finite figures; all
+  **58/58** sampled companies have zero unexplained material tags.
+- Standard filing audit: **278/278 sourced**, **3,138/3,138 arithmetic**, and **378/378 printed-
+  statement** matches, zero wrong; 66 lines were not printed as one comparable concept and one
+  payload-only item is not independently checkable.
+- Targeted EML/UHAL/TM/CODI/WFRD/GCO/JNJ/DD/Q/WHR/CE/IP audit: **148/148 sourced**,
+  **1,639/1,639 arithmetic**, and **233/233 printed-statement** matches, zero wrong; 20 lines were
+  not printed as one comparable concept and none were unchecked.
+- Full-universe regression against the preserved engine-131 UI payload reports **14,082 cumulative
+  field changes across 6,586 baseline companies**; 6,585 candidate rows recompute.  That is the
+  accumulated dirty-tree delta, not an engine-145 delta.  Since it is not yet fully attributed,
+  the served `api/screener/static/dashboard.json` remains untouched and this combined branch is
+  not release-ready.
+
+## Intangible-rollup and stale-balance follow-up — engines 146–147
+
+The next balance-sheet pass found two opposite XBRL presentation cases. OPKO Health's June 30,
+2026 balance sheet separately prints **$477.566m** of amortising intangible assets and **$195m**
+of in-process research and development. Its note states total intangible assets other than
+goodwill of **$672.6m**. The nominal ex-goodwill total element carries only the amortising row,
+while the nominal indefinite-lived element carries the rounded complete note total. Engine 146
+uses that larger total only for OPK's verified CIK. American Vanguard is the negative control:
+its balance sheet prints net intangibles of **$133.185m**, while its **$314.580m** indefinite-
+lived element is gross cost and must not replace or be added to the net total.
+
+BioMarin proves why no market-wide addition rule is safe. Its June 2026 balance sheet prints net
+intangibles of **$4,879.367m**. The note reconciles finite-lived gross cost of **$5,173.642m** plus
+**$300m** indefinite-lived assets less **$594.275m** accumulated amortisation to that exact net
+amount. The filer uses both `IntangibleAssetsNetExcludingGoodwill` and
+`FiniteLivedIntangibleAssetsNet` for the final total; adding the separately tagged $300m would
+double count it. BMRN is now a permanent pinned refusal test and engine 147 leaves every one of
+its exported fields unchanged.
+
+Bruker's June 30, 2026 report exposed two stale-tag defects. The nominal intangible total stopped
+at the December 2025 value of **$899.6m**, while the current note prints net intangibles of
+**$867.8m**. Its nominal `Liabilities` total also stopped at the December value of **$3,731.1m**.
+The current balance sheet instead prints current liabilities of **$1,204.7m**, long-term debt of
+**$1,814.7m**, and other long-term liabilities of **$597.7m**: exactly **$3,617.1m**. Together
+with **$2,400.2m** equity including NCI and **$35.6m** redeemable NCI, those rows reconcile to the
+printed **$6,052.9m** assets. Engine 147 admits this exhaustive three-row reconstruction only for
+BRKR, only when every component has one period and accession, and lets the newer finite-lived
+intangible fact replace the abandoned total. It does not infer that arbitrary liability detail
+is exhaustive. The coverage identity check now also fails explicitly when assets and liabilities
+come from different balance-sheet dates instead of performing invalid cross-period arithmetic.
+
+The material-tag sweep added the 2025-taxonomy successor `OtherNonrecurringExpense` to the
+earnings-quality chain. Bruker dual-tags one **$39.4m** "Other charges, net" rollup under both the
+old and new elements; equal amounts are de-duplicated into one warning. Solstice's current
+**$47m** is filed transaction-related cost and correctly reduces pre-tax income. UNFI files
+**-$18m** because current cybersecurity insurance recoveries exceeded the related costs; its
+report's pre-tax bridge independently shows the $18m benefit, so the warning correctly says it
+added to income. The earlier engine-146 tag additions similarly disclose Advanced Energy's
+**$31.8m** and Ormat's **$34.413m** induced-debt-conversion charges. OPK's historical **$32.647m**
+charge remains outside the current trailing window and correctly produces no current warning.
+
+The exact engine-145/146 payload comparison changed 16 leaves across OPK, AEIS and ORA. The exact
+engine-146/147 comparison changed **29 leaves across three companies**: BRKR's two corrected
+balances, provenance and dependent book/asset-quality figures, plus one earnings-quality list at
+UNFI and SOLS. No Graham criterion or verdict moved in the isolated engine-147 step.
+
+Validation for this follow-up:
+
+- Full Python suite: **582 passed** (one Starlette deprecation warning); web suite: **84 passed**.
+- Candidate coverage: all **6,585** payload rows pass structural checks and all **62/62** sampled
+  companies have zero unexplained material tags or identity failures.
+- Standard audit: **278/278 sourced**, **3,138/3,138 arithmetic**, and **378/378 published-
+  statement** comparisons, zero wrong; 66 cells are not printed as one comparable subtotal and
+  one payload-only item cannot be independently checked.
+- Targeted BRKR/BMRN/UNFI/SOLS audit: **55/55 sourced**, **574/574 arithmetic**, and **85/85
+  published-statement** comparisons, zero wrong; five constructed values are not printed as one
+  directly comparable cell. The preceding AVD/OPK/AEIS/ORA run was **53/53**, **667/667**, and
+  **89/89**, respectively, also with zero wrong.
+- Full regression against the preserved engine-131 UI payload reports **14,122 cumulative field
+  changes across 6,586 baseline companies**; 6,585 candidate rows recompute. The isolated
+  engine-147 change is the 29-leaf set above, but the cumulative dirty-tree delta is not fully
+  attributed. The served `api/screener/static/dashboard.json` therefore remains untouched and
+this combined branch is still not release-ready.
+
+## Cross-period balance-sheet follow-up — engines 149–150
+
+A full scan of the UI payload found **42 companies** whose displayed total assets and total
+liabilities came from different balance-sheet dates. The first attempted general repair
+(engine 148) deliberately did not advance: it replaced same-date equity-identity derivations
+with classified liability subtotals for 401 companies and changed 28 Graham criteria. Some of
+those decompositions were economically better, but others moved amounts such as redeemable or
+temporary equity between liabilities and senior claims. That 2,104-leaf radius was too broad to
+attribute safely in this gradual audit. Advancing `Assets` independently to a newer
+`LiabilitiesAndStockholdersEquity` fact also created new mixed-period pairs, so that part was
+reverted rather than shipping a locally plausible but globally unsafe heuristic.
+
+Engine 149 keeps the existing derivation when a filer has no direct liabilities total and uses
+the standard `LiabilitiesCurrent + LiabilitiesNoncurrent` construction only when both exact,
+same-accession subtotals are newer than an abandoned direct `Liabilities` fact. This fixes five
+filers and no others: **DPZ, CMRE, ICCM, ONEG and EROK**. Domino's June 14, 2026 statement is the
+large US control: current liabilities of **$588.670m** plus long-term liabilities of
+**$5,157.083m** equal **$5,745.753m**. With assets of **$1,763.322m**, the resulting
+**-$3,982.431m** stockholders' deficit is exactly the balance-sheet line. The isolated
+engine-147/149 payload diff is **66 leaves across those five companies**: five liability totals
+and their source records plus dependent common equity, BVPS/TBVPS/NCAVPS, asset-quality and
+profitability values. No Graham criterion or verdict changed. The global mixed-period count
+fell from 42 to 37 with no new mismatch.
+
+J.B. Hunt does not file the standard noncurrent subtotal, so it remains outside the generic
+rule. Its June 30, 2026 balance sheet instead prints five exhaustive rows: current liabilities
+**$1,444.663m**, long-term debt **$1,145.337m**, self-insurance reserves **$487.457m**, other
+long-term liabilities **$298.697m**, and deferred income taxes **$911.509m**. Their sum is
+**$4,287.663m**, exactly equal to assets of **$7,944.778m** less stockholders' equity of
+**$3,657.115m**. Engine 150 admits those rows only for JBHT's verified CIK and only when all five
+share one accession and period. The engine-149/150 diff is **20 leaves in JBHT alone**; its
+no-price criteria and verdict do not change. Against the priced served baseline, the serialized
+criteria list is one additional explained leaf because the corrected book value changes the
+numeric valuation input. The mixed-period count falls once more, from 37 to **36**.
+
+Pinning JBHT in the material-tag harness also exposed three previously unclassified operating-
+expense details: direct communications/utilities, operating taxes/licenses and operating
+insurance/claims. They are separately printed components already included in reported operating
+income; adding them to another chain would double count costs. The coverage registry now states
+that reason explicitly instead of silently ignoring the tags.
+
+Validation for this follow-up:
+
+- Exact candidate comparisons: engine 147 to 149 changes **5 companies / 66 leaves**; engine 149
+  to 150 changes **1 company / 20 leaves**. The final candidate contains **6,585 companies**.
+- Full Python suite: **584 passed** (one Starlette deprecation warning); web suite: **84 passed**.
+- Candidate coverage: all 6,585 rows pass structural checks and all **64/64** sampled companies
+  have zero unexplained material tags or identity failures.
+- Targeted DPZ/CMRE/ICCM/ONEG/EROK filing audit: **55/55 sourced**, **269/269 arithmetic**, and
+  **85/85 published-statement** comparisons, zero wrong. Targeted JBHT: **12/12 sourced**,
+  **162/162 arithmetic**, and **20/20 published-statement** comparisons, zero wrong.
+- Standard audit: **278/278 sourced** and **3,138/3,138 arithmetic**, zero wrong. Filing audit:
+  **378/378 published-statement** comparisons, zero wrong; 66 values are not printed as one
+  comparable subtotal and one share-class item is not independently checkable from the payload.
+- Full regression against the preserved engine-131 UI payload reports **14,209 cumulative field
+  changes across 6,586 baseline companies**. That is the accumulated dirty-tree delta, not an
+  engine-150 release delta. Because those older changes remain only partly attributed, the
+  served `api/screener/static/dashboard.json` remains untouched and the combined branch is not
+  yet release-ready.
+
+Engine 151 adds one further market-wide rule, but only under an exact accounting identity that
+cannot confuse parent equity with consolidated equity. A newer liability total replaces a stale
+direct fact only when `Assets`, `LiabilitiesAndStockholdersEquity`, and equity **including NCI**
+all have the same period and accession, the two asset totals are exactly equal, and the identity
+date matches the selected balance-sheet date. Parent-only equity and mixed-accession facts are
+explicit negative tests. This changes exactly **35 leaves across RDAR, MHUAF and SHGI**. Their
+derived liabilities are respectively **$4,315,427**, **$18,251,143**, and **$0**; each is the
+exact difference between the two same-filing totals. The global mixed-period count falls from 36
+to **33**, with no new mismatch and no isolated criterion or verdict change.
+
+The targeted RDAR/MHUAF/SHGI filing audit reports **20/20 sourced**, **120/120 arithmetic**, and
+**31/31 published-statement** comparisons, zero wrong. All three are now pinned in coverage,
+which passes **67/67** companies. The final engine-151 gates are **586 Python tests**, **84 web
+tests**, **278/278** standard source checks, **3,138/3,138** arithmetic checks, and **378/378**
+published-statement comparisons, all with zero wrong. Full regression against engine 131 is
+**14,244 cumulative fields across 6,586 baseline companies**. The served payload remains the
+preserved baseline.
+
+## Cross-period isolation and auditor follow-up — engine 156
+
+The remaining balance-sheet scan found **33 companies** whose selected total assets and total
+liabilities still came from different dates after every exact reconstruction path had run. The
+lags ranged from 91 days to more than eleven years. Combining those values created fictitious
+common equity and therefore fictitious BVPS, NCAVPS, tangible-book and return denominators. BCS
+was the clearest large case: 2021 assets minus 2025 liabilities displayed a false **-£82.081bn**
+of current common equity.
+
+Engine 156 keeps the original facts for independent history, scale checks and disclosure
+materiality, but withholds the older side from the current snapshot whenever the two selected
+total dates disagree. The missing side is not zero and the UI criterion note now names it as
+missing. Bank/REIT applicability is captured before the withholding step, so hiding one stale
+total cannot accidentally convert a not-applicable liquidity test into an ordinary missing-data
+test. No generic parent-equity subtraction was added: for many of these filings that would omit
+NCI, mezzanine equity or other senior claims and merely replace a visible absence with a plausible
+but false liability total.
+
+Statement history now chooses its XBRL namespace from any surviving core balance-sheet fact, not
+only total assets. That preserves BCS's legitimate IFRS history after its stale asset total is
+withheld and also restores filing-backed history for **WPP, RTO, MNY, HDL and DGNX**. Those five
+rows account for 233 isolated UI leaves. Their independent audit reports **37/37 sourced**,
+**221/221 arithmetic**, and **41/41 published-statement** matches, zero wrong; 28 additional
+statement lines are not printed as one directly comparable concept.
+
+The filing auditor itself exposed and fixed one false alarm while checking AHII. FY2012 gross
+profit of **$16.375m** is printed in the 2012 report as $54.396m sales less $38.021m cost of goods,
+but the auditor had compared it with the FY2012 comparative column in a newer accession. It now
+opens the exact annual accession that supplied each older serialized year before declaring a
+statement mismatch. The audit CLI also accepts an explicit candidate payload, allowing the exact
+UI export to be checked without replacing the served baseline. The full regression harness now
+keeps only sixteen derivations in flight on four workers; this removes the Windows submission
+stall caused by queuing all 6,585 jobs before consuming the first result.
+
+The auditor can now sweep the complete payload rather than only the standard spread or a random
+sample. Its first full run left 88 explicitly uncheckable share counts, all sourced from a
+share-class dimension that Company Facts omits. The values were present in the independently
+cached SEC Financial Statement Data Set sidecars. The auditor now merges those raw observations
+for verification and requires exact accession, period, unit **and dimension** equality; a Class A
+observation cannot substantiate the displayed Class B count. The second full run closes all 88
+without weakening the check.
+
+Validation for this follow-up:
+
+- The engine-156 candidate contains **6,585 companies** and the full balance-period scan reports
+  **zero** remaining mixed-date asset/liability pairs.
+- The engine-151/156 full regression completes all **6,585/6,585** rows and reports 1,163 leaves.
+  Of these, **581** are explained engine changes across 38 companies: 348 leaves in the 33
+  cross-period rows and 233 in the five restored namespace histories. The other 582 are refreshed
+  historical price/FX-derived fields; 22 of them are split-adjusted GTBP/BRTX history inside the
+  33-company subset. No criterion status or verdict changes in this isolated engine step.
+- Targeted cross-period audit: **195/195 sourced**, **533/533 arithmetic**, and **254/254
+  published-statement** comparisons, zero wrong; 52 values are not separately printed.
+- Candidate coverage passes all structural checks; **139/140** sampled companies have no
+  unexplained material tag, with the remaining item covered by the registry's known-identity
+  controls. Standard candidate audit is **278/278 sourced**, **3,168/3,168 arithmetic**, and
+  **378/378 published-statement** comparisons, zero wrong; 66 statement values are not separately
+  printed and one payload-only item cannot be independently checked.
+- Full local candidate audit across all 6,585 companies is **61,367/61,367 sourced** and
+  **511,837/511,837 arithmetic**, with zero wrong, zero superseded-date components and zero
+  uncheckable values. Published-statement rendering remains the narrower targeted/network gate
+  reported above rather than a claim that 6,585 HTML reports were downloaded.
+- Final suites are **593 Python tests** and **84 web tests**, all passing. The only Python warning
+  is Starlette's existing `httpx` deprecation notice.
+- Full cumulative regression against the preserved engine-131 UI payload completes 6,585 current
+  rows from 6,586 baseline companies and reports **15,124** changed fields. YFOR is the one omitted
+  row under the already-documented strict ticker-continuity gate. The only cumulative defensive
+  verdict change is the previously audited EML fiscal-calendar/history repair.
+
+The exact candidate is retained outside the served path as
+`tmp/pdfs/jnj-2025-audit/dashboard-engine-156-candidate.json`. The served
+`api/screener/static/dashboard.json` remains the engine-131 baseline; the cumulative dirty-tree
+change set is verified by the gates above but has not been published implicitly.
+
+## Reviewed presentation-scale contradictions — engine 157
+
+The next historical scale sweep found one filing-backed corruption in **Golden Sun Health
+Technology Group (GSUN)**. Its 2023 annual filing, accession
+`0001213900-24-011180`, prints FY2022 revenue **$10,814,656**, gross profit **$4,811,398**,
+operating loss **$1,540,421**, and attributable net loss **$2,139,320**. The following annual
+filing, accession `0001213900-25-013985`, repeats those exact visible digits but labels its
+statement `$ in Thousands`; its machine facts consequently make every repeated amount exactly
+1,000 times larger. The contradiction also reaches cash-flow and balance-sheet comparisons:
+FY2022 operating cash flow is **$910,251**, capital expenditure **$174,074**, and depreciation
+and amortisation **$169,808**, while FY2023 common equity is **$4,427,990** and liabilities are
+**$15,071,828**. The corrected values reconcile to both earlier exact annual reports and the
+published statement arithmetic.
+
+Engine 157 reconciles duration and instant monetary histories only after an exact 1,000x or
+1,000,000x contradiction has been independently proved. The general repair is then gated by a
+reviewed-accession registry: neighbouring years alone are not treated as proof. This is important
+for **IOR**, whose older filings alternate between apparently scaled and unscaled observations;
+the negative-control test requires that ambiguous history to remain untouched. Corrected facts
+retain their original accession, form, period and component provenance. The same guard covers the
+UI's **+/− Working-capital cash effect**, both when it comes from a direct rollup and when it is
+assembled from components; missing evidence still remains missing rather than becoming zero.
+
+The sweep also exposed a regression-harness defect rather than an extractor defect. Rebuilding a
+foreign filer during comparison omitted its stored historical FX closes, falsely removing annual
+price and valuation fields. The harness now reuses the export path's statement currency and exact
+stored USD/counter-currency history. A focused UL/BCS/SONY/HMC control leaves those histories
+unchanged, so foreign-price noise cannot hide accounting changes.
+
+Validation for this follow-up:
+
+- The exact engine-156/157 full-universe comparison completes **6,585/6,585** current rows and
+  changes **62 leaves**. Numeric and provenance changes are confined to GSUN; SODI and COHR have
+  wording-only caveat changes. No Graham criterion or verdict changes.
+- GSUN's independent published-filing audit is **13/13 sourced**, **88/88 arithmetic**, and
+  **25/25 published-statement** comparisons, zero wrong and zero unchecked.
+- Full candidate audit is **61,367/61,367 sourced** and **507,520/507,520 arithmetic**, with zero
+  wrong, zero superseded-date components and zero uncheckable values. The standard network filing
+  gate is **279/279 sourced**, **3,138/3,138 arithmetic**, and **378/378 published-statement**
+  comparisons, zero wrong; 66 constructed or differently presented cells are explicitly marked
+  as not printed as one directly comparable line.
+- Candidate coverage passes all structural checks across **6,585 companies**; all **67/67**
+  sampled companies have zero unexplained material tags.
+- Final suites are **599 Python tests** and **84 web tests**, all passing. The only Python warning
+  is Starlette's existing `httpx` deprecation notice.
+- The cumulative comparison against the preserved engine-131 payload completes successfully and
+  reports **16,147 changed fields across 6,586 baseline companies**. It includes later filings,
+  refreshed market inputs and every prior audited engine change, so it is not used to attribute
+  engine 157; attribution comes from the adjacent 156/157 baseline above.
+
+The exact candidate is retained as
+`tmp/pdfs/jnj-2025-audit/dashboard-engine-157-candidate.json`. The served
+`api/screener/static/dashboard.json` remains the engine-131 baseline and was not overwritten by
+derive, export, coverage or audit commands.
+
+## Filing-specific working-capital expansion — engine 158
+
+The first measured sweep of the UI's **+/− Working-capital cash effect** found that 3,989
+companies have a current annual operating-cash-flow bridge, but only 69 have a separately proved
+current working-capital effect; across history the counts are 684 of 31,524 annual OCF rows. The
+missing cells are honest absences, not zeroes. A raw Company Facts scan found 27 current filings
+with all five commonly used standard components, but 26 also carry additional contract, tax,
+lease or other `IncreaseDecreaseIn...` facts. The Ennis negative control proves why the common
+five cannot be summed generically: its rendered statement contains an issuer-extension row that
+Company Facts omits.
+
+**Applied Materials (AMAT)** is the next filing-verified exception. Its 2025 10-K, accession
+`0001628280-25-056742`, prints seven working-capital rows: receivables, inventory, other assets,
+payables/accruals, contract liabilities, taxes payable and other liabilities. They sum to cash
+effects of **+$775m in FY2023**, **+$1,117m in FY2024**, and **-$200m in FY2025**. The same
+statement separately prints deferred tax among non-cash adjustments; that **-$639m** FY2025 fact
+is explicitly permitted in the context but excluded from the working-capital family.
+
+The verified-context registry now carries each filing's exact component weights and explicitly
+classified non-working-capital tags. Every included component must still share the configured
+accession, form, start and end, and any unreviewed same-context `IncreaseDecreaseIn...` tag blocks
+the reconstruction. This allows different filers to have different complete statement families
+without turning a visual naming pattern into an accounting assumption.
+
+Validation for this follow-up:
+
+- The exact engine-157/158 full-universe regression completes **6,585/6,585** rows and changes
+  exactly **20 leaves in AMAT alone**. They are the three working-capital bridges, per-share and
+  three-year/current displays, provenance, and the corresponding residual reclassification.
+  Operating cash flow, free cash flow, criteria and verdict do not change.
+- AMAT's independent audit is **13/13 sourced**, **209/209 arithmetic**, and **24/24
+  published-statement** comparisons, with zero wrong, zero unprinted and zero unchecked.
+- Full candidate audit remains **61,367/61,367 sourced** and **507,520/507,520 arithmetic**, zero
+  wrong and zero unchecked. The standard filing gate remains **279/279**, **3,138/3,138**, and
+  **378/378**, respectively, with zero wrong.
+- Candidate coverage passes all **6,585** rows and all **67/67** sampled companies. Final suites
+  are **600 Python tests** and **84 web tests**, all passing apart from the existing Starlette
+  deprecation warning.
+
+The engine-158 candidate is retained as
+`tmp/pdfs/jnj-2025-audit/dashboard-engine-158-candidate.json`; the served engine-131 payload was
+again left untouched.
+
+## Published-statement working-capital sweep — engine 159
+
+The next pass reviewed every current Company Facts context that exposed the common five
+working-capital components plus additional `IncreaseDecreaseIn...` concepts. Twelve further
+filings have complete standard-tag families that can be reconstructed without an issuer-
+extension guess: **RIVN, USLM, SONO, KVUE, MTZ, BYD, FIX, TGLS, PTON, BARK, OMQS and FTAI**.
+Each exception is pinned to one CIK, one accession and its explicitly reviewed fiscal years;
+the family records whether each extra row is an asset or liability movement and separately
+permits any same-accession non-cash adjustment that must not enter working capital.
+
+The rendered statements were read row by row before admission. The resulting cash effects are:
+
+- RIVN: **-$1,414m, +$1,167m, +$1,440m** for FY2023–FY2025.
+- USLM: **-$8.756m, -$10.957m, -$2.603m** for FY2023–FY2025.
+- SONO: **-$38.936m, +$102.779m, +$27.936m** for FY2023–FY2025.
+- KVUE: **+$797m, -$571m, +$52m** for FY2023–FY2025.
+- MTZ: **+$276.332m, +$441.125m, -$409.554m** for FY2023–FY2025.
+- BYD: **-$126.527m, -$100.221m, +$350.064m** for FY2023–FY2025.
+- FIX: **+$73.471m, +$107.401m, -$67.667m** for FY2023–FY2025.
+- TGLS: **-$48.278m, -$24.167m, -$42.375m** for FY2023–FY2025.
+- PTON: **-$14.0m, +$27.3m, -$35.5m** for FY2024–FY2026.
+- BARK: **+$12.549m, -$11.051m, -$14.411m** for FY2024–FY2026.
+- OMQS: **+$9.944m and +$6.285m** for FY2024–FY2025.
+- FTAI: **-$75.928m, -$254.423m, -$702.498m** for FY2023–FY2025.
+
+The sign review caught two easy-to-miss cases before they reached the payload: TGLS's commodity-
+contract line is an asset movement, and OMQS's deferred-income-tax line is a working-capital
+asset in that statement. BYD's similarly named deferred-tax line is instead printed in its
+non-cash section and is therefore permitted but excluded. This is why names alone do not drive
+the generic extractor.
+
+Thirteen apparent candidates deliberately remain blank: **TMUS, ALCO, AES, WAT, FSLR, MELI,
+CALY, NRGV, PRPH, MPAA, FBIO, EBF and DYNR**. Their statements contain lease, prepaid, tax,
+government-grant, funds-payable or issuer-extension rows that the available standard Company
+Facts family does not completely represent. Showing a partial sum would be more misleading than
+the UI dash. Coverage rises from **67 to 79 current companies** and from **687 to 722 historical
+annual rows**, out of **31,524** annual OCF rows; every other missing value remains missing, never
+zero.
+
+Validation for this follow-up:
+
+- The exact engine-158/159 full-universe regression recomputes and compares **6,585/6,585** rows
+  and reports exactly **235 leaves across the twelve reviewed companies**. Every change is the
+  working-capital bridge, its current/three-year/per-share presentation, provenance or the equal-
+  and-opposite residual reclassification. Operating cash flow, FCF, Owner Earnings, Graham
+  criteria and verdicts do not change.
+- Targeted filing audit is **154/154 sourced**, **1,564/1,564 arithmetic**, and **259/259
+  published-statement** comparisons, zero wrong. Seven unrelated constructed or differently
+  captioned figures are explicitly reported as not printed as one directly comparable line.
+- Full candidate audit is **61,367/61,367 sourced** and **507,520/507,520 arithmetic**, zero
+  wrong, zero superseded-date components and zero uncheckable values.
+- Candidate coverage passes structural checks across all **6,585 companies** and all **67/67**
+  stratified companies have zero unexplained material tags. Final suites are **612 Python tests**
+  and **84 web tests**, all passing apart from the existing Starlette deprecation warning.
+
+The engine-159 candidate is retained as
+`tmp/pdfs/jnj-2025-audit/dashboard-engine-159-candidate.json`; the served engine-131 payload was
+again left untouched.
+
+## Historical scale, period and statement sweep — engines 160–171
+
+The next staged sweep followed the values shown in Company Details backwards from the UI to
+their annual XBRL observations and then, for suspicious cases, to the primary statement a person
+reads.  Engines 160 and 162 added filing-specific reconciliation for exact historical monetary-
+flow and weighted-share scale contradictions.  Engines 165–168 then removed an unsafe generic
+EPS sign inference and admitted only statement-verified sign, share, EPS and monetary scale
+exceptions.  The rules remain deliberately narrow: a value is never multiplied, divided, sign-
+flipped or treated as a split merely because a neighbouring year looks more plausible.
+
+The final scale scan still reports eight visually isolated tiny values: **CATO** FY2022 net
+income $29,000, **SPXC** $200,000, **AOXY** $9, **PURE** $4,000, **UEC** gross profit $37,000,
+**RBCN** $40,000, **SHIP** FY2010 split-adjusted EPS $15 and **CWK** net income $200,000.  Each
+was checked against its actual filing and is a real small value, not a thousands/millions defect.
+More importantly, the mechanical cross-check finds **zero** remaining exact 1,000x or 1,000,000x
+contradictions between annual EPS and its share denominator.
+
+Engine 168 contains two further primary-statement corrections.  **APCX** had a filing-specific
+gross/operating presentation scale and sign contradiction; **ZCAR** had an already-restated
+comparative that the generic split path would otherwise restate again.  The exact engine-165/168
+payload comparison contains **391 changed leaves across 6,585 companies**; the changed financial
+histories are the reviewed exceptions and their direct per-share/ratio consumers.
+
+### Fiscal-year alignment and the independent statement reader
+
+Engine 169 fixes a separate class of old-report errors: in a fresh-start or year-end transition,
+several instant facts can share a filed date and fiscal label.  The annual balance-sheet selector
+now prefers the observation anchored to the annual report's own period end rather than whichever
+same-filed candidate happens to appear first.  The audit accepts a predecessor-plus-successor
+income statement only when the two reported periods exactly form the transition year.  **FLYYQ**
+was the filing-backed reproducer.  The adjacent engine-168/169 comparison reports **1,869 changed
+leaves across 304 companies**, all downstream of the corrected annual-period alignment, with no
+verdict or grade changes.
+
+That comparison was followed by a rendered-statement sweep.  Six apparent extraction failures
+were actually defects in the independent auditor, and therefore could have hidden or invented
+future alarms:
+
+- **AZTA** and **DCO** publish quarterly and annual blocks with the same ending date; the auditor
+  had selected the first block instead of accepting the exact annual block.
+- **GWLL** repeats an annual block, which must not be interpreted as a different value.
+- **CCI** reserves an entirely blank dated scenario column before the populated columns.
+- **FBCD** has an XBRL-linked row with an empty visible caption; dropping that cell shifted every
+  tagged value one column left.
+- **SHFH** has no HTML `thead`; scanning later prose found the statement dates in the opposite
+  order and reversed the year mapping.
+
+The statement parser now reads only leading header rows, preserves empty cell positions, removes
+only columns proved empty across the whole table and keeps all same-date annual candidates for
+comparison.  A final cash-flow guard also ignores an empty tagged comparative cell instead of
+attempting to convert it to a number.  These are audit-only changes; they do not reinterpret the
+payload.
+
+### Three confirmed UI data defects — engine 171
+
+After removing those false alarms, three cases remained and were verified in the primary filing:
+
+- **BNET** has no revenue line or revenue activity in its FY2025 statement.  A $62 non-operating
+  interest line tagged `InterestIncomeOperating` had been selected as revenue, producing absurd
+  multi-million-percent margins.  Revenue and every dependent margin are now missing, not zero.
+- **FLZH** prints FY2024 EPS of **-$73.12** in its newer annual report.  The older diluted chain
+  still held pre-reverse-split **-$2.62** and produced **-$65.50** after generic adjustment.  The
+  exact newer basic-only comparative now supersedes that obsolete value.
+- **MBBC** prints EPS of **$0.02** for FY2025 and **-$0.07** for FY2024.  A rounded quarterly move
+  from $0.09 to $0.06 resembled a 1.5-for-1 split, but the report identifies a **1.3728 conversion
+  exchange ratio**, not a stock split.  That exact filing date is excluded from split inference;
+  all affected historical share denominators and per-share owner-earnings fields follow the
+  reported basis again.
+
+A broader proposed engine-170 rule was intentionally rejected by the mandatory full-payload
+gate: it changed 2,154 leaves, 45 criterion payloads and hundreds of unrelated EPS histories.
+Engine 171 replaces it with three exact CIK/accession/year exceptions.  The engine-169/171
+comparison is consequently limited to **165 leaves** whose financial changes belong to BNET,
+FLZH and MBBC and their direct derived fields.  No verdict or grade changes; FLZH and MBBC retain
+their prior criterion statuses, while BNET's unsupported size evidence becomes `INSUFFICIENT`.
+
+### Johnson & Johnson and the requested operating-return fields
+
+The **JNJ FY2025 10-K** was read directly as a report as well as through XBRL.  It prints operating
+income of **$25.287bn**; the UI now carries that exact amount, not zero.  With the aligned three-
+year median tax rate of **15.7068%**, the model produces NOPAT **$21.315bn**, NOPAT ROIC
+**17.4184%**, and the cash-inclusive operating return **14.7323%**.  Its FY2025 operating cash flow
+is **$24.530bn** and the complete printed working-capital bridge is **-$12.718bn**, so operating
+cash flow before working capital is **$37.248bn**.  Those three values reconcile exactly.
+
+RONTA and lease-neutral RONTA remain dashes by design.  The filing exposes an operating-lease ROU
+asset but not an exact-date current operating-lease-liability split for both ends of the average,
+and no exact positive beginning/ending net tangible operating-asset pair can be proved.  Filling
+either return would require silently guessing an economically material denominator, which would
+violate the project's missing-is-not-zero invariant.
+
+Final validation of the engine-171 UI payload:
+
+- Full derivation and export completed for **7,163/7,163** cached snapshots and produced **6,585
+  UI rows**.  Ticker and CIK identities are unique; the served payload and retained candidate are
+  byte-identical with SHA-256
+  `99cddc10691a43d9c369f9bf09abe313ac2c648d52ba1e2fe600441a1939535d`.
+- Independent full-payload audit: **61,366/61,366 sourced values** and **511,863/511,863 derived
+  arithmetic checks**, zero wrong, zero superseded and zero uncheckable.
+- Standard real-filing spread: **279/279 sourced**, **3,168/3,168 arithmetic** and **378/378
+  published-statement** comparisons, zero wrong.  The focused JNJ/defect set is **97/97**,
+  **904/904** and **168/168**, respectively, also zero wrong.
+- The expanded set of all 301 period-alignment-affected companies is **3,023/3,023 sourced**,
+  **24,453/24,453 arithmetic** and **4,561/4,561 published-statement** comparisons, zero wrong.
+  The 373 cells reported as “not printed” are constructed figures or differently presented
+  subtotals and are explicitly excluded rather than counted as passing.
+- Final suites are **647 Python tests** and **84 web tests**, all passing (apart from Starlette's
+  existing `httpx` deprecation warning), and the Vite production bundle builds successfully.
+
+The exact release payload is retained as
+`tmp/pdfs/jnj-2025-audit/dashboard-engine-171-candidate.json` and is also the current
+`api/screener/static/dashboard.json` consumed by the UI.

@@ -40,3 +40,44 @@ def test_unset_token_leaves_localhost_open(monkeypatch):
     c = TestClient(api.app)
     assert c.get("/config").json() == {"write_protected": False}
     assert c.post("/sync", json={"command": "nope"}).status_code == 409   # not 401
+
+
+def test_assumption_detail_failure_returns_strict_row_not_http_500(monkeypatch):
+    base = {"ticker": "TEST", "cik": "0000000001", "annual_ratios": {}}
+
+    class Connection:
+        def close(self):
+            pass
+
+    class BrokenLoader:
+        def load(self, cik, ticker):
+            raise RuntimeError("cached filing bundle is unavailable")
+
+    monkeypatch.setattr(api, "_dashboard_payload", lambda: {"rows": [base]})
+    monkeypatch.setattr(api.store, "connect", Connection)
+    monkeypatch.setattr(api.evidence, "EvidenceLoader", lambda conn, edgar: BrokenLoader())
+
+    response = TestClient(api.app).get(
+        "/company/TEST/dashboard?assume_absent_zero=true")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ticker"] == "TEST"
+    assert payload["assumption_mode"]["status"] == "UNAVAILABLE"
+    assert "cached filing bundle is unavailable" in payload["assumption_mode"]["note"]
+
+
+def test_ratio_gap_overlay_uses_zero_or_not_measurable_without_dashes():
+    row = {"annual_ratios": {2025: {"net_margin": 12.5}}}
+
+    details = api._fill_assumed_ratio_gaps(row)
+    cell = row["annual_ratios"][2025]
+
+    assert cell["net_margin"] == 12.5
+    assert cell["revenue"] == 0
+    assert cell["award_pct"] == 0
+    assert "pe_undefined" in cell
+    assert "current_ratio_undefined" in cell
+    assert not any(value is None for value in cell.values())
+    assert any(item["field"] == "revenue" and item["fiscal_year"] == 2025
+               for item in details)

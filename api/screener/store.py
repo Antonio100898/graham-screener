@@ -17,7 +17,7 @@ from .sources import cover
 
 # Bump when normalisation changes meaning; snapshots below this are recomputed
 # from stored raw facts, with no refetching.
-ENGINE_VERSION = 114  # carry the selected share class into historical ratios
+ENGINE_VERSION = 171  # statement-verified EPS/revenue exceptions
 
 DEFAULT_DB = Path.home() / ".cache" / "graham-screener" / "screener.db"
 _WRITE_ATTEMPTS = 5   # a recompute must not fail because the site was being read
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS company (
     first_filed   TEXT,   -- the company's first-ever SEC filing date; gates windowed tests
     events_from   TEXT,   -- oldest filing the event scan could see; the window it may claim
     incorporation TEXT,   -- SEC's state-or-country code; a digit in it means non-US
-    listed        TEXT    -- 'y' while SEC's ticker file still assigns this symbol here
+    listed        TEXT    -- 'y' from SEC, or 'external' for an explicitly imported primary listing
 );
 CREATE INDEX IF NOT EXISTS company_ticker ON company(ticker);
 CREATE INDEX IF NOT EXISTS company_industry ON company(industry);
@@ -158,6 +158,20 @@ CREATE TABLE IF NOT EXISTS security_cover (
     PRIMARY KEY (cik, symbol)
 );
 
+-- One rate series is shared by every filer reporting in the same currency.
+-- `base=USD, counter=JPY` means JPY per USD; fixing that direction in storage
+-- prevents an accidental inversion from changing every valuation in a country.
+CREATE TABLE IF NOT EXISTS fx_history (
+    base        TEXT NOT NULL,
+    counter     TEXT NOT NULL,
+    fetched_at  TEXT NOT NULL,
+    rate_asof   TEXT NOT NULL,
+    rate        TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    series      TEXT NOT NULL,
+    PRIMARY KEY (base, counter)
+);
+
 -- Evidence can change without engine code changing: a newly parsed cover or a
 -- newly published DERA quarter may settle a previously unknown share basis.
 CREATE TABLE IF NOT EXISTS snapshot_dirty (
@@ -187,7 +201,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 REQUIRED_TABLES = frozenset({"company", "snapshot", "sync_state", "tracked", "portfolio",
                              "portfolio_trade", "portfolio_asset", "portfolio_cash",
-                             "price_history", "filing_event",
+                             "price_history", "fx_history", "filing_event",
                              "security_cover", "snapshot_dirty", "pending_filing"})
 
 
@@ -475,7 +489,10 @@ def resolve_ticker_conflicts(conn, mapping: dict[str, tuple[str, str]]) -> int:
     # index carries no ticker and no exchange at all; Farmer Brothers filed a Form
     # 15 in May. Both still show a price here, and a price for a security nobody
     # can buy is the one number this screen must never present as ordinary.
-    conn.execute("UPDATE company SET listed = NULL WHERE listed IS NOT NULL")
+    conn.execute(
+        "UPDATE company SET listed = NULL "
+        "WHERE listed IS NOT NULL AND listed <> 'external'"
+    )
     conn.executemany("UPDATE company SET listed = 'y' WHERE cik = ? AND ticker = ?",
                      [(cik, ticker) for cik, (ticker, _) in mapping.items() if ticker])
     return max(freed, 0)
@@ -818,6 +835,45 @@ def price_history_record(conn, cik: str) -> tuple[datetime | None, list[tuple[da
     return fetched, [(date.fromisoformat(d), c) for d, c in json.loads(row["series"])]
 
 
+def set_fx_history(conn, base: str, counter: str, history) -> None:
+    """Persist one provider rate and its weekly history in a fixed direction."""
+    conn.execute(
+        """INSERT INTO fx_history
+               (base, counter, fetched_at, rate_asof, rate, source, series)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(base, counter) DO UPDATE SET
+             fetched_at = excluded.fetched_at,
+             rate_asof = excluded.rate_asof,
+             rate = excluded.rate,
+             source = excluded.source,
+             series = excluded.series""",
+        (base.upper(), counter.upper(), _now(), history.quote.asof.isoformat(),
+         str(history.quote.price), history.quote.source,
+         json.dumps([[day.isoformat(), float(value)]
+                     for day, value in history.closes])),
+    )
+
+
+def fx_history(conn, base: str, counter: str) -> dict | None:
+    row = conn.execute(
+        """SELECT base, counter, fetched_at, rate_asof, rate, source, series
+           FROM fx_history WHERE base = ? AND counter = ?""",
+        (base.upper(), counter.upper()),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "base": row["base"],
+        "counter": row["counter"],
+        "fetched_at": row["fetched_at"],
+        "asof": row["rate_asof"],
+        "rate": float(row["rate"]),
+        "source": row["source"],
+        "closes": [(date.fromisoformat(day), value)
+                   for day, value in json.loads(row["series"])],
+    }
+
+
 def stats(conn) -> dict:
     q = lambda sql: conn.execute(sql).fetchone()[0]  # noqa: E731
     all_stale = len(needs_recompute(conn))
@@ -838,6 +894,7 @@ def stats(conn) -> dict:
                OR EXISTS (SELECT 1 FROM pending_filing p WHERE p.cik = company.cik)"""),
         "last_daily_index": get_state(conn, "last_daily_index"),
         "price_histories": q("SELECT COUNT(*) FROM price_history"),
+        "fx_histories": q("SELECT COUNT(*) FROM fx_history"),
         "companies_scanned_for_events": q(
             "SELECT COUNT(*) FROM company WHERE events_from IS NOT NULL"),
         "filing_events": q("SELECT COUNT(*) FROM filing_event"),

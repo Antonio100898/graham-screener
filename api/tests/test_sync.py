@@ -1,4 +1,5 @@
 """Store and price-application tests — no network."""
+from dataclasses import replace
 import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -6,10 +7,12 @@ from decimal import Decimal
 import pytest
 
 from screener import store, sync
-from screener.models import Quote
+from screener.models import PriceHistory, Quote
 from screener.sources.prices import YahooPriceProvider
 from screener.sync import (apply_price, material_events, _restate_historical_ratios,
-                           _validated_price_history)
+                           _statement_source_namespace, _validated_price_history)
+
+from tests.helpers import build
 
 
 def row(ttm=5.0, tbvps=10.0, others="PASS"):
@@ -37,12 +40,81 @@ def test_fractional_receipt_rebases_historical_books_too():
     assert ratios[2025] == pytest.approx({"bvps": 1.6, "tbvps": 1.2, "ncavps": 0.4})
 
 
+def test_statement_namespace_survives_a_withheld_ifrs_asset_total():
+    snap = build()
+    ifrs_liabilities = replace(
+        snap.total_liabilities,
+        provenance=replace(
+            snap.total_liabilities.provenance,
+            tag="ifrs-full:Liabilities",
+        ),
+    )
+    snap = replace(snap, total_assets=None, total_liabilities=ifrs_liabilities)
+
+    assert _statement_source_namespace(snap) == "ifrs-full"
+
+
+def test_export_strip_keeps_operating_returns_but_moves_evidence_to_detail():
+    payload = {"annual_ratios": {2025: {
+        "nopat": 75.0,
+        "ronta": 30.0,
+        "lease_neutral_ronta": 35.0,
+        "operating_return_assumptions": ["intangibles"],
+        "operating_return_caveats": ["disclosed"],
+        "operating_return_evidence": {"operating_income": [["tag"]]},
+    }}}
+
+    sync._strip_detail_only_evidence(payload)
+
+    assert payload["annual_ratios"][2025] == {
+        "nopat": 75.0,
+        "ronta": 30.0,
+        "lease_neutral_ronta": 35.0,
+        "operating_return_assumptions": ["intangibles"],
+        "operating_return_caveats": ["disclosed"],
+    }
+
+
 def test_price_settles_valuation_criteria():
     r = apply_price(row(ttm=5.0, tbvps=10.0), price=40.0)  # P/E 8, P/TBV 4
     c = {x["n"]: x for x in r["criteria"]}
     assert c[1]["status"] == "PASS" and c[1]["value"] == 8.0
     assert c[7]["status"] == "FAIL" and c[7]["value"] == 4.0
     assert r["verdict"] == "FAIL"
+
+
+def test_us_quote_is_converted_to_the_statement_currency_before_valuation():
+    priced = row(ttm=3000.0, tbvps=20000.0)
+    priced.update(
+        reporting_currency="JPY", quote_currency="USD", shares=10,
+        asset_quality={"net_cash": 600000},
+        fx={"base": "USD", "counter": "JPY", "rate": 150,
+            "asof": "2026-09-01", "source": "test-fx"},
+    )
+
+    out = apply_price(priced, price=200.0)
+    criteria = {item["n"]: item for item in out["criteria"]}
+
+    assert out["price_reporting_currency"] == 30000.0
+    assert criteria[1]["value"] == 10.0
+    assert criteria[7]["value"] == 1.5
+    assert out["asset_quality"]["market_cap_to_net_cash"] == 0.5
+
+
+def test_cross_currency_valuation_stays_unknown_without_explicit_fx():
+    priced = row(ttm=3000.0, tbvps=20000.0)
+    priced.update(reporting_currency="JPY", quote_currency="USD")
+    for item in priced["criteria"]:
+        if item["n"] in (1, 7):
+            item["note"] = "missing: price quote"
+
+    out = apply_price(priced, price=200.0)
+    criteria = {item["n"]: item for item in out["criteria"]}
+
+    assert "price_reporting_currency" not in out
+    assert criteria[1]["status"] == "INSUFFICIENT_DATA"
+    assert criteria[1]["note"] == "missing: USD to JPY exchange rate"
+    assert criteria[7]["note"] == "missing: USD to JPY exchange rate"
 
 
 def test_price_adds_market_cap_to_positive_filing_backed_net_cash_only():
@@ -123,6 +195,23 @@ def test_store_roundtrip_and_staleness(tmp_path):
     assert store.needs_recompute(conn) == ["0000000001"]
 
 
+def test_store_roundtrips_a_directional_fx_history(tmp_path):
+    conn = store.connect(tmp_path / "t.db")
+    stamp = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    history = PriceHistory(
+        quote=Quote(Decimal("150.25"), stamp, "test-fx"),
+        closes=((date(2025, 12, 31), Decimal("149.5")),),
+    )
+
+    store.set_fx_history(conn, "usd", "jpy", history)
+    stored = store.fx_history(conn, "USD", "JPY")
+
+    assert stored["base"] == "USD" and stored["counter"] == "JPY"
+    assert stored["rate"] == 150.25
+    assert stored["asof"] == stamp.isoformat()
+    assert stored["closes"] == [(date(2025, 12, 31), 149.5)]
+
+
 def test_pending_filing_keeps_recomputed_last_complete_snapshot_and_retries(tmp_path):
     conn = store.connect(tmp_path / "pending.db")
     store.upsert_company(conn, "0000000001", "TEST", "Test company",
@@ -161,6 +250,9 @@ def test_zero_and_non_usd_provider_quotes_are_missing_not_prices():
     assert YahooPriceProvider._quote_from({
         "meta": {"regularMarketPrice": 10, "regularMarketTime": now, "currency": "USD"}
     }).price == Decimal("10")
+    assert YahooPriceProvider._quote_from({
+        "meta": {"regularMarketPrice": 210, "regularMarketTime": now, "currency": "EUR"}
+    }, expected_currency="EUR").price == Decimal("210")
 
 
 def test_provider_prefers_newer_premarket_bar_and_discloses_market_state():
@@ -272,6 +364,54 @@ def test_provider_carries_declared_split_events_with_the_price_history(monkeypat
     assert history.splits == ((date(2026, 8, 22), Decimal("10")),)
 
 
+def test_provider_reads_usd_to_reporting_currency_in_a_fixed_direction(monkeypatch):
+    stamp = int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp())
+    calls = []
+    provider = YahooPriceProvider()
+
+    def fake_chart(symbol, range_, interval, include_pre_post=False):
+        calls.append((symbol, range_, interval, include_pre_post))
+        return {
+            "meta": {"regularMarketPrice": 150, "regularMarketTime": stamp,
+                     "currency": "JPY"},
+            "timestamp": [stamp],
+            "indicators": {"quote": [{"close": [149.5]}]},
+        }
+
+    monkeypatch.setattr(provider, "_chart", fake_chart)
+    history = provider.exchange_rate_history("USD", "JPY")
+    provider.close()
+
+    assert calls == [("USDJPY=X", "10y", "1wk", False)]
+    assert history.quote.price == Decimal("150")
+    assert history.quote.source == "yahoo-fx:USDJPY=X"
+    assert history.closes == ((date(2026, 9, 1), Decimal("149.5")),)
+
+
+def test_historical_multiples_use_the_exchange_rate_at_each_fiscal_end():
+    priced = {
+        "reporting_currency": "JPY", "quote_currency": "USD",
+        "ttm_eps_vintage": {"2025-12-31": 300.0},
+        "annual_ratios": {2025: {
+            "end": "2025-12-31", "bvps": 2000.0,
+            "tbvps": 1800.0, "ncavps": 1000.0,
+        }},
+    }
+
+    sync._price_the_ratio_history(
+        priced,
+        [(date(2025, 12, 20), 20.0)],
+        [(date(2025, 12, 19), 150.0)],
+    )
+
+    cell = priced["annual_ratios"][2025]
+    assert cell["quote_price"] == 20.0
+    assert cell["fx_rate"] == 150.0
+    assert cell["price"] == 3000.0
+    assert cell["pe"] == 10.0
+    assert cell["pb"] == 1.5
+
+
 def test_history_requests_extended_bars_only_for_intraday_quote(monkeypatch):
     stamp = int(datetime(2026, 8, 28, tzinfo=timezone.utc).timestamp())
     calls = []
@@ -340,7 +480,7 @@ def test_quote_only_export_updates_all_rows_and_retains_a_dated_quote_on_failure
     monkeypatch.setattr(sync, "_price_stats_row", lambda _row, _closes: None)
     monkeypatch.setattr(sync, "_mark_peer_efficiency", lambda _rows: None)
     monkeypatch.setattr(sync.profiles, "enrich", lambda _row: {})
-    monkeypatch.setattr(sync, "_price_the_ratio_history", lambda _row, _closes: None)
+    monkeypatch.setattr(sync, "_price_the_ratio_history", lambda _row, _closes, _fx=(): None)
 
     sync.quotes(Connection(), progress=lambda *_args: None)
 
@@ -755,14 +895,15 @@ def test_price_uses_recurring_dividend_and_discloses_special_inclusive_cash():
     assert "trailing cash was $4.40" in c5["note"]
 
 
-def test_profitability_is_grahams_two_ratios_on_one_fiscal_year():
-    """Chapter 13 compares companies on profit against sales and profit against book
-    value. Both legs must come from the same fiscal year, and the return on book is
-    withheld when the balance sheet is from a different era than the earnings —
-    the defect the audit found in ROIC."""
+def test_profitability_includes_finkles_return_on_net_tangible_assets():
+    """Book and tangible returns share the fiscal-year income and recency guard.
+
+    Missing intangible evidence withholds Finkle's ratio, and a balance sheet from
+    a different era withholds both capital-return measures.
+    """
     from decimal import Decimal
     from datetime import date
-    from screener.sync import _profitability
+    from screener.sync import _debt_to_equity, _profitability
 
     class Snap:
         annual_revenue = {2025: type("F", (), {"value": Decimal("100000000"),
@@ -772,17 +913,42 @@ def test_profitability_is_grahams_two_ratios_on_one_fiscal_year():
             "provenance": type("P", (), {"period_end": date(2025, 12, 31)})()})()}
         annual_operating_income = {2025: type("F", (), {"value": Decimal("18000000"),
                                                         "provenance": None})()}
+        debt_provenance = type("P", (), {"period_end": date(2026, 3, 31)})()
         total_assets = type("F", (), {"value": Decimal("200000000")})()
         total_liabilities = type("F", (), {"value": Decimal("140000000")})()
+        long_term_debt = type("F", (), {"value": Decimal("30000000"),
+                                          "provenance": debt_provenance})()
+        short_term_debt = type("F", (), {"value": Decimal("5000000"),
+                                           "provenance": debt_provenance})()
+        # The rollup is smaller than the complete long + short representation;
+        # debt/equity must use the same conservative reconciliation as criterion 3.
+        total_debt = type("F", (), {"value": Decimal("32000000"),
+                                      "provenance": debt_provenance})()
+        assumed_zero = frozenset()
+        goodwill = type("F", (), {"value": Decimal("10000000")})()
+        intangibles = type("F", (), {"value": Decimal("5000000")})()
         preferred_stock = noncontrolling_interest = temporary_equity = None
         balance_sheet_date = date(2026, 3, 31)
 
-    p = _profitability(Snap())
+    history = {2025: {"gross_margin": 42.5,
+                      "average_common_equity": 50_000_000,
+                      "return_on_equity": 24.0}}
+    p = _profitability(Snap(), history)
     assert p["net"] == 12.0 and p["operating"] == 18.0
+    assert p["gross"] == 42.5
     assert p["on_book"] == 20.0          # 12M on 60M of common equity
+    assert p["on_equity"] == 24.0        # 12M on 50M average common equity
+    assert p["on_net_tangible_assets"] == 26.67  # 12M on 45M after intangibles
+    assert p["net_tangible_assets"] == 45_000_000
+    assert _debt_to_equity(Snap()) == round(35 / 60, 4)
+
+    Snap.intangibles = None
+    assert _profitability(Snap())["on_net_tangible_assets"] is None
+    Snap.intangibles = type("F", (), {"value": Decimal("5000000")})()
 
     Snap.balance_sheet_date = date(2030, 3, 31)   # five years past the earnings
     assert _profitability(Snap())["on_book"] is None
+    assert _profitability(Snap())["on_net_tangible_assets"] is None
 
 
 def test_a_symbol_belongs_to_the_company_sec_names_today(tmp_path):
@@ -802,6 +968,49 @@ def test_a_symbol_belongs_to_the_company_sec_names_today(tmp_path):
     assert [r["cik"] for r in rows] == ["0002081043"]
     # the predecessor keeps everything except the claim to the symbol
     assert conn.execute("SELECT COUNT(*) FROM snapshot WHERE cik = '0001840904'").fetchone()[0] == 1
+
+
+def test_new_ticker_index_prefers_the_cover_verified_common_share_over_a_spac_unit(tmp_path):
+    conn = store.connect(tmp_path / "t.db")
+    store.set_cover(conn, "0002015502", [
+        {"symbol": "LPAA", "title": "Class A Ordinary Shares", "ratio": None},
+        {"symbol": "LPAAU", "title": (
+            "Units, each consisting of one Class A Ordinary Share and one-half "
+            "of one redeemable Warrant"), "ratio": None},
+    ], "cover25")
+
+    class Edgar:
+        def _cached(self, *_args):
+            return {
+                "0": {"cik_str": 2015502, "ticker": "LPAAU", "title": "Launch One"},
+                "1": {"cik_str": 2015502, "ticker": "LPAA", "title": "Launch One"},
+                "2": {"cik_str": 2015502, "ticker": "LPAAW", "title": "Launch One"},
+            }
+
+    selected = sync._index_tickers(conn, Edgar())
+
+    assert selected["0002015502"] == ("LPAA", "Launch One")
+    assert conn.execute(
+        "SELECT ticker FROM company WHERE cik = '0002015502'").fetchone()[0] == "LPAA"
+
+
+def test_ticker_index_preserves_an_established_live_symbol_when_cover_is_partial(tmp_path):
+    conn = store.connect(tmp_path / "t.db")
+    store.upsert_company(conn, "0000005513", "UNM", "Unum")
+    store.set_cover(conn, "0000005513", [
+        {"symbol": "UNMA", "title": "6.250% Junior Subordinated Notes", "ratio": None},
+    ], "cover26")
+
+    class Edgar:
+        def _cached(self, *_args):
+            return {
+                "0": {"cik_str": 5513, "ticker": "UNMA", "title": "Unum"},
+                "1": {"cik_str": 5513, "ticker": "UNM", "title": "Unum"},
+            }
+
+    selected = sync._index_tickers(conn, Edgar())
+
+    assert selected["0000005513"] == ("UNM", "Unum")
 
 
 def test_the_cover_parser_reads_the_ratio_the_data_cannot_carry():
@@ -827,6 +1036,8 @@ def test_the_cover_parser_reads_the_ratio_the_data_cannot_carry():
         "each representing 2,000 shares of Common Stock") == 2000
     assert cover.depositary_ratio(
         "American Depositary Shares each representing 1 share") == 1
+    assert cover.depositary_ratio(
+        "Each American Depositary Share representing ten shares") == 10
     # an ordinary class says nothing about a ratio, which is the answer for most filers
     assert cover.depositary_ratio("Common Stock, $0.25 Par Value") is None
     assert cover.depositary_ratio("1.875% Notes Due 2026") is None
@@ -843,6 +1054,43 @@ def test_the_cover_parser_reads_the_ratio_the_data_cannot_carry():
     assert cover.securities(page) == [
         {"title": "American Depositary Shares, each representing 13 Ordinary Shares, "
                   "par value $0.0001 per share", "symbol": "ONC"}]
+
+    toyota = (
+        "American Depositary Shares [Member] Trading Symbol TM "
+        "Title of 12(b) Security American Depositary Shares "
+        "Security Exchange Name NYSE"
+    )
+    assert cover.securities(toyota) == [
+        {"title": "American Depositary Shares", "symbol": "TM"}]
+
+    # OACC's rendered report orders each class as symbol, exchange, then title.
+    # A whole-document regex crossed the member boundaries and attached the
+    # warrant's symbol to the ordinary-share title.
+    oacc = """
+      <table>
+        <tr><td>Trading Symbol</td><td>OACCU</td></tr>
+        <tr><td>Security Exchange Name</td><td>NASDAQ</td></tr>
+        <tr><td>Title of 12(b) Security</td><td>Units, each consisting of one
+          Class A ordinary share and one-fifth of one redeemable warrant</td></tr>
+        <tr><td>Entity Common Stock, Shares Outstanding</td><td>19,783,010</td></tr>
+        <tr><td>Trading Symbol</td><td>OACC</td></tr>
+        <tr><td>Security Exchange Name</td><td>NASDAQ</td></tr>
+        <tr><td>Title of 12(b) Security</td><td>Class A ordinary shares included
+          as part of the units</td></tr>
+        <tr><td>Trading Symbol</td><td>OACCW</td></tr>
+        <tr><td>Security Exchange Name</td><td>NASDAQ</td></tr>
+        <tr><td>Title of 12(b) Security</td><td>Redeemable warrants included as
+          part of the units</td></tr>
+      </table>
+    """
+    assert cover.securities(oacc) == [
+        {"title": "Units, each consisting of one Class A ordinary share and "
+                  "one-fifth of one redeemable warrant", "symbol": "OACCU"},
+        {"title": "Class A ordinary shares included as part of the units",
+         "symbol": "OACC"},
+        {"title": "Redeemable warrants included as part of the units",
+         "symbol": "OACCW"},
+    ]
 
     # NYSE renders preferred tickers with spaces. Truncating "GLP pr B" to GLP
     # made this second class overwrite the common-unit cover record.
@@ -871,6 +1119,20 @@ def test_the_cover_parser_reads_the_ratio_the_data_cannot_carry():
                   "representing two Class A ordinary shares)"),
         "symbol": "LX",
     }]
+
+
+def test_pending_foreign_annual_owns_the_cover_accession():
+    row = {
+        "data_pending": {"accession": "current20f", "filed": "2026-06-10"},
+        "sources": {
+            "eps": {"filed": "2025-06-18", "accn": "old20f"},
+            "assets": {"filed": "2025-06-18", "accn": "old20f"},
+        },
+    }
+    assert sync._cover_accession(row) == "current20f"
+
+    del row["data_pending"]
+    assert sync._cover_accession(row) == "old20f"
 
 
 def test_an_award_total_says_which_kinds_it_contains():
@@ -935,6 +1197,51 @@ def test_a_printed_statement_is_read_at_the_scale_its_header_declares():
     assert statements.value_for(lines, "total assets")[1] == 104_217_000_000
     # a parenthesised cell is negative, and the comparative column is ignored
     assert statements.value_for(lines, "accumulated deficit")[1] == -1_234_000_000
+
+
+def test_statement_dates_come_only_from_header_rows():
+    """A later caption can repeat both dates in an order unrelated to columns."""
+    from screener.sources import statements
+    doc = """<table class="report">
+      <tr><th>Statement</th><th>6 Months Ended</th><th>12 Months Ended</th></tr>
+      <tr><th></th><th>Dec. 31, 2024</th><th>Dec. 31, 2025</th></tr>
+      <tr><td>Revenue</td><td>120,775</td><td>204,055</td></tr>
+      <tr><td>Expense (for the year ended December 31, 2025 and the period ended
+          December 31, 2024)</td><td>(1)</td><td>(2)</td></tr>
+    </table>"""
+
+    assert statements.columns(doc) == [date(2024, 12, 31), date(2025, 12, 31)]
+
+
+def test_all_blank_scenario_column_does_not_shift_statement_values():
+    """CCI heads an empty future-date scenario before its two real columns."""
+    from screener.sources import statements
+    doc = """<table class="report">
+      <tr><th>Balance Sheet</th><th>Dec. 31, 2026</th>
+          <th>Jun. 30, 2026</th><th>Dec. 31, 2025</th></tr>
+      <tr><td><a onclick="defref_us-gaap_Assets">Total assets</a></td>
+          <td></td><td>21,512</td><td>31,518</td></tr>
+      <tr><td>Current assets</td><td></td><td>1,716</td><td>1,144</td></tr>
+    </table>"""
+
+    assert statements.columns(doc) == [date(2026, 6, 30), date(2025, 12, 31)]
+    assert statements.value_for(statements.lines(doc), "total assets")[1] == 21_512
+    assert statements.elements(doc)["us-gaap_Assets"] == [
+        Decimal("21512"), Decimal("31518")]
+
+
+def test_empty_rendered_label_does_not_shift_tagged_element_columns():
+    """Old SEC renderers sometimes link a concept on a row with no caption."""
+    from screener.sources import statements
+    doc = """<table class="report">
+      <tr><th>Operations</th><th>Jul. 31, 2012</th>
+          <th>Jul. 31, 2011</th><th>Jul. 31, 2012</th></tr>
+      <tr><td><a onclick="defref_us-gaap_GrossProfit"></a></td>
+          <td>15,314</td><td>0</td><td>15,314</td></tr>
+    </table>"""
+
+    assert statements.elements(doc)["us-gaap_GrossProfit"] == [
+        Decimal("15314"), Decimal("0"), Decimal("15314")]
 
 
 def test_a_statement_is_found_by_its_printed_name_not_its_number():

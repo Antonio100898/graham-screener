@@ -5,7 +5,9 @@ from decimal import Decimal
 
 import pytest
 
-from screener.normalize import UnsupportedFilerError, _fy_label, build_snapshot
+from screener.normalize import (UnsupportedFilerError,
+                                _current_operating_lease_liability,
+                                _fy_label, build_snapshot)
 from helpers import *  # noqa: F403 — the shared fixtures, by design
 from helpers import EPS, GAAP, build, dur, facts_doc, inst, tagdata, texts
 from helpers import _dimensioned, _reported, _shares, _years, _yr  # underscored, so `import *` skips them
@@ -18,6 +20,34 @@ def test_balance_sheet_uses_latest_period_end():
     assert s.balance_sheet_date == date(2026, 3, 31)
     # goodwill only reported annually -> its own latest instant
     assert s.goodwill.provenance.period_end == date(2025, 12, 31)
+
+
+def test_later_exact_scale_comparative_cannot_corrupt_balance_history():
+    from screener.normalize import (
+        _annual_balances, _latest_instant, _taxonomy_at_end,
+    )
+
+    gaap = {"Assets": tagdata("USD", [
+        inst("2022-09-30", 23_000_000, form="10-K",
+             accn="assets-22", filed="2023-02-01"),
+        inst("2023-09-30", 19_500_000, form="10-K",
+             accn="assets-23-original", filed="2024-02-01"),
+        inst("2023-09-30", 19_500_000_000, form="10-K",
+             accn="0001213900-25-013985", filed="2025-02-01"),
+        inst("2024-09-30", 17_000_000, form="10-K",
+             accn="assets-24", filed="2026-02-01"),
+    ])}
+
+    annual = _annual_balances(gaap, ("Assets",))
+    exact = _taxonomy_at_end(
+        gaap, date(2023, 9, 30), annual_only=True)
+    selected = _latest_instant(
+        exact, "Assets", ("Assets",), not_before=date(2023, 9, 30))
+
+    for fact in (annual[2023], selected):
+        assert fact.value == Decimal("19500000")
+        assert fact.provenance.accession == "assets-23-original"
+        assert "adjacent annual balances" in fact.provenance.concept
 
 
 def test_missing_stays_missing():
@@ -49,6 +79,149 @@ def test_liabilities_not_derived_across_mismatched_dates():
     gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [inst("2026-03-31", 1000e9, accn="q126")])
     gaap["StockholdersEquity"] = tagdata("USD", [inst("2025-12-31", 600e9, form="10-K", accn="k25", filed="2026-02-15")])
     assert build(gaap).total_liabilities is None
+
+
+def test_exact_total_equity_identity_replaces_an_abandoned_liability_total():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 450e9, form="10-K", accn="k25",
+             filed="2026-02-15")])
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [
+        inst("2026-03-31", 1000e9, accn="q126")])
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = (
+        tagdata("USD", [inst("2026-03-31", 600e9, accn="q126")]))
+
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 400e9
+    assert s.total_liabilities.provenance.period_end == date(2026, 3, 31)
+    assert "exact same-filing accounting identity" in s.total_liabilities.provenance.concept
+
+
+def test_parent_only_or_mixed_accession_identity_cannot_rescue_a_stale_liability_total():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 450e9, form="10-K", accn="k25",
+             filed="2026-02-15")])
+    gaap["LiabilitiesAndStockholdersEquity"] = tagdata("USD", [
+        inst("2026-03-31", 1000e9, accn="q126")])
+    gaap["StockholdersEquity"] = tagdata("USD", [
+        inst("2026-03-31", 600e9, accn="q126")])
+    assert build(gaap).total_liabilities is None
+
+    gaap.pop("StockholdersEquity")
+    gaap["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"] = (
+        tagdata("USD", [inst("2026-03-31", 600e9, accn="different-q126")]))
+    assert build(gaap).total_liabilities is None
+
+
+def test_unresolved_total_balance_mismatch_withholds_the_older_side():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 450e9, form="10-K", accn="k25",
+             filed="2026-02-15")])
+    s = build(gaap)
+    assert float(s.total_assets.value) == 1000e9
+    assert s.total_liabilities is None
+
+    gaap = dict(GAAP)
+    gaap["Assets"] = tagdata("USD", [
+        inst("2025-12-31", 1000e9, form="10-K", accn="k25",
+             filed="2026-02-15")])
+    s = build(gaap)
+    assert s.total_assets is None
+    assert float(s.total_liabilities.value) == 400e9
+
+    gaap.pop("AssetsCurrent")
+    s = build(gaap)
+    assert s.total_assets is None
+    assert s.balance_sheet_date == date(2025, 12, 31)
+
+
+def test_withheld_current_asset_does_not_disable_owner_earnings_scale_guard():
+    gaap = dict(OE_GAAP)
+    gaap["Assets"] = tagdata("USD", [
+        inst("2025-12-31", 5_912, form="10-K", accn="k25",
+             filed="2026-02-15")])
+
+    s = build(gaap)
+
+    assert s.total_assets is None  # the newer liability cannot be paired with it
+    assert s.owner_earnings is None  # the implausible flow/asset scale still blocks it
+
+
+def test_verified_brkr_liabilities_use_current_printed_statement_rows():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 3731.1e6, form="10-K", accn="k25",
+             filed="2026-02-27"),
+    ])
+    gaap["LiabilitiesCurrent"] = tagdata("USD", [
+        inst("2026-03-31", 1204.7e6, accn="q126")])
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [
+        inst("2026-03-31", 1814.7e6, accn="q126")])
+    gaap["OtherLiabilitiesNoncurrent"] = tagdata("USD", [
+        inst("2026-03-31", 597.7e6, accn="q126")])
+
+    # This reconstruction is filing-backed and issuer-specific. A generic filer
+    # does not treat three details as exhaustive and does not pair the abandoned
+    # direct total with the newer assets either.
+    assert build(gaap).total_liabilities is None
+
+    s = build_snapshot("BRKR", "0001109354", facts_doc(gaap))
+    assert float(s.total_liabilities.value) == 3617.1e6
+    assert s.total_liabilities.provenance.period_end == date(2026, 3, 31)
+    assert "LiabilitiesCurrent" in s.total_liabilities.provenance.tag
+    assert "OtherLiabilitiesNoncurrent" in s.total_liabilities.provenance.tag
+
+
+def test_verified_jbht_liabilities_use_all_current_printed_statement_rows():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 4362070e3, form="10-K", accn="k25",
+             filed="2026-02-24")])
+    for tag, value in {
+        "LiabilitiesCurrent": 1444663e3,
+        "LongTermDebtNoncurrent": 1145337e3,
+        "SelfInsuranceReserveNoncurrent": 487457e3,
+        "OtherLiabilitiesNoncurrent": 298697e3,
+        "DeferredIncomeTaxLiabilitiesNet": 911509e3,
+    }.items():
+        gaap[tag] = tagdata("USD", [
+            inst("2026-06-30", value, accn="q226", filed="2026-07-24")])
+
+    # The five rows are known to be exhaustive only for this filing pattern. A
+    # generic filer with the same tags gets neither a guessed sum nor a stale
+    # cross-period total.
+    assert build(gaap).total_liabilities is None
+
+    s = build_snapshot("JBHT", "0000728535", facts_doc(gaap))
+    assert float(s.total_liabilities.value) == 4287663e3
+    assert s.total_liabilities.provenance.period_end == date(2026, 6, 30)
+    assert len(s.total_liabilities.provenance.components) == 5
+    assert "SelfInsuranceReserveNoncurrent" in s.total_liabilities.provenance.tag
+    assert "DeferredIncomeTaxLiabilitiesNet" in s.total_liabilities.provenance.tag
+
+
+def test_current_and_noncurrent_liability_classes_replace_an_abandoned_total():
+    gaap = dict(GAAP)
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2025-12-31", 5617601e3, form="10-K", accn="k25",
+             filed="2026-02-23")])
+    gaap["LiabilitiesCurrent"] = tagdata("USD", [
+        inst("2026-03-31", 588670e3, accn="q126")])
+    gaap["LiabilitiesNoncurrent"] = tagdata("USD", [
+        inst("2026-03-31", 5157083e3, accn="q126")])
+    s = build(gaap)
+    assert float(s.total_liabilities.value) == 5745753e3
+    assert s.total_liabilities.provenance.period_end == date(2026, 3, 31)
+    assert "LiabilitiesCurrent" in s.total_liabilities.provenance.tag
+    assert "LiabilitiesNoncurrent" in s.total_liabilities.provenance.tag
+
+    # At one date the direct rollup remains authoritative; components can be a
+    # filing fragment even when their nominal element names look exhaustive.
+    gaap["Liabilities"] = tagdata("USD", [
+        inst("2026-03-31", 6e9, accn="q126")])
+    assert float(build(gaap).total_liabilities.value) == 6e9
 
 
 def test_intangibles_summed_from_finite_and_indefinite():
@@ -222,11 +395,11 @@ def test_total_debt_rollup_tag_extracted():
     assert float(build(gaap).total_debt.value) == 1.94e9
 
 
-def test_assume_absent_zero_requires_opt_in_and_clean_history():
+def test_assume_absent_zero_requires_opt_in_and_clean_current_filing_window():
     gaap = {k: v for k, v in GAAP.items() if k not in ("Goodwill",)}
     # default: strict, nothing assumed
     assert build_snapshot("TEST", "0000000001", facts_doc(gaap)).assumed_zero == frozenset()
-    # opt-in: debt + goodwill have zero evidence anywhere -> assumable
+    # opt-in: debt + goodwill have zero evidence in the current filing window
     s = build_snapshot("TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
     assert s.assumed_zero == {"debt", "goodwill"}
 
@@ -251,6 +424,40 @@ def test_owner_earnings_and_invested_capital():
     assert float(oe.invested_capital) == 810e9
     assert round(float(oe.all_capex_return), 4) == round(70 / 810 * 100, 4)
     assert round(float(oe.maintenance_estimate_return), 4) == round(70 / 810 * 100, 4)
+
+
+def test_finkle_three_way_fcf_reconciliation_matches_or_exposes_the_gap():
+    gaap = dict(OE_GAAP)
+    gaap["Revenues"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 200e9, accn="k25", filed="2026-02-15")])
+    gaap["IncomeTaxesPaidNet"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 25e9, accn="k25", filed="2026-02-15")])
+    # With no change in operating capital: 87 CFO - 12 capex = 100 operating
+    # income - 25 cash tax = 200 revenue - 100 operating costs - 25 cash tax.
+    gaap["NetCashProvidedByUsedInOperatingActivities"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 87e9, accn="k25", filed="2026-02-15")])
+
+    from screener.sync import _owner_earnings_row
+    payload = _owner_earnings_row(build(gaap))
+    reconciliation = payload["fcf_reconciliation"]
+
+    assert reconciliation["status"] == "MATCH"
+    assert reconciliation["net_investment_in_operating_capital"] == 0
+    assert [method["value"] for method in reconciliation["methods"].values()] == [
+        75e9, 75e9, 75e9]
+    assert all(sum(value for _, value in method["components"]) == method["value"]
+               for method in reconciliation["methods"].values())
+
+    gaap["NetCashProvidedByUsedInOperatingActivities"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 75e9, accn="k25", filed="2026-02-15")])
+    reconciliation = _owner_earnings_row(build(gaap))["fcf_reconciliation"]
+    assert reconciliation["status"] == "MISMATCH"
+    assert reconciliation["spread"] == 12e9
+
+    gaap.pop("IncomeTaxesPaidNet")
+    reconciliation = _owner_earnings_row(build(gaap))["fcf_reconciliation"]
+    assert reconciliation["status"] == "INCOMPLETE"
+    assert "same-period cash taxes paid" in reconciliation["missing"]
 
 
 def test_owner_earnings_uses_common_income_and_deducts_a_filed_preferred_claim():
@@ -302,6 +509,59 @@ def test_owner_returns_use_exact_average_beginning_and_ending_capital():
     assert float(oe.all_capex_return_including_cash) == pytest.approx(70 / 850 * 100)
 
 
+def test_owner_return_reads_current_generation_held_to_maturity_balance():
+    """Vertiv's audited short-term-investment row uses the post-CECL tag.
+
+    Both the explicit prior-year dash and the current carrying amount survive
+    Company Facts.  They are exact balance-sheet evidence, not absent-zero
+    assumptions, and must be deducted from their respective capital endpoints.
+    """
+    gaap = dict(OE_GAAP)
+    gaap.pop("ShortTermInvestments")
+    tag = (
+        "DebtSecuritiesHeldToMaturityAmortizedCostAfterAllowanceForCreditLossCurrent")
+    accession = "0001674101-26-000008"
+    gaap[tag] = tagdata("USD", [
+        inst("2024-12-31", 0, form="10-K", accn=accession,
+             filed="2026-02-13"),
+        inst("2025-12-31", 99.5e9, form="10-K", accn=accession,
+             filed="2026-02-13"),
+    ])
+
+    oe = build_snapshot("VRT", "0001674101", facts_doc(gaap)).owner_earnings
+
+    assert oe.invested_capital_beginning.value == Decimal("810000000000")
+    assert oe.invested_capital_ending.value == Decimal("710500000000")
+    assert oe.invested_capital == Decimal("760250000000")
+    assert tag in oe.invested_capital_ending.provenance.tag
+
+
+def test_modern_held_to_maturity_cash_equivalent_is_not_double_counted():
+    """Westlake's HTM note amount is already inside cash equivalents.
+
+    The element alone therefore cannot prove a separate short-term-investment
+    balance. Without a verified statement context, missing stays missing and the
+    cash-excluded return is withheld instead of deducting the same cash twice.
+    """
+    gaap = dict(OE_GAAP)
+    gaap.pop("ShortTermInvestments")
+    tag = (
+        "DebtSecuritiesHeldToMaturityAmortizedCostAfterAllowanceForCreditLossCurrent")
+    accession = "0001262823-26-000016"
+    gaap[tag] = tagdata("USD", [
+        inst("2024-12-31", 1009e9, form="10-K", accn=accession,
+             filed="2026-02-18"),
+        inst("2025-12-31", 0, form="10-K", accn=accession,
+             filed="2026-02-18"),
+    ])
+
+    oe = build_snapshot("WLK", "0001262823", facts_doc(gaap)).owner_earnings
+
+    assert oe.invested_capital is None
+    assert oe.all_capex_return is None
+    assert any("short-term-investment fact" in caveat for caveat in oe.caveats)
+
+
 def test_owner_return_is_withheld_without_both_exact_balance_sheets_or_current_debt():
     missing_beginning = dict(OE_GAAP)
     missing_beginning["Assets"] = tagdata("USD", [
@@ -316,6 +576,91 @@ def test_owner_return_is_withheld_without_both_exact_balance_sheets_or_current_d
     oe = build(no_current_debt_evidence).owner_earnings
     assert oe.invested_capital is None and oe.all_capex_return is None
     assert any("short-term-debt fact" in caveat for caveat in oe.caveats)
+
+
+def test_explicit_absent_debt_opt_in_reaches_owner_capital_and_dashboard_fields():
+    """Filing silence is usable only after the whole-history evidence gate passes.
+
+    The same explicit decision must reach both the Graham debt test and the
+    short-term-debt input used to separate interest-bearing from operating current
+    liabilities; otherwise the UI says debt-free while its capital returns stay blank.
+    """
+    from screener.sync import _derive
+
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "DebtCurrent"}
+    strict = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert strict.assumed_zero == frozenset()
+    assert strict.owner_earnings.capital_including_cash is None
+
+    assumed = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    assert "debt" in assumed.assumed_zero
+    assert float(assumed.owner_earnings.capital_including_cash) == 850e9
+    assert float(assumed.owner_earnings.invested_capital) == 810e9
+    assert any("short-term debt was assumed to be 0" in caveat
+               for caveat in assumed.owner_earnings.caveats)
+
+    status, row = _derive(
+        "0000000001", "TEST", facts_doc(gaap), assume_absent_zero=True)
+    assert status == "ok"
+    assert row["assumptions"] == ["debt"]
+    assert row["debt"] == row["total_debt"] == 0
+    assert row["long_term_debt"] == row["short_term_debt"] == 0
+    assert row["debt_to_equity"] == 0
+    assert {criterion["n"]: criterion for criterion in row["criteria"]}[3]["note"].startswith(
+        "assumed 0")
+
+
+def test_explicit_short_debt_zero_keeps_filed_long_debt_in_combined_ratio():
+    """EPAM-shaped: noncurrent debt is filed, while the current bucket is silent."""
+    from screener.sync import _derive
+
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "DebtCurrent"}
+    gaap["LongTermDebtNoncurrent"] = tagdata("USD", [
+        inst("2024-12-31", 25e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 25e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 25e9, accn="q126"),
+    ])
+
+    assumed = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    assert assumed.assumed_zero == {"short_term_debt"}
+    assert assumed.long_term_debt.value == 25e9
+    assert assumed.short_term_debt is None
+    assert assumed.owner_earnings.capital_including_cash is not None
+
+    status, row = _derive(
+        "0000000001", "TEST", facts_doc(gaap), assume_absent_zero=True)
+    assert status == "ok"
+    assert row["long_term_debt"] == row["debt"] == 25e9
+    assert row["short_term_debt"] == 0
+    assert row["total_debt"] is None  # no filing-backed rollup was invented
+    assert row["debt_to_equity"] == pytest.approx(25 / 600, abs=0.0001)
+    criterion = {item["n"]: item for item in row["criteria"]}[3]
+    assert criterion["status"] in {"PASS", "FAIL"}
+    assert "assumed 0 for short-term debt" in criterion["note"]
+
+
+def test_operating_capital_reads_current_debt_even_when_long_debt_includes_it():
+    """NIKE's LongTermDebt includes current maturities. That suppresses the
+    current component in total-debt reconciliation, but NIBCL still needs it."""
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "DebtCurrent"}
+    gaap["LongTermDebt"] = tagdata("USD", [
+        inst("2024-12-31", 105e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 110e9, form="10-K", accn="k25", filed="2026-02-15"),
+    ])
+    gaap["LongTermDebtCurrent"] = tagdata("USD", [
+        inst("2024-12-31", 5e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 10e9, form="10-K", accn="k25", filed="2026-02-15"),
+    ])
+
+    oe = build(gaap).owner_earnings
+
+    # assets - (current liabilities - current debt) - cash - investments
+    assert float(oe.invested_capital_beginning.value) == 815e9
+    assert float(oe.invested_capital_ending.value) == 820e9
+    assert float(oe.invested_capital) == 817.5e9
+    assert not any("short-term-debt fact" in caveat for caveat in oe.caveats)
 
 
 @pytest.mark.parametrize("missing_tag", [
@@ -361,14 +706,16 @@ def test_owner_cash_diagnostics_remain_separate_and_period_aligned():
         dur("2025-01-01", "2025-12-31", 5e9, accn="k25", filed="2026-02-15")])
     gaap["PaymentsToAcquireBusinessesNetOfCashAcquired"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 10e9, accn="k25", filed="2026-02-15")])
+    gaap["PaymentsForRepurchaseOfCommonStock"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 7e9, accn="k25", filed="2026-02-15")])
     gaap["PaymentsToDevelopSoftware"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 2e9, accn="k25", filed="2026-02-15")])
     gaap["PaymentsToAcquireIntangibleAssets"] = tagdata("USD", [
         dur("2025-01-01", "2025-12-31", 3e9, accn="k25", filed="2026-02-15")])
     gaap["IncreaseDecreaseInOperatingCapital"] = tagdata("USD", [
-        dur("2023-01-01", "2023-12-31", -1e9, accn="k23", filed="2024-02-15"),
-        dur("2024-01-01", "2024-12-31", -2e9, accn="k24", filed="2025-02-15"),
-        dur("2025-01-01", "2025-12-31", -4e9, accn="k25", filed="2026-02-15"),
+        dur("2023-01-01", "2023-12-31", 1e9, accn="k23", filed="2024-02-15"),
+        dur("2024-01-01", "2024-12-31", 2e9, accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 4e9, accn="k25", filed="2026-02-15"),
     ])
     oe = build(gaap).owner_earnings
     assert float(oe.free_cash_flow.value) == 63e9
@@ -384,6 +731,431 @@ def test_owner_cash_diagnostics_remain_separate_and_period_aligned():
     assert oe.acquisition_years_10 == 1
     assert float(oe.acquisitions_to_capex_10) == pytest.approx(10 / 12 * 100)
     assert float(oe.annual[2025].expanded_free_cash_flow_per_share.value) == 5.8
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(build(gaap))["annual_per_share"]["2025"][
+        "cash_flow_bridge"]
+    assert bridge["net_income"][0] == 70e9
+    assert bridge["depreciation_and_amortisation"][0] == 12e9
+    assert bridge["stock_compensation"][0] == 5e9
+    assert bridge["other_operating_cash_flow_adjustments"] == -8e9
+    assert bridge["working_capital_cash_effect"][0] == -4e9
+    assert bridge["operating_cash_flow"][0] == 75e9
+    assert bridge["total_capital_expenditure"][0] == 12e9
+    assert bridge["free_cash_flow"] == 63e9
+    assert bridge["share_repurchases"][0] == 7e9
+    assert bridge["share_repurchases"][1:] == [
+        "us-gaap:PaymentsForRepurchaseOfCommonStock",
+        "10-K", "k25", "2025-12-31",
+    ]
+    assert bridge["operating_cash_flow"][1:] == [
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        "10-K", "k25", "2025-12-31",
+    ]
+
+
+def test_annual_cash_bridge_residual_absorbs_unseparated_stock_compensation():
+    gaap = dict(OE_GAAP)
+    gaap["IncreaseDecreaseInOperatingCapital"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 4e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(build(gaap))["annual_per_share"]["2025"][
+        "cash_flow_bridge"]
+
+    assert "stock_compensation" not in bridge
+    # 75 OCF - 70 net income - 12 D&A - (-4 WC) = -3 other. Nothing
+    # missing is set to zero; it remains inside the labelled residual.
+    assert bridge["other_operating_cash_flow_adjustments"] == -3e9
+
+
+def test_working_capital_cash_effect_reconstructs_complete_jnj_statement_family():
+    gaap = dict(OE_GAAP)
+
+    def component(tag, value):
+        gaap[tag] = tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", value,
+                accn="0000200406-26-000016", filed="2026-02-11"),
+        ])
+
+    # JNJ's filed XBRL values describe increases/decreases in the balances;
+    # the 10-K cash-flow statement displays the corresponding signed cash
+    # effects: (1,781), (1,450), 2,377, (6,167), and (5,697) million.
+    component("IncreaseDecreaseInAccountsReceivable", 1_781e6)
+    component("IncreaseDecreaseInInventories", 1_450e6)
+    component("IncreaseDecreaseInAccountsPayableAndAccruedLiabilities", 2_377e6)
+    component("IncreaseDecreaseInOtherOperatingAssets", 6_167e6)
+    component("IncreaseDecreaseInOtherOperatingLiabilities", -5_697e6)
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9,
+            accn="0000200406-26-000016", filed="2026-02-11"),
+    ])
+
+    snapshot = build_snapshot("JNJ", "0000200406", facts_doc(gaap))
+    fact = snapshot.owner_earnings.annual[2025].working_capital_cash_effect
+    assert fact is not None
+    assert "complete reported component family" in fact.provenance.concept
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(snapshot)["annual_per_share"]["2025"][
+        "cash_flow_bridge"]
+
+    assert bridge["working_capital_cash_effect"][0] == -12_718e6
+    assert "IncreaseDecreaseInAccountsReceivable" in (
+        bridge["working_capital_cash_effect"][1])
+    assert bridge["other_operating_cash_flow_adjustments"] == pytest.approx(
+        75e9 - 70e9 - 12e9 - (-12_718e6))
+
+
+def test_working_capital_cash_effect_uses_complete_amat_statement_family():
+    from screener.normalize import _annual_working_capital_cash_effect
+
+    gaap = {}
+    accession = "0001628280-25-056742"
+    periods = (
+        ("2022-10-31", "2023-10-29"),
+        ("2023-10-30", "2024-10-27"),
+        ("2024-10-28", "2025-10-26"),
+    )
+    values = {
+        "IncreaseDecreaseInAccountsReceivable": (-903e6, 69e6, -49e6),
+        "IncreaseDecreaseInInventories": (-207e6, -304e6, 494e6),
+        "IncreaseDecreaseInOtherOperatingAssets": (48e6, -287e6, 119e6),
+        "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": (
+            -138e6, 281e6, 307e6),
+        "IncreaseDecreaseInContractWithCustomerLiability": (-167e6, -126e6, -283e6),
+        "IncreaseDecreaseInAccruedIncomeTaxesPayable": (-20e6, 389e6, 250e6),
+        "IncreaseDecreaseInOtherOperatingLiabilities": (38e6, 51e6, 90e6),
+        # Printed above the working-capital section as a non-cash tax adjustment.
+        "IncreaseDecreaseInDeferredIncomeTaxes": (-24e6, 633e6, -639e6),
+    }
+    for tag, annual_values in values.items():
+        gaap[tag] = tagdata("USD", [
+            dur(start, end, value, accn=accession, filed="2025-12-12")
+            for (start, end), value in zip(periods, annual_values)
+        ])
+
+    series = _annual_working_capital_cash_effect(gaap, "0000006951")
+
+    assert {year: fact.value for year, fact in series.items()} == {
+        2023: Decimal("775000000"),
+        2024: Decimal("1117000000"),
+        2025: Decimal("-200000000"),
+    }
+    assert len(series[2025].provenance.components) == 7
+    assert all(
+        part.tag != "us-gaap:IncreaseDecreaseInDeferredIncomeTaxes"
+        for part in series[2025].provenance.components
+    )
+
+
+@pytest.mark.parametrize(
+    ("cik", "accession", "end", "cash_rows", "permitted_extra"),
+    [
+        ("0001874178", "0001874178-26-000008", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -112_000_000,
+            "IncreaseDecreaseInInventories": 522_000_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 9_000_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 571_000_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -53_000_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": 503_000_000,
+        }, None),
+        ("0000082020", "0001104659-26-020480", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -3_951_000,
+            "IncreaseDecreaseInInventories": -3_222_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 402_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 4_537_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -101_000,
+            "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets": -268_000,
+        }, None),
+        ("0001314727", "0001314727-25-000090", "2025-09-27", {
+            "IncreaseDecreaseInAccountsReceivable": -21_873_000,
+            "IncreaseDecreaseInInventories": 51_729_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 10_483_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": -14_439_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -459_000,
+            "IncreaseDecreaseInEmployeeRelatedLiabilities": 5_232_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": -2_737_000,
+        }, None),
+        ("0001944048", "0001944048-26-000030", "2025-12-28", {
+            "IncreaseDecreaseInAccountsReceivable": -112_000_000,
+            "IncreaseDecreaseInInventories": -12_000_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 122_000_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 41_000_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -3_000_000,
+            "IncreaseDecreaseInEmployeeRelatedLiabilities": 43_000_000,
+            "IncreaseDecreaseInAccruedTaxesPayable": -27_000_000,
+        }, None),
+        ("0000015615", "0000015615-26-000020", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -140_809_000,
+            "IncreaseDecreaseInInventories": -2_709_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -65_312_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 250_533_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": 2_661_000,
+            "IncreaseDecreaseInContractWithCustomerAsset": -446_613_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": -7_305_000,
+        }, None),
+        ("0000906553", "0001437749-26-004908", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": 47_974_000,
+            "IncreaseDecreaseInInventories": 1_046_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 1_043_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 373_730_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -1_904_000,
+            "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets": 11_701_000,
+            "IncreaseDecreaseInIncomeTaxesReceivable": 8_068_000,
+            "IncreaseDecreaseInOperatingLeaseLiability": -91_594_000,
+        }, "IncreaseDecreaseInDeferredIncomeTaxes"),
+        ("0001035983", "0001104659-26-017530", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -594_298_000,
+            "IncreaseDecreaseInInventories": -24_411_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -386_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": -276_051_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": 28_699_000,
+            "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets": -91_359_000,
+            "IncreaseDecreaseInContractWithCustomerAsset": -19_945_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": 910_084_000,
+        }, None),
+        ("0001534675", "0001493152-26-008465", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -25_348_000,
+            "IncreaseDecreaseInInventories": -45_083_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -5_877_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 8_124_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -92_000,
+            "IncreaseDecreaseInPrepaidExpense": -4_223_000,
+            "IncreaseDecreaseInCommodityContractAssetsAndLiabilities": 31_362_000,
+            "IncreaseDecreaseInAccruedIncomeTaxesPayable": -3_805_000,
+            "IncreaseDecreaseInEmployeeRelatedLiabilities": 1_884_000,
+            "IncreaseDecreaseInDueToRelatedParties": 683_000,
+        }, None),
+        ("0001639825", "0001639825-26-000038", "2026-06-30", {
+            "IncreaseDecreaseInAccountsReceivable": 18_600_000,
+            "IncreaseDecreaseInInventories": 81_300_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -4_700_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": -71_100_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -5_500_000,
+            "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets": 34_200_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": -11_000_000,
+            "IncreaseDecreaseInOperatingLeaseLiability": -77_300_000,
+        }, None),
+        ("0001819574", "0001628280-26-042242", "2026-03-31", {
+            "IncreaseDecreaseInAccountsReceivable": -2_940_000,
+            "IncreaseDecreaseInInventories": 11_110_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -629_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": -13_389_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -2_246_000,
+            "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets": -1_577_000,
+            "IncreaseDecreaseInContractWithCustomerLiability": 977_000,
+            "IncreaseDecreaseInOperatingLeaseLiability": -5_717_000,
+        }, None),
+        ("0000278165", "0001493152-26-016891", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": 7_909_000,
+            "IncreaseDecreaseInInventories": 3_501_000,
+            "IncreaseDecreaseInOtherOperatingAssets": 142_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": -2_838_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": -1_428_000,
+            "IncreaseDecreaseInPrepaidExpense": 119_000,
+            "IncreaseDecreaseInDeferredIncomeTaxes": 450_000,
+            "IncreaseDecreaseInAccruedTaxesPayable": -1_370_000,
+            "IncreaseDecreaseInOperatingLeaseLiability": -200_000,
+        }, None),
+        ("0001590364", "0001628280-26-012940", "2025-12-31", {
+            "IncreaseDecreaseInAccountsReceivable": -42_425_000,
+            "IncreaseDecreaseInInventories": -645_464_000,
+            "IncreaseDecreaseInOtherOperatingAssets": -136_784_000,
+            "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 122_779_000,
+            "IncreaseDecreaseInOtherOperatingLiabilities": 356_000,
+            "IncreaseDecreaseInDueToRelatedParties": -960_000,
+        }, None),
+    ],
+    ids=("RIVN", "USLM", "SONO", "KVUE", "MTZ", "BYD", "FIX", "TGLS",
+         "PTON", "BARK", "OMQS", "FTAI"),
+)
+def test_verified_working_capital_families_match_published_statement(
+    cik, accession, end, cash_rows, permitted_extra,
+):
+    from screener.normalize import _annual_working_capital_cash_effect
+
+    asset_movements = {
+        "IncreaseDecreaseInAccountsReceivable",
+        "IncreaseDecreaseInInventories",
+        "IncreaseDecreaseInOtherOperatingAssets",
+        "IncreaseDecreaseInPrepaidDeferredExpenseAndOtherAssets",
+        "IncreaseDecreaseInPrepaidExpense",
+        "IncreaseDecreaseInDeferredIncomeTaxes",
+        "IncreaseDecreaseInIncomeTaxesReceivable",
+        "IncreaseDecreaseInContractWithCustomerAsset",
+        "IncreaseDecreaseInCommodityContractAssetsAndLiabilities",
+    }
+    start = (date.fromisoformat(end) - timedelta(days=364)).isoformat()
+    gaap = {
+        tag: tagdata("USD", [dur(
+            start, end, -cash_effect if tag in asset_movements else cash_effect,
+            accn=accession, filed="2026-09-01",
+        )])
+        for tag, cash_effect in cash_rows.items()
+    }
+    if permitted_extra:
+        gaap[permitted_extra] = tagdata("USD", [dur(
+            start, end, 123, accn=accession, filed="2026-09-01",
+        )])
+
+    fact = _annual_working_capital_cash_effect(gaap, cik)[int(end[:4])]
+
+    assert fact.value == Decimal(sum(cash_rows.values()))
+    assert len(fact.provenance.components) == len(cash_rows)
+
+
+def test_operating_capital_balance_change_is_inverted_in_both_directions():
+    """The standard rollup is a balance movement, not a signed cash effect.
+
+    Coca-Cola reports a positive balance movement and a negative cash effect;
+    HNI and Vertiv supply the opposite-direction control.  Pin both signs so a
+    future cleanup cannot accidentally restore the raw Company Facts value.
+    """
+    from screener.normalize import _annual_working_capital_cash_effect
+
+    gaap = {
+        "IncreaseDecreaseInOperatingCapital": tagdata("USD", [
+            dur("2024-01-01", "2024-12-31", 7_208e6,
+                accn="ko25", filed="2026-02-20"),
+            dur("2025-01-01", "2025-12-31", -339_300_000,
+                accn="vrt25", filed="2026-02-13"),
+        ]),
+    }
+
+    series = _annual_working_capital_cash_effect(gaap)
+
+    assert series[2024].value == Decimal("-7208000000")
+    assert series[2025].value == Decimal("339300000")
+    assert series[2025].provenance.tag == (
+        "-(us-gaap:IncreaseDecreaseInOperatingCapital)")
+
+
+def test_working_capital_effect_rejects_a_repeated_later_scale_error():
+    from screener.normalize import _annual_working_capital_cash_effect
+
+    tag = "IncreaseDecreaseInOperatingCapital"
+    gaap = {tag: tagdata("USD", [
+        dur("2020-01-01", "2020-12-31", 20,
+            accn="wc20", filed="2021-02-01"),
+        dur("2021-01-01", "2021-12-31", 30,
+            accn="wc21-a", filed="2022-02-01"),
+        dur("2021-01-01", "2021-12-31", 30,
+            accn="wc21-b", filed="2023-02-01"),
+        dur("2021-01-01", "2021-12-31", 30_000,
+            accn="0001213900-25-013985", filed="2024-02-01"),
+        dur("2022-01-01", "2022-12-31", -1_000,
+            accn="wc22", filed="2025-02-01"),
+    ])}
+
+    series = _annual_working_capital_cash_effect(gaap)
+
+    assert series[2021].value == Decimal("-30")
+    assert series[2021].provenance.components[0].accession == "wc21-b"
+
+
+def test_working_capital_component_family_refuses_incomplete_or_overlapping_rows():
+    base = dict(OE_GAAP)
+    base["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+
+    def add(gaap, tag, value):
+        gaap[tag] = tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", value,
+                accn="k25", filed="2026-02-15"),
+        ])
+
+    components = {
+        "IncreaseDecreaseInAccountsReceivable": 1e9,
+        "IncreaseDecreaseInInventories": 2e9,
+        "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 3e9,
+        "IncreaseDecreaseInOtherOperatingAssets": 4e9,
+        "IncreaseDecreaseInOtherOperatingLiabilities": 5e9,
+    }
+    incomplete = dict(base)
+    for tag, value in list(components.items())[:-1]:
+        add(incomplete, tag, value)
+    overlapping = dict(base)
+    for tag, value in components.items():
+        add(overlapping, tag, value)
+    add(overlapping, "IncreaseDecreaseInDeferredRevenue", 6e9)
+
+    for gaap in (incomplete, overlapping):
+        item = build_snapshot(
+            "JNJ", "0000200406", facts_doc(gaap)).owner_earnings.annual[2025]
+        assert item.working_capital_cash_effect is None
+
+
+def test_working_capital_component_family_refuses_unverified_ennis_pattern():
+    gaap = dict(OE_GAAP)
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9,
+            accn="0001193125-26-213764", filed="2026-05-08"),
+    ])
+    for tag, value in {
+        "IncreaseDecreaseInAccountsReceivable": -1_088e3,
+        "IncreaseDecreaseInInventories": 12_848e3,
+        "IncreaseDecreaseInAccountsPayableAndAccruedLiabilities": 1_123e3,
+        "IncreaseDecreaseInOtherOperatingAssets": -78e3,
+        "IncreaseDecreaseInOtherOperatingLiabilities": 88e3,
+    }.items():
+        gaap[tag] = tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", value,
+                accn="0001193125-26-213764", filed="2026-05-08"),
+        ])
+
+    item = build_snapshot(
+        "EBF", "0000033002", facts_doc(gaap)).owner_earnings.annual[2025]
+    # The rendered statement also has a separately printed $72k prepaid/tax
+    # row that Company Facts omits, proving that five standard tags alone do
+    # not establish completeness.
+    assert item.working_capital_cash_effect is None
+
+
+def test_buybacks_remain_visible_when_fcf_cannot_be_calculated():
+    gaap = dict(OE_GAAP)
+    gaap.pop("NetCashProvidedByUsedInOperatingActivities", None)
+    gaap["PaymentsForRepurchaseOfCommonStock"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 7e9, accn="k25", filed="2026-02-15")])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9, accn="k25", filed="2026-02-15")])
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(build(gaap))["annual_per_share"]["2025"][
+        "cash_flow_bridge"]
+
+    assert "operating_cash_flow" not in bridge
+    assert "free_cash_flow" not in bridge
+    assert bridge["share_repurchases"][0] == 7e9
+
+
+def test_annual_cash_bridge_residual_absorbs_unseparated_working_capital():
+    gaap = dict(OE_GAAP)
+    gaap["ShareBasedCompensation"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", 5e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur("2025-01-01", "2025-12-31", 10e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(build(gaap))["annual_per_share"]["2025"][
+        "cash_flow_bridge"]
+
+    assert "working_capital_cash_effect" not in bridge
+    # 75 OCF - 70 net income - 12 D&A - 5 SBC = -12 other, including
+    # the working-capital effect that the filer did not publish as a rollup.
+    assert bridge["other_operating_cash_flow_adjustments"] == -12e9
 
 
 def test_nopat_roic_uses_normalized_tax_and_both_average_capital_views():
@@ -405,6 +1177,639 @@ def test_nopat_roic_uses_normalized_tax_and_both_average_capital_views():
     assert float(oe.nopat_return_including_cash) == pytest.approx(75 / 850 * 100)
 
 
+def test_nopat_accepts_only_an_exactly_reconciled_operating_income_fallback():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+
+    def annual(value, year):
+        return dur(f"{year}-01-01", f"{year}-12-31", value,
+                   accn=f"k{year}", filed=f"{year + 1}-02-15")
+
+    gaap.update({
+        "GrossProfit": tagdata("USD", [annual(600e9, y) for y in (2023, 2024, 2025)]),
+        "SellingGeneralAndAdministrativeExpense": tagdata(
+            "USD", [annual(500e9, y) for y in (2023, 2024, 2025)]),
+        "InterestIncomeExpenseNonoperatingNet": tagdata(
+            "USD", [annual(5e9, y) for y in (2023, 2024, 2025)]),
+        "OtherNonoperatingIncomeExpense": tagdata(
+            "USD", [annual(5e9, y) for y in (2023, 2024, 2025)]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+            tagdata("USD", [annual(110e9, y) for y in (2023, 2024, 2025)]),
+        "IncomeTaxExpenseBenefit": tagdata("USD", [
+            annual(22e9, 2023), annual(27.5e9, 2024), annual(33e9, 2025),
+        ]),
+    })
+
+    snapshot = build(gaap)
+    operating = snapshot.annual_operating_income[2025]
+    assert float(operating.value) == 100e9
+    assert "derived and reconciled" in operating.provenance.concept
+    from screener.sync import _source
+    source = _source(operating)
+    assert "derived and reconciled" in source["concept"]
+    assert {part["tag"] for part in source["components"]} == {
+        "us-gaap:GrossProfit",
+        "us-gaap:SellingGeneralAndAdministrativeExpense",
+        ("us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+         "ExtraordinaryItemsNoncontrollingInterest"),
+        "us-gaap:InterestIncomeExpenseNonoperatingNet",
+        "us-gaap:OtherNonoperatingIncomeExpense",
+    }
+    assert float(snapshot.owner_earnings.nopat) == 75e9
+
+    # The subtraction inputs alone are insufficient: break the independent
+    # pretax reconciliation and the latest operating income/NOPAT disappear.
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = tagdata(
+        "USD", [annual(110e9, 2023), annual(110e9, 2024), annual(111e9, 2025)])
+    snapshot = build(gaap)
+    assert 2025 not in snapshot.annual_operating_income
+    assert snapshot.owner_earnings.nopat is None
+
+
+def test_biotechne_comparative_operating_income_scale_is_reconciled():
+    """Bio-Techne's FY2015 10-K prints its statement in thousands.
+
+    The FY2013 OperatingIncomeLoss XBRL comparative lost that table scale in
+    Company Facts and arrived as 158,469 dollars.  Every other same-accession
+    statement input remained in dollars and independently proves 158,469,000:
+    gross profit less operating expenses, then operating plus nonoperating income
+    to pretax income.  Only that exact 1,000x contradiction may displace a direct
+    standard-tag fact.
+    """
+    def annual(value):
+        return dur("2012-07-01", "2013-06-30", value,
+                   accn="0001437749-15-016645", filed="2015-08-31")
+
+    gaap = {
+        "OperatingIncomeLoss": tagdata("USD", [annual(158_469)]),
+        "GrossProfit": tagdata("USD", [annual(231_110_000)]),
+        "OperatingExpenses": tagdata("USD", [annual(72_641_000)]),
+        "NonoperatingIncomeExpense": tagdata("USD", [annual(2_193_000)]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+            tagdata("USD", [annual(160_662_000)]),
+    }
+
+    from screener.normalize import _annual_operating_income
+    operating = _annual_operating_income(gaap)[2013]
+    assert float(operating.value) == 158_469_000
+    assert "exact 1000x presentation-scale contradiction" in (
+        operating.provenance.concept)
+    assert {part.tag for part in operating.provenance.components} == {
+        "us-gaap:OperatingIncomeLoss",
+        "us-gaap:GrossProfit",
+        "us-gaap:OperatingExpenses",
+        "us-gaap:NonoperatingIncomeExpense",
+        ("us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+         "ExtraordinaryItemsNoncontrollingInterest"),
+    }
+
+    # A normal restatement disagreement is not a units error.  Keep the direct
+    # fact unless the contradiction is an exact presentation factor.
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [annual(150_000_000)])
+    assert float(_annual_operating_income(gaap)[2013].value) == 150_000_000
+
+
+def test_dolphin_hidden_three_dollar_gross_profit_is_withheld():
+    """A hidden standard-tag fact must not outrank the statement's arithmetic.
+
+    Dolphin's FY2022 10-K prints $40,505,558 revenue and $3,566,336 direct costs
+    but no gross-profit row.  Company Facts nevertheless exposes GrossProfit=3.
+    Missing is the only defensible result; multiplying three by a guessed report
+    scale would invent a subtotal the company never presented.
+    """
+    def annual(value):
+        return dur("2022-01-01", "2022-12-31", value,
+                   accn="0001553350-23-000246", filed="2023-03-31")
+
+    gaap = {
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata(
+            "USD", [annual(40_505_558)]),
+        "CostOfRevenue": tagdata("USD", [annual(3_566_336)]),
+        "GrossProfit": tagdata("USD", [annual(3)]),
+    }
+
+    from screener.normalize import _annual_gross_profit
+    assert 2022 not in _annual_gross_profit(gaap)
+
+    # Small results are not rejected merely for being unusual.  If the three
+    # same-filing rows satisfy the accounting identity, the filed subtotal stays.
+    gaap["CostOfRevenue"] = tagdata("USD", [annual(40_505_555)])
+    assert float(_annual_gross_profit(gaap)[2022].value) == 3
+
+
+def test_dolphin_repeated_hidden_gross_profit_series_is_withheld():
+    """A hard-coded subtotal repeated across moving statements is not history."""
+    def annual(year, value):
+        return dur(f"{year}-01-01", f"{year}-12-31", value,
+                   accn=f"k{year}", filed=f"{year + 1}-03-31")
+
+    gaap = {
+        "Revenues": tagdata("USD", [
+            annual(2020, 24_054_480), annual(2021, 35_727_199),
+            annual(2022, 40_505_558),
+        ]),
+        "CostOfRevenue": tagdata("USD", [
+            annual(2020, 2_576_709), annual(2021, 3_879_409),
+            annual(2022, 3_566_336),
+        ]),
+        "GrossProfit": tagdata("USD", [
+            annual(2020, 3_000_000), annual(2021, 3_000_000),
+            annual(2022, 3_000_000),
+        ]),
+    }
+
+    from screener.normalize import _annual_gross_profit
+    assert _annual_gross_profit(gaap) == {}
+
+    # Repetition alone is not a rejection: if revenue less cost supports the
+    # same rounded subtotal in each filing, all three years remain reported.
+    gaap["CostOfRevenue"] = tagdata("USD", [
+        annual(2020, 21_054_480), annual(2021, 32_727_199),
+        annual(2022, 37_505_558),
+    ])
+    assert set(_annual_gross_profit(gaap)) == {2020, 2021, 2022}
+
+
+def test_jnj_operating_income_is_recovered_from_complete_nonoperating_bridge():
+    """J&J's printed 10-K has no OperatingIncomeLoss subtotal.
+
+    The separate interest and other-nonoperating rows recover the exact subtotal,
+    while gross profit and the identified operating-cost stack independently guard
+    the classification.  These are the FY2023-FY2025 values printed on page 44 of
+    accession 0000200406-26-000016, in millions of dollars.
+    """
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+
+    def annual(value, year):
+        starts = {2023: "2023-01-02", 2024: "2024-01-01", 2025: "2024-12-30"}
+        ends = {2023: "2023-12-31", 2024: "2024-12-29", 2025: "2025-12-28"}
+        return dur(starts[year], ends[year], value * 1e6,
+                   accn="0000200406-26-000016", filed="2026-02-11")
+
+    values = {
+        "GrossProfit": {2023: 58_606, 2024: 61_350, 2025: 63_937},
+        "SellingGeneralAndAdministrativeExpense": {
+            2023: 21_512, 2024: 22_869, 2025: 23_676,
+        },
+        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost": {
+            2023: 15_085, 2024: 17_232, 2025: 14_665,
+        },
+        "InvestmentIncomeInterest": {2023: 1_261, 2024: 1_332, 2025: 1_056},
+        "InterestExpenseNonoperating": {2023: 772, 2024: 755, 2025: 971},
+        "OtherNonoperatingIncomeExpense": {
+            2023: -6_634, 2024: -4_694, 2025: 7_209,
+        },
+        "RestructuringCharges": {2023: 489, 2024: 234, 2025: 228},
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": {
+            2023: 15_062, 2024: 16_687, 2025: 32_581,
+        },
+    }
+    for tag, by_year in values.items():
+        gaap[tag] = tagdata("USD", [annual(value, year)
+                                     for year, value in by_year.items()])
+
+    snapshot = build(gaap)
+    assert {year: float(fact.value) for year, fact
+            in snapshot.annual_operating_income.items() if year >= 2023} == {
+        2023: 21_207e6,
+        2024: 20_804e6,
+        2025: 25_287e6,
+    }
+    latest = snapshot.annual_operating_income[2025]
+    assert "pretax less complete nonoperating lines" in latest.provenance.concept
+    assert {part.tag for part in latest.provenance.components} == {
+        "us-gaap:GrossProfit",
+        "us-gaap:SellingGeneralAndAdministrativeExpense",
+        "us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+        "us-gaap:InvestmentIncomeInterest",
+        "us-gaap:InterestExpenseNonoperating",
+        "us-gaap:OtherNonoperatingIncomeExpense",
+        "us-gaap:RestructuringCharges",
+        ("us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+         "ExtraordinaryItemsNoncontrollingInterest"),
+    }
+
+    # The inverse bridge is intentionally all-or-nothing: losing one nonoperating
+    # row must not turn an incomplete statement into invented operating income.
+    del gaap["InvestmentIncomeInterest"]
+    assert 2025 not in build(gaap).annual_operating_income
+
+
+def test_inverse_operating_bridge_rejects_a_contradictory_cost_stack():
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+
+    def annual(value):
+        return dur("2025-01-01", "2025-12-31", value,
+                   accn="k25", filed="2026-02-15")
+
+    gaap.update({
+        "GrossProfit": tagdata("USD", [annual(100)]),
+        "SellingGeneralAndAdministrativeExpense": tagdata("USD", [annual(40)]),
+        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost": tagdata(
+            "USD", [annual(40)]),
+        "InvestmentIncomeInterest": tagdata("USD", [annual(5)]),
+        "InterestExpenseNonoperating": tagdata("USD", [annual(2)]),
+        "OtherNonoperatingIncomeExpense": tagdata("USD", [annual(3)]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+            tagdata("USD", [annual(24)]),
+    })
+    # The bridge implies operating income 18 and therefore only 82 of operating
+    # costs.  Raise identified R&D above that total: the guard must reject it.
+    gaap["ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"] = tagdata(
+        "USD", [annual(50)])
+    assert 2025 not in build(gaap).annual_operating_income
+
+
+def test_note_only_generic_research_does_not_create_fstr_operating_income():
+    """FSTR's FY2014 R&D disclosure is already included in SG&A.
+
+    Its printed statement has a separate $4.695m amortization row and equity-method
+    income outside operations.  Treating generic R&D as another statement expense
+    happens to yield a tiny residual but invents $38.364m instead of the actual
+    $37.082m operating subtotal, so this shape must stay absent.
+    """
+    gaap = {k: v for k, v in OE_GAAP.items() if k != "OperatingIncomeLoss"}
+
+    def annual(value):
+        return dur("2014-01-01", "2014-12-31", value * 1e3,
+                   accn="0001193125-17-074622", filed="2017-03-08")
+
+    gaap.update({
+        "GrossProfit": tagdata("USD", [annual(121_591)]),
+        "SellingGeneralAndAdministrativeExpense": tagdata(
+            "USD", [annual(79_814)]),
+        "ResearchAndDevelopmentExpense": tagdata("USD", [annual(3_096)]),
+        "InvestmentIncomeInterest": tagdata("USD", [annual(530)]),
+        "InterestExpense": tagdata("USD", [annual(512)]),
+        "OtherNonoperatingIncomeExpense": tagdata("USD", [annual(678)]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+            tagdata("USD", [annual(39_060)]),
+    })
+
+    assert 2014 not in build(gaap).annual_operating_income
+
+
+def test_annual_nopat_is_independent_of_owner_earnings_cash_bridge():
+    """Missing D&A/CapEx must not erase an otherwise evidenced NOPAT return."""
+    gaap = {k: v for k, v in OE_GAAP.items()
+            if k not in ("DepreciationDepletionAndAmortization",
+                         "PaymentsToAcquirePropertyPlantAndEquipment")}
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = tagdata(
+        "USD", [
+            dur("2024-01-01", "2024-12-31", 80e9,
+                accn="k24", filed="2025-02-15"),
+            dur("2025-01-01", "2025-12-31", 100e9,
+                accn="k25", filed="2026-02-15"),
+        ])
+    gaap["IncomeTaxExpenseBenefit"] = tagdata("USD", [
+        dur("2024-01-01", "2024-12-31", 16e9,
+            accn="k24", filed="2025-02-15"),
+        dur("2025-01-01", "2025-12-31", 20e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+
+    snapshot = build(gaap)
+    assert snapshot.owner_earnings is None
+    annual = snapshot.annual_operating_returns[2025]
+    assert float(annual.normalized_tax_rate) == pytest.approx(0.20)
+    assert float(annual.nopat.value) == 80e9
+    assert float(annual.invested_capital) == 810e9
+    assert float(annual.nopat_roic) == pytest.approx(80 / 810 * 100)
+
+
+def test_annual_nopat_uses_both_pretax_geographies_when_direct_tag_ends():
+    """DECK-shaped domestic + foreign evidence is one consolidated denominator."""
+    gaap = dict(OE_GAAP)
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"] = tagdata(
+        "USD", [dur("2025-01-01", "2025-12-31", 70e9,
+                    accn="k25", filed="2026-02-15")])
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign"] = tagdata(
+        "USD", [dur("2025-01-01", "2025-12-31", 30e9,
+                    accn="k25", filed="2026-02-15")])
+
+    annual = build(gaap).annual_operating_returns[2025]
+    assert float(annual.normalized_tax_rate) == pytest.approx(0.20)
+    assert float(annual.nopat.value) == 80e9
+    assert len(annual.pretax_income_inputs) == 1
+    assert "Domestic + us-gaap:IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign" in (
+        annual.pretax_income_inputs[0].provenance.tag)
+
+
+def test_ten_year_operating_return_history_discloses_each_zero_assumption():
+    """The UI history gets ten real calculations, not ten repeated latest values."""
+    from screener.sync import _derive
+
+    fiscal_years = range(2016, 2026)
+    balance_years = range(2015, 2026)
+    gaap = {k: v for k, v in OE_GAAP.items()
+            if k not in ("DepreciationDepletionAndAmortization",
+                         "PaymentsToAcquirePropertyPlantAndEquipment",
+                         "Goodwill", "IntangibleAssetsNetExcludingGoodwill",
+                         "ShortTermInvestments")}
+    gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
+        dur(f"{year}-01-01", f"{year}-12-31", 5,
+            accn=f"k{year}", filed=f"{year + 1}-02-15")
+        for year in fiscal_years
+    ])
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur(f"{year}-01-01", f"{year}-12-31", year * 1e6,
+            accn=f"k{year}", filed=f"{year + 1}-02-15")
+        for year in fiscal_years
+    ])
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = tagdata(
+        "USD", [
+            dur(f"{year}-01-01", f"{year}-12-31", year * 1e6,
+                accn=f"k{year}", filed=f"{year + 1}-02-15")
+            for year in fiscal_years
+        ])
+    gaap["IncomeTaxExpenseBenefit"] = tagdata("USD", [
+        dur(f"{year}-01-01", f"{year}-12-31", year * 0.2e6,
+            accn=f"k{year}", filed=f"{year + 1}-02-15")
+        for year in fiscal_years
+    ])
+    for tag, value in (
+        ("Assets", 1000e9),
+        ("LiabilitiesCurrent", 150e9),
+        ("DebtCurrent", 0),
+        ("CashAndCashEquivalentsAtCarryingValue", 40e9),
+    ):
+        gaap[tag] = tagdata("USD", [
+            inst(f"{year}-12-31", value, form="10-K",
+                 accn=f"k{year}", filed=f"{year + 1}-02-15")
+            for year in balance_years
+        ])
+
+    strict = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert strict.annual_operating_returns[2025].nopat_roic is None
+    assert strict.annual_operating_returns[2025].ronta is None
+
+    assumed = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    assert len(assumed.annual_operating_returns) == 10
+    for year, annual in assumed.annual_operating_returns.items():
+        assert annual.nopat is not None, year
+        assert annual.nopat_roic is not None, year
+        assert annual.nopat_return_including_cash is not None, year
+        assert annual.ronta is not None, year
+        assert set(annual.assumed_zero) == {
+            "goodwill", "intangibles", "noncurrent_investments",
+            "short_term_investments",
+        }
+
+    status, row = _derive(
+        "0000000001", "TEST", facts_doc(gaap), assume_absent_zero=True)
+    assert status == "ok"
+    history = row["annual_ratios"]
+    assert sorted(history) == list(fiscal_years)
+    assert all(history[year]["nopat"] is not None for year in fiscal_years)
+    assert all(history[year]["nopat_roic"] is not None for year in fiscal_years)
+    assert all(history[year]["ronta"] is not None for year in fiscal_years)
+    assert history[2025]["operating_return_evidence"]["operating_income"][0][2] == "k2025"
+    assert row["operating_returns"]["nopat"] == history[2025]["nopat"]
+    assert row["operating_returns"]["ronta"] == history[2025]["ronta"]
+
+
+def test_detail_zero_mode_fills_every_missing_operating_return_input():
+    """The explicit detail mode leaves no dash merely because an input is absent."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 1,
+                accn="k25", filed="2026-02-15"),
+        ]),
+    }
+
+    strict = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    assert strict.annual_operating_returns[2025].nopat is None
+
+    assumed = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    assert sorted(assumed.annual_operating_returns) == list(range(2016, 2026))
+    for year, annual in assumed.annual_operating_returns.items():
+        assert annual.operating_income.value == 0, year
+        assert annual.normalized_tax_rate == 0, year
+        assert annual.nopat.value == 0, year
+        assert annual.invested_capital == 0, year
+        assert annual.capital_including_cash == 0, year
+        assert annual.average_net_tangible_operating_assets == 0, year
+        assert annual.nopat_roic == 0, year
+        assert annual.nopat_return_including_cash == 0, year
+        assert annual.ronta is None, year
+        assert {
+            "operating_income", "tax_rate", "total_assets",
+            "current_liabilities", "cash", "short_term_debt",
+            "short_term_investments", "goodwill", "intangibles",
+            "noncurrent_investments",
+        } <= set(annual.assumed_zero)
+        assert any("was not reported" in note for note in annual.caveats)
+
+
+def test_detail_zero_mode_creates_ten_slots_without_annual_filing_history():
+    gaap = {
+        "Assets": tagdata("USD", [inst("2026-06-30", 100e6)]),
+        "AssetsCurrent": tagdata("USD", [inst("2026-06-30", 60e6)]),
+        "LiabilitiesCurrent": tagdata("USD", [inst("2026-06-30", 20e6)]),
+    }
+
+    snapshot = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+
+    assert sorted(snapshot.annual_operating_returns) == list(range(2017, 2027))
+    assert all(item.nopat.value == 0
+               for item in snapshot.annual_operating_returns.values())
+    assert all(item.nopat_roic == 0
+               for item in snapshot.annual_operating_returns.values())
+    assert all(item.ronta is None
+               for item in snapshot.annual_operating_returns.values())
+
+    no_anchor = build_snapshot(
+        "TEST", "0000000001", facts_doc({}), assume_absent_zero=True)
+    assert len(no_anchor.annual_operating_returns) == 10
+    assert all(item.nopat.value == 0
+               for item in no_anchor.annual_operating_returns.values())
+
+
+def test_ronta_uses_nopat_over_exact_average_net_tangible_operating_assets():
+    gaap = dict(OE_GAAP)
+    gaap.update({
+        "Goodwill": tagdata("USD", [
+            inst("2024-12-31", 50e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 60e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "IntangibleAssetsNetExcludingGoodwill": tagdata("USD", [
+            inst("2024-12-31", 20e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 30e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "OtherLongTermInvestments": tagdata("USD", [
+            inst("2024-12-31", 40e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 50e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": tagdata("USD", [
+            dur("2023-01-01", "2023-12-31", 100e9, accn="k23", filed="2024-02-15"),
+            dur("2024-01-01", "2024-12-31", 100e9, accn="k24", filed="2025-02-15"),
+            dur("2025-01-01", "2025-12-31", 100e9, accn="k25", filed="2026-02-15"),
+        ]),
+        "IncomeTaxExpenseBenefit": tagdata("USD", [
+            dur("2023-01-01", "2023-12-31", 20e9, accn="k23", filed="2024-02-15"),
+            dur("2024-01-01", "2024-12-31", 25e9, accn="k24", filed="2025-02-15"),
+            dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15"),
+        ]),
+    })
+    oe = build(gaap).owner_earnings
+
+    # Each endpoint starts from assets - NIB current liabilities - cash -
+    # short-term investments, then removes goodwill, other intangibles, and
+    # noncurrent investments: 700 at the beginning and 670 at the end.
+    assert float(oe.net_tangible_operating_assets_beginning.value) == 700e9
+    assert float(oe.net_tangible_operating_assets_ending.value) == 670e9
+    assert float(oe.average_net_tangible_operating_assets) == 685e9
+    assert float(oe.nopat) == 75e9
+    assert float(oe.ronta) == pytest.approx(75 / 685 * 100)
+    assert "OtherLongTermInvestments" in (
+        oe.net_tangible_operating_assets_ending.provenance.tag)
+
+    from screener.sync import _owner_earnings_row
+    payload = _owner_earnings_row(build(gaap))
+    assert payload["average_net_tangible_operating_assets"] == 685e9
+    assert payload["ronta"] == pytest.approx(75 / 685 * 100)
+    assert payload["net_tangible_operating_assets_evidence"]["beginning"]["value"] == 700e9
+    assert payload["net_tangible_operating_assets_evidence"]["ending"]["value"] == 670e9
+
+
+def test_ronta_treats_lease_liabilities_as_financing_and_exposes_neutral_view():
+    gaap = dict(OE_GAAP)
+    gaap.update({
+        "Goodwill": tagdata("USD", [
+            inst("2024-12-31", 50e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 60e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "IntangibleAssetsNetExcludingGoodwill": tagdata("USD", [
+            inst("2024-12-31", 20e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 30e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "OtherLongTermInvestments": tagdata("USD", [
+            inst("2024-12-31", 40e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 50e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "OperatingLeaseLiabilityCurrent": tagdata("USD", [
+            inst("2024-12-31", 20e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 25e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "OperatingLeaseRightOfUseAsset": tagdata("USD", [
+            inst("2024-12-31", 100e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 120e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": tagdata(
+            "USD", [
+                dur("2023-01-01", "2023-12-31", 100e9, accn="k23", filed="2024-02-15"),
+                dur("2024-01-01", "2024-12-31", 100e9, accn="k24", filed="2025-02-15"),
+                dur("2025-01-01", "2025-12-31", 100e9, accn="k25", filed="2026-02-15"),
+            ]),
+        "IncomeTaxExpenseBenefit": tagdata("USD", [
+            dur("2023-01-01", "2023-12-31", 20e9, accn="k23", filed="2024-02-15"),
+            dur("2024-01-01", "2024-12-31", 25e9, accn="k24", filed="2025-02-15"),
+            dur("2025-01-01", "2025-12-31", 30e9, accn="k25", filed="2026-02-15"),
+        ]),
+    })
+
+    snapshot = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    annual = snapshot.annual_operating_returns[2025]
+
+    # The old NTOA endpoints were 700 and 670. Keeping the current lease
+    # liability with financing makes them 720 and 695. Removing the ROU assets
+    # for presentation comparability then makes them 620 and 575.
+    assert float(annual.net_tangible_operating_assets_beginning.value) == 720e9
+    assert float(annual.net_tangible_operating_assets_ending.value) == 695e9
+    assert float(annual.average_net_tangible_operating_assets) == 707.5e9
+    assert float(annual.lease_neutral_net_tangible_operating_assets_beginning.value) == 620e9
+    assert float(annual.lease_neutral_net_tangible_operating_assets_ending.value) == 575e9
+    assert float(annual.average_lease_neutral_net_tangible_operating_assets) == 597.5e9
+    assert float(annual.ronta) == pytest.approx(75 / 707.5 * 100)
+    assert float(annual.lease_neutral_ronta) == pytest.approx(75 / 597.5 * 100)
+    assert "OperatingLeaseLiabilityCurrent" in (
+        annual.net_tangible_operating_assets_ending.provenance.tag)
+    assert "OperatingLeaseRightOfUseAsset" in (
+        annual.lease_neutral_net_tangible_operating_assets_ending.provenance.tag)
+
+    from screener.sync import _operating_return_history
+    cell = _operating_return_history(snapshot)[2025]
+    assert cell["average_net_tangible_operating_assets"] == 707.5e9
+    assert cell["average_lease_neutral_net_tangible_operating_assets"] == 597.5e9
+    assert cell["lease_neutral_ronta"] == pytest.approx(75 / 597.5 * 100)
+
+
+def test_current_operating_lease_liability_can_be_derived_from_exact_total():
+    exact = {
+        "OperatingLeaseLiability": tagdata("USD", [
+            inst("2025-12-31", 120e9, form="10-K", accn="k25",
+                 filed="2026-02-15"),
+        ]),
+        "OperatingLeaseLiabilityNoncurrent": tagdata("USD", [
+            inst("2025-12-31", 95e9, form="10-K", accn="k25",
+                 filed="2026-02-15"),
+        ]),
+    }
+
+    current = _current_operating_lease_liability(
+        exact, date(2025, 12, 31))
+
+    assert current.value == Decimal("25000000000")
+    assert current.provenance.tag == (
+        "us-gaap:OperatingLeaseLiability - "
+        "us-gaap:OperatingLeaseLiabilityNoncurrent")
+    assert len(current.provenance.components) == 2
+
+
+def test_nonpositive_average_ntoa_makes_ronta_not_meaningful_in_detail_mode():
+    gaap = dict(OE_GAAP)
+    gaap.update({
+        "Goodwill": tagdata("USD", [
+            inst("2024-12-31", 900e9, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 900e9, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "IntangibleAssetsNetExcludingGoodwill": tagdata("USD", [
+            inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "OtherLongTermInvestments": tagdata("USD", [
+            inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+    })
+
+    snapshot = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    annual = snapshot.annual_operating_returns[2025]
+    assert annual.average_net_tangible_operating_assets == Decimal("-90000000000")
+    assert annual.nopat is not None
+    assert annual.ronta is None
+    assert any("displays N/M" in caveat for caveat in annual.caveats)
+
+    from screener.sync import _derive
+    status, row = _derive(
+        "0000000001", "TEST", facts_doc(gaap), assume_absent_zero=True)
+    assert status == "ok"
+    cell = row["annual_ratios"][2025]
+    assert "ronta" not in cell
+    assert "not greater than 0" in cell["ronta_undefined"]
+
+
+def test_ronta_does_not_assume_an_unreported_noncurrent_investment_is_zero():
+    gaap = dict(OE_GAAP)
+    gaap["Goodwill"] = tagdata("USD", [
+        inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+    ])
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2024-12-31", 0, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15"),
+    ])
+    oe = build(gaap).owner_earnings
+
+    assert oe.average_net_tangible_operating_assets is None
+    assert oe.ronta is None
+    assert any("noncurrent investments" in caveat and "RONTA" in caveat
+               for caveat in oe.caveats)
+
+
 def test_nopat_tax_normalization_rejects_misaligned_fiscal_periods():
     gaap = dict(OE_GAAP)
     gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = tagdata("USD", [
@@ -418,6 +1823,8 @@ def test_nopat_tax_normalization_rejects_misaligned_fiscal_periods():
     oe = build(gaap).owner_earnings
     assert oe.normalized_tax_rate is None
     assert oe.nopat is None and oe.nopat_roic is None
+    assert any("fewer than two aligned" in caveat and "NOPAT" in caveat
+               for caveat in oe.caveats)
 
 
 def test_epd_shape_keeps_owner_estimates_distinct_from_standard_fcf():
@@ -518,6 +1925,121 @@ def test_owner_earnings_per_share_keeps_each_complete_audited_year():
         "PaymentsToAcquirePropertyPlantAndEquipment")
 
 
+def test_owner_earnings_retains_proved_same_period_da_scale_fusb_pattern():
+    """A later comparative cannot turn $1.6m of D&A into $1.60.
+
+    FUSB's FY2023 fact is independently present in its earlier 10-K, while both
+    adjacent years corroborate that dollar scale.  Keep the reported earlier
+    fact and disclose the rejected later comparative; do not manufacture a value
+    from company size or from the neighbours themselves.
+    """
+    gaap = dict(OE_GAAP)
+
+    def years(values, tag):
+        gaap[tag] = tagdata("USD", [
+            dur(f"{year}-01-01", f"{year}-12-31", value,
+                accn=f"k{year}", filed=f"{year + 1}-03-15")
+            for year, value in values.items()
+        ])
+
+    years({2022: 8_000_000, 2023: 8_500_000,
+           2024: 9_000_000, 2025: 9_500_000}, "NetIncomeLoss")
+    years({2022: 1_000_000, 2023: 1_100_000,
+           2024: 1_200_000, 2025: 1_300_000},
+          "PaymentsToAcquirePropertyPlantAndEquipment")
+    years({2022: 10_000_000, 2023: 11_000_000,
+           2024: 12_000_000, 2025: 13_000_000},
+          "NetCashProvidedByUsedInOperatingActivities")
+    gaap["WeightedAverageNumberOfDilutedSharesOutstanding"] = tagdata("shares", [
+        dur(f"{year}-01-01", f"{year}-12-31", 6_000_000,
+            accn=f"k{year}", filed=f"{year + 1}-03-15")
+        for year in range(2022, 2026)
+    ])
+    gaap["DepreciationDepletionAndAmortization"] = tagdata("USD", [
+        dur("2022-01-01", "2022-12-31", 1_614_000,
+            accn="k22", filed="2023-03-15"),
+        dur("2023-01-01", "2023-12-31", 1_600_000,
+            accn="k23", filed="2024-03-15"),
+        dur("2023-01-01", "2023-12-31", Decimal("1.6"),
+            accn="k24-bad-comparative", filed="2025-03-15"),
+        dur("2024-01-01", "2024-12-31", 1_600_000,
+            accn="k25", filed="2026-03-15"),
+        dur("2025-01-01", "2025-12-31", 1_700_000,
+            accn="k25", filed="2026-03-15"),
+    ])
+
+    snapshot = build(gaap)
+    repaired = snapshot.owner_earnings.annual[2023].depreciation_and_amortisation
+
+    assert repaired.value == Decimal("1600000")
+    assert repaired.provenance.accession == "k23"
+    assert "exact 1000000x presentation-scale contradiction" in (
+        repaired.provenance.concept)
+    assert {source.accession for source in repaired.provenance.components} == {
+        "k22", "k23", "k24-bad-comparative", "k25",
+    }
+    assert any("FY2023 (1000000x)" in caveat
+               for caveat in snapshot.owner_earnings.caveats)
+
+    from screener.sync import _owner_earnings_row
+    bridge = _owner_earnings_row(snapshot)["annual_per_share"]["2023"][
+        "cash_flow_bridge"]
+    assert bridge["depreciation_and_amortisation"][:5] == [
+        1_600_000.0, "us-gaap:DepreciationDepletionAndAmortization",
+        "10-K", "k23", "2023-12-31",
+    ]
+
+    extension_tag = (
+        "DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms")
+    sidecar = {"facts": {"ext:fusb/2024": {extension_tag: tagdata("USD", [
+        dur("2023-01-01", "2023-12-31", 1_581_000,
+            accn="k24-bad-comparative", filed="2025-03-15"),
+    ])}}}
+    exact = build_snapshot(
+        "FUSB", "0000717806", facts_doc(gaap), dimensioned=sidecar)
+    exact_da = exact.owner_earnings.annual[2023].depreciation_and_amortisation
+    assert exact_da.value == Decimal("1581000")
+    assert exact_da.provenance.accession == "k24-bad-comparative"
+    assert exact_da.provenance.tag == f"ext:fusb/2024:{extension_tag}"
+    assert not any("FY2023 (1000000x)" in caveat
+                   for caveat in exact.owner_earnings.caveats)
+
+
+def test_da_scale_guard_preserves_normal_restatements_and_unproved_endpoints():
+    from screener.normalize import (_annual_union,
+                                    _reconcile_depreciation_scale)
+
+    tag = "DepreciationAndAmortization"
+    ordinary = {tag: tagdata("USD", [
+        dur("2022-01-01", "2022-12-31", 1_500_000,
+            accn="k22", filed="2023-03-15"),
+        dur("2023-01-01", "2023-12-31", 1_600_000,
+            accn="k23", filed="2024-03-15"),
+        dur("2023-01-01", "2023-12-31", 1_550_000,
+            accn="k24-restated", filed="2025-03-15"),
+        dur("2024-01-01", "2024-12-31", 1_700_000,
+            accn="k24", filed="2025-03-15"),
+    ])}
+    series = _annual_union(ordinary, (tag,))
+    reconciled, repairs = _reconcile_depreciation_scale(ordinary, series)
+    assert reconciled[2023].value == Decimal("1550000")
+    assert reconciled[2023].provenance.accession == "k24-restated"
+    assert repairs == []
+
+    endpoint = {tag: tagdata("USD", [
+        dur("2023-01-01", "2023-12-31", 1_600_000,
+            accn="k23", filed="2024-03-15"),
+        dur("2023-01-01", "2023-12-31", Decimal("1.6"),
+            accn="k24-bad", filed="2025-03-15"),
+        dur("2024-01-01", "2024-12-31", 1_700_000,
+            accn="k24", filed="2025-03-15"),
+    ])}
+    series = _annual_union(endpoint, (tag,))
+    reconciled, repairs = _reconcile_depreciation_scale(endpoint, series)
+    assert reconciled[2023].value == Decimal("1.6")
+    assert repairs == []
+
+
 def test_owner_earnings_per_share_does_not_fill_a_missing_component():
     gaap = dict(OE_GAAP)
     gaap["OperatingIncomeLoss"] = tagdata("USD", [
@@ -595,10 +2117,11 @@ def test_owner_earnings_old_share_denominators_are_rebased_for_later_splits():
     assert "later split" in old.diluted_shares.provenance.concept
 
 
-def test_owner_earnings_repairs_a_proved_table_scale_after_split_rebasing():
+def test_proved_table_scale_is_repaired_before_split_rebasing():
     """FIZZ pattern: FY2018 is tagged as 46,921 shares before a 2:1 split,
-    between 92M and 94M split-adjusted years. The owner series alone repairs the
-    exact 1,000x unit; the filing-reported annual-share table remains untouched."""
+    between 92M and 94M split-adjusted years. Filing arithmetic and adjacent
+    counts prove the exact 1,000x unit for the public annual series before owner
+    earnings applies the later 2:1 split to its comparable denominator."""
     gaap = dict(OE_GAAP)
     gaap["EarningsPerShareDiluted"] = tagdata("USD/shares", [
         _yr(2017, 2, "2018-02-15", "k17"),
@@ -628,11 +2151,12 @@ def test_owner_earnings_repairs_a_proved_table_scale_after_split_rebasing():
     snapshot = build(gaap)
     year = snapshot.owner_earnings.annual[2018]
 
-    assert snapshot.annual_share_counts[2018].value == Decimal("46921")
+    assert snapshot.annual_share_counts[2018].value == Decimal("46921000")
+    assert "scaled 1000x" in snapshot.annual_share_counts[2018].provenance.concept
     assert year.diluted_shares.value == Decimal("93842000")
     assert round(float(year.maintenance_estimate_per_share.value), 6) == round(100e6 / 93842000, 6)
-    assert "adjacent fiscal years agree" in year.diluted_shares.provenance.concept
-    assert any("FY2018 (1000x)" in caveat for caveat in snapshot.owner_earnings.caveats)
+    assert "later split" in year.diluted_shares.provenance.concept
+    assert not any("FY2018 (1000x)" in caveat for caveat in snapshot.owner_earnings.caveats)
 
 
 def test_interest_bearing_current_debt_stays_in_invested_capital():
@@ -691,6 +2215,7 @@ def test_historical_tbv_never_turns_a_missing_deduction_into_zero():
 
     assert ratios[2025]["bvps"] == 60
     assert "tbvps" not in ratios[2025]
+    assert "return_on_net_tangible_assets" not in ratios[2025]
 
     # An explicit zero is evidence and restores the calculation; None is never
     # treated as that zero implicitly.
@@ -698,6 +2223,7 @@ def test_historical_tbv_never_turns_a_missing_deduction_into_zero():
         inst("2025-12-31", 0, form="10-K", accn="k25", filed="2026-02-15")])
     ratios = annual_ratios(gaap, income, {}, {}, annual_eps=eps)
     assert ratios[2025]["tbvps"] == 55
+    assert ratios[2025]["return_on_net_tangible_assets"] == round(60 / 550 * 100, 4)
 
 
 def test_historical_book_uses_the_snapshot_selected_share_class():
@@ -738,6 +2264,57 @@ def test_historical_book_uses_the_snapshot_selected_share_class():
 
     assert ratios[2025]["bvps"] == 60
     assert ratios[2025]["tbvps"] == 52
+    assert ratios[2025]["return_on_net_tangible_assets"] == round(60 / 520 * 100, 4)
+
+
+def test_finkle_roe_uses_average_equity_and_debt_ratio_uses_combined_debt():
+    from screener.normalize import _annual_net_income, annual_ratios
+
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2024-01-01", "2024-12-31", 50, accn="k24", filed="2025-02-15"),
+            dur("2025-01-01", "2025-12-31", 60, accn="k25", filed="2026-02-15"),
+        ]),
+        "Assets": tagdata("USD", [
+            inst("2024-12-31", 900, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 1000, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "Liabilities": tagdata("USD", [
+            inst("2024-12-31", 400, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 400, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "LongTermDebtNoncurrent": tagdata("USD", [
+            inst("2024-12-31", 150, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 200, form="10-K", accn="k25", filed="2026-02-15"),
+            # A later quarterly comparative must not replace annual history.
+            inst("2025-12-31", 999, form="10-Q", accn="q126", filed="2026-05-01"),
+        ]),
+        "LongTermDebt": tagdata("USD", [
+            inst("2024-12-31", 160, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 230, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "LongTermDebtCurrent": tagdata("USD", [
+            inst("2024-12-31", 10, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 30, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "ShortTermBorrowings": tagdata("USD", [
+            inst("2024-12-31", 4, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 5, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+        "DebtLongtermAndShorttermCombinedAmount": tagdata("USD", [
+            inst("2024-12-31", 164, form="10-K", accn="k24", filed="2025-02-15"),
+            inst("2025-12-31", 235, form="10-K", accn="k25", filed="2026-02-15"),
+        ]),
+    }
+
+    income = _annual_net_income(gaap)
+    ratios = annual_ratios(gaap, income, {}, {})
+
+    assert ratios[2025]["common_equity"] == 600
+    assert ratios[2025]["average_common_equity"] == 550
+    assert ratios[2025]["return_on_equity"] == round(60 / 550 * 100, 4)
+    assert ratios[2025]["combined_debt"] == 235
+    assert ratios[2025]["debt_to_equity"] == round(235 / 600, 4)
 
 
 def test_stale_zero_on_priority_debt_tag_loses_to_newer_fact():
@@ -968,6 +2545,88 @@ def test_indefinite_class_tags_fill_the_empty_slot_ko_style():
     # the rollup wins over class tags when both exist
     gaap["IndefiniteLivedIntangibleAssetsExcludingGoodwill"] = tagdata("USD", [inst("2026-03-31", 12463e6, accn="q126")])
     assert float(build(gaap).intangibles.value) == 12463e6 + 100e6
+
+
+def test_misused_intangible_total_adds_separate_trademarks_eml_style():
+    gaap = dict(GAAP)
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-01-03", 5269204, form="10-K", accn="k25", filed="2026-03-03"),
+        inst("2026-07-04", 4121143, accn="q226", filed="2026-08-11"),
+    ])
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [
+        inst("2026-01-03", 5269204, form="10-K", accn="k25", filed="2026-03-03"),
+    ])
+    gaap["IndefiniteLivedTrademarks"] = tagdata("USD", [
+        inst("2026-01-03", 5082767, form="10-K", accn="k25", filed="2026-03-03"),
+        inst("2026-07-04", 5082816, accn="q226", filed="2026-08-11"),
+    ])
+
+    # Exact equality is not a market-wide heuristic; without filing-backed
+    # issuer verification the nominal total remains authoritative.
+    assert float(build(gaap).intangibles.value) == 4121143
+
+    s = build_snapshot("EML", "0000031107", facts_doc(gaap))
+    assert float(s.intangibles.value) == 4121143 + 5082816
+    assert s.intangibles.provenance.period_end == date(2026, 7, 4)
+    assert "IntangibleAssetsNetExcludingGoodwill" in s.intangibles.provenance.tag
+    assert "IndefiniteLivedTrademarks" in s.intangibles.provenance.tag
+
+    # Exact equality is the proof: a genuine rollup remains authoritative when
+    # it exceeds its finite-lived component.
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-01-03", 10351971, form="10-K", accn="k25", filed="2026-03-03"),
+        inst("2026-07-04", 9203959, accn="q226", filed="2026-08-11"),
+    ])
+    assert float(build_snapshot(
+        "EML", "0000031107", facts_doc(gaap)).intangibles.value) == 9203959
+
+
+def test_verified_opk_intangible_total_includes_separately_printed_iprd():
+    gaap = dict(GAAP)
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-06-30", 477566000, accn="q226", filed="2026-07-27"),
+    ])
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [
+        inst("2026-06-30", 477566000, accn="q226", filed="2026-07-27"),
+    ])
+    gaap["IndefiniteLivedIntangibleAssetsExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-06-30", 672600000, accn="q226", filed="2026-07-27"),
+    ])
+
+    # AVD uses this same nominal indefinite-lived element for gross cost. The
+    # market-wide rule must therefore keep the exact net balance-sheet total.
+    assert float(build(gaap).intangibles.value) == 477566000
+
+    # OPK's filing says the larger value is net intangibles other than goodwill,
+    # including the separately printed $195m IPR&D balance.
+    s = build_snapshot("OPK", "0000944809", facts_doc(gaap))
+    assert float(s.intangibles.value) == 672600000
+    assert s.intangibles.provenance.period_end == date(2026, 6, 30)
+    assert "IndefiniteLivedIntangibleAssetsExcludingGoodwill" in s.intangibles.provenance.tag
+
+
+def test_verified_brkr_intangible_successor_and_bmrn_total_control():
+    gaap = dict(GAAP)
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2025-12-31", 899.6e6, form="10-K", accn="k25",
+             filed="2026-02-27"),
+    ])
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [
+        inst("2026-03-31", 867.8e6, accn="q126")])
+    assert float(build(gaap).intangibles.value) == 899.6e6
+    assert float(build_snapshot(
+        "BRKR", "0001109354", facts_doc(gaap)).intangibles.value) == 867.8e6
+
+    # BMRN uses both finite-lived and nominal total for the complete net amount;
+    # its separately filed indefinite balance is already inside that total.
+    gaap["IntangibleAssetsNetExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-03-31", 4879367e3, accn="q126")])
+    gaap["FiniteLivedIntangibleAssetsNet"] = tagdata("USD", [
+        inst("2026-03-31", 4879367e3, accn="q126")])
+    gaap["IndefiniteLivedIntangibleAssetsExcludingGoodwill"] = tagdata("USD", [
+        inst("2026-03-31", 300e6, accn="q126")])
+    assert float(build_snapshot(
+        "BMRN", "0001048477", facts_doc(gaap)).intangibles.value) == 4879367e3
 
 
 def test_combined_minus_goodwill_derivation_needs_a_common_period_end():

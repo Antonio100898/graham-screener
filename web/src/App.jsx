@@ -6,7 +6,8 @@ import EarningsEvidence, { epsEvidence } from "./EarningsEvidence.jsx";
 import { fetchJson, send } from "./api.js";
 import { below, spell } from "./format.js";
 import { hasActiveFilters, loadView, saveView, takeOverScrollRestoration, unfilteredView } from "./view.js";
-import { TOTAL_CRITERIA, byN, currentRatio, indexValuation, pe3, priceToBook } from "./screen.js";
+import { TOTAL_CRITERIA, byN, currentRatio, indexValuation, pe3, priceToBook,
+         valuationPrice } from "./screen.js";
 import { AlignmentCompact } from "./Alignment.jsx";
 import { alignmentSortValue } from "./alignment.js";
 import { compareRows, normalizeSort, updateSort } from "./sort.js";
@@ -260,6 +261,7 @@ export default function App() {
   const rows = useMemo(() => {
     if (!data) return [];
     return data.rows.map((r) => {
+      const financialPrice = valuationPrice(r);
       return {
         ...r,
         mcap: r.price && r.shares ? r.price * r.shares : null,
@@ -269,10 +271,12 @@ export default function App() {
         // criteria 2 and 3 cannot be asked of a filer with no classified balance
         // sheet — unlike a missing figure, no later filing will ever supply it
         inapplicable: r.criteria.some((c) => c.status === "NOT_APPLICABLE"),
-        netNet: r.ncavps != null && r.price != null && r.ncavps > 0 && r.price <= r.ncavps,
+        netNet: r.ncavps != null && financialPrice != null
+          && r.ncavps > 0 && financialPrice <= r.ncavps,
         // only while net current assets are positive: a negative denominator
         // would turn the cheapest-looking ratio into the most expensive company
-        pncav: r.ncavps != null && r.price != null && r.ncavps > 0 ? r.price / r.ncavps : null,
+        pncav: r.ncavps != null && financialPrice != null && r.ncavps > 0
+          ? financialPrice / r.ncavps : null,
         idx: r.index_memberships ?? [],
         pe3: pe3(r),
         currentRatio: currentRatio(r),
@@ -645,9 +649,9 @@ export default function App() {
               </td>
               <td data-label="Graham fit"><AlignmentCompact row={r} /></td>
               <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
-              <td className="num" data-label="Mkt cap">{fmtCap(r.mcap)}</td>
+              <td className="num" data-label="Mkt cap">{fmtCap(r.mcap, r.quote_currency ?? r.currency)}</td>
               <td className="num" data-label="Price">
-                {fmtPrice(r.price)}
+                {fmtPrice(r.price, r.quote_currency ?? r.currency)}
                 <span className={`quote-icon ${quoteTone(r)}`} title={quoteTitle(r)}
                       aria-label={quoteStatus(r)}>{quoteIcon(r)}</span>
               </td>
@@ -695,7 +699,7 @@ export default function App() {
       {selected && <Detail row={selected} onClose={() => setSelected(null)}
                            tracked={tracked.has(selected.cik)}
                            onToggleTracked={() => toggleTracked(selected)}
-                           onRecordTrade={() => recordTrade(selected)} />}
+                           onRecordTrade={(detailRow) => recordTrade(detailRow ?? selected)} />}
       {tradeTarget !== null && portfolioData && (
         <TradeModal portfolio={portfolioData.portfolio} rows={rows}
                     initialRow={tradeTarget.cik ? tradeTarget : null}
@@ -746,12 +750,14 @@ const fmtMultiple = (v) => (v == null ? "—" : `${v.toLocaleString(undefined, {
 })}×`);
 
 // penny stocks rounded to 2dp all read "$0.00", which looks like missing data
-const fmtPrice = (v) => {
+const currencySymbol = (currency) => ({ EUR: "€", GBP: "£", JPY: "¥" }[currency] ?? "$");
+const fmtPrice = (v, currency = "USD") => {
   if (v == null) return "—";
-  if (v === 0) return "$0";
-  if (v < 0.01) return `$${v.toPrecision(2)}`;
-  if (v < 1) return `$${v.toFixed(3)}`;
-  return `$${v.toFixed(2)}`;
+  const symbol = currencySymbol(currency);
+  if (v === 0) return `${symbol}0`;
+  if (v < 0.01) return `${symbol}${v.toPrecision(2)}`;
+  if (v < 1) return `${symbol}${v.toFixed(3)}`;
+  return `${symbol}${v.toFixed(2)}`;
 };
 
 // EPS can rise on buybacks alone, so flag when the two move differently
@@ -765,7 +771,8 @@ function divergence(r) {
 
 function niTitle(r) {
   const n = r.niTrend;
-  const ttm = r.ttm_net_income != null ? `TTM net income ${fmtCap(r.ttm_net_income)}` : "";
+  const ttm = r.ttm_net_income != null
+    ? `TTM net income ${fmtCap(r.ttm_net_income, r.currency)}` : "";
   if (!n) return ttm || "net income";
   const pct = n.change == null ? "n/m" : `${n.change >= 0 ? "+" : ""}${Math.round(n.change * 100)}%`;
   return `${ttm}\nchange over the window ${pct}\n` +
@@ -780,15 +787,19 @@ export function drawdownTitle(r) {
     `${p.pct_below_52w_high}% below the 52-week high`,
     `${p.pct_above_52w_low}% above the 52-week low`,
     `${p.pct_below_3y_high}% below the 3-year high`,
-    `${p.pct_vs_3y_average >= 0 ? "+" : ""}${p.pct_vs_3y_average}% versus the 3-year average (${fmtPrice(p.average_3y)})`,
+    `${p.pct_vs_3y_average >= 0 ? "+" : ""}${p.pct_vs_3y_average}% versus the 3-year average (${fmtPrice(p.average_3y, r.quote_currency ?? r.currency)})`,
     `${p.price_to_3y_median}× the 3-year median price`,
     "\nweekly closing prices — a high here is the best weekly close, not an intraday spike",
   ].join("\n");
 }
 
-const fmtCap = (v) => {
+const fmtCap = (v, currency = "USD") => {
   if (!v) return "—";
+  const symbol = currencySymbol(currency);
   for (const [d, s] of [[1e12, "T"], [1e9, "B"], [1e6, "M"]])
-    if (v >= d) return `$${(v / d).toFixed(v / d < 10 ? 1 : 0)}${s}`;
-  return `$${(v / 1e3).toFixed(0)}K`;
+    if (v >= d) {
+      const scaled = v / d;
+      return `${symbol}${scaled.toFixed(s === "B" ? 2 : (scaled < 10 ? 1 : 0))}${s}`;
+    }
+  return `${symbol}${(v / 1e3).toFixed(0)}K`;
 };

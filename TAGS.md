@@ -53,7 +53,8 @@ days and was being booked twice.
 |---|---|---|
 | Net income | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, `ProfitLoss` | carried beside EPS because buybacks can grow EPS while earnings fall |
 | Revenue | `RevenueFromContractWithCustomerExcludingAssessedTax`, `Revenues`, `RevenueFromContractWithCustomerIncludingAssessedTax`, `SalesRevenueNet`, `SalesRevenueGoodsNet`, `SalesRevenueServicesNet`, then sector top lines: `RegulatedAndUnregulatedOperatingRevenue`, `OperatingLeaseLeaseIncome`, `OperatingLeasesIncomeStatementLeaseRevenue`, `RealEstateRevenueNet`, `RevenuesNetOfInterestExpense`, `InterestAndDividendIncomeOperating`, `PremiumsEarnedNet` | ASC 606 (2018) switched most filers mid-history, so selection is recency-first with per-year fill; sector lines exist because a REIT's generic `Revenues` can be a $13M scrap beside $1.5B of lease income |
-| Operating income | `OperatingIncomeLoss` | defensive size context; banks/insurers have no such subtotal — stays absent |
+| Gross profit | `GrossProfit`, checked against same-accession revenue and `CostOfRevenue`, `CostOfGoodsAndServicesSold`, or `CostOfGoodsSold` when a suspicious fact is sub-$1,000 or repeats exactly for at least three fiscal years | SEC Company Facts can expose a hidden `zerodash` as zero (Financial Gravity) or an unprinted hard-coded subtotal (Dolphin Entertainment). A contradictory suspicious fact is withheld, never rescaled or replaced with an inferred subtotal. Genuine small results survive when the identity supports them (Uranium Energy $37,000; Rubicon −$40,000). |
+| Operating income | `OperatingIncomeLoss`; otherwise `GrossProfit − OperatingExpenses` or `SellingGeneralAndAdministrativeExpense` only when the same filing reconciles it exactly to pretax income through `NonoperatingIncomeExpense`, or both `InterestIncomeExpenseNonoperatingNet` and `OtherNonoperatingIncomeExpense`. A second exact inverse path starts at pretax and removes separately filed interest income, interest expense and other nonoperating income/expense, but only when gross profit, SG&A and the separately presented `ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost` independently constrain residual operating-cost rows to at most 5% of gross profit. Generic `ResearchAndDevelopmentExpense` is excluded because it is often a note disclosure already included in SG&A. | reconstructed industrial subtotals retain every source in provenance; the constrained residual admits separately reported rows such as J&J's acquired in-process R&D without guessing their tag. A direct comparative that contradicts a complete same-filing bridge by exactly 1,000× or 1,000,000× is replaced by the reconciled presentation-scale value while the bad fact remains named in provenance (Bio-Techne FY2013). Other disagreement, an unreconciled subtraction, and banks/insurers stay absent. |
 
 ### 1.3 Balance sheet → criteria 2 (CR ≥ 1.5), 3 (debt ≤ 1.1× NCA), 7 (price < 1.2× TBVPS), NCAV
 
@@ -97,7 +98,12 @@ Overstating debt is conservative; double counting is still wrong.
 | Long, additive parts | `OtherLongTermDebtNoncurrent` (only when primary absent), `JuniorSubordinatedDebentureOwedToUnconsolidatedSubsidiaryTrustNoncurrent`, `FinanceLeaseLiabilityNoncurrent` (skipped when the primary already contains leases) |
 | Short, rollup | `DebtCurrent` (terminates the bucket) |
 | Short, parts | `LongTermDebtCurrent` / `LongTermDebtAndCapitalLeaseObligationsCurrent` / `UnsecuredDebtCurrent` (skipped when the long bucket already holds current maturities), `ShortTermBorrowings` / `CommercialPaper`, `FinanceLeaseLiabilityCurrent` |
-| Evidence only | regex over the filer's whole history (`debt|borrowing|notespayable|…`) + `InterestExpenseDebt` family — gates `assume_absent_zero`: debt may be assumed 0 only when nothing debt-shaped ever carried ≥ $1M |
+| Evidence only | regex over the latest annual report and every later structured filing (`debt|borrowing|notespayable|…`) + `InterestExpenseDebt` family — gates the explicit `assume_absent_zero` opt-in: debt may be assumed 0 only when nothing debt-shaped in that current filing window carries ≥ $1M |
+
+The opt-in also treats a separately missing **short-term** bucket as zero when
+that filing window has no current-debt-shaped evidence, even if a noncurrent
+balance exists. Thus EPAM's filed $25M noncurrent debt remains $25M combined debt;
+only its silent current bucket becomes zero.
 
 ### 1.5 Dividends → criterion 5 ("currently pays"), defensive 20-year record
 
@@ -128,6 +134,14 @@ separate:
   and assumed maintenance deduction cancel by construction; and
 - **standard free cash flow:** `operating cash flow - cash capex`.
 
+Engine v115 also publishes Finkle's three-equation reconciliation for the latest
+completed fiscal year: (1) CFO − cash capex; (2) operating income − filed cash
+taxes paid − the change in exact cash-excluded operating capital; and (3) revenue
+− operating costs − filed cash taxes paid − that same capital investment. Methods
+2 and 3 are algebraic rearrangements; method 1 is the independent cash-flow-
+statement check. All inputs must cover the same fiscal period. The payload reports
+`MATCH`, `MISMATCH`, or `INCOMPLETE` and never adjusts a method to force agreement.
+
 The common numerator prefers a direct
 `NetIncomeLossAvailableToCommonStockholders*` fact. Where only parent income is
 available, a same-period preferred-dividend fact is deducted and both source facts
@@ -142,7 +156,7 @@ Engine v112 adds separately named diagnostics without changing any Graham grade:
 | FCF after stock compensation | `ShareBasedCompensation`, then `AllocatedShareBasedCompensationExpense`; standard FCF less the CFO add-back | same fiscal period; conservative shareholder-cost diagnostic, not a second earnings expense |
 | FCF after cash acquisitions | `PaymentsToAcquireBusinessesNetOfCashAcquired`, then gross | same fiscal period; never relabelled standard FCF |
 | Capitalized-intangible cash investment | sum of `PaymentsToDevelopSoftware` and `PaymentsToAcquireIntangibleAssets` | only distinct, same-period cash-flow facts; content/contract costs remain absent without a reliable standard tag |
-| Working-capital cash effect | `IncreaseDecreaseInOperatingAssetsAndLiabilities` | the reported rollup only; overlapping subcomponents are never summed |
+| Working-capital cash effect | inverse of `IncreaseDecreaseInOperatingCapital`; signed adapter rollup `IncreaseDecreaseInOperatingAssetsAndLiabilities`; or a filing-verified complete component family (`IncreaseDecreaseInAccountsReceivable`, `IncreaseDecreaseInInventories`, `IncreaseDecreaseInOtherOperatingAssets`, `IncreaseDecreaseInAccountsPayableAndAccruedLiabilities`, `IncreaseDecreaseInOtherOperatingLiabilities`) | the US-GAAP operating-capital balance movement is sign-inverted to the cash effect; because Company Facts omits issuer-extension rows, a five-row sum is accepted only for an exact SEC accession/year already checked against the rendered statement, and same-context/overlap guards still apply |
 | Operating-lease context | `OperatingLeaseLiability`; lease cost from `OperatingLeaseCost`, `LeaseCost`, `OperatingLeaseExpense`, then `RentExpense` | lease-adjusted debt requires both settled debt and the lease fact; fixed-charge coverage requires operating income, interest and lease cost for one annual period |
 
 Every return denominator is now the exact average of the fiscal year's beginning
@@ -150,9 +164,49 @@ and ending capital. Both balance sheets must report assets, current liabilities,
 and current debt; missing current debt is not treated as zero. Two views are shown:
 capital including all cash, and capital excluding all filed cash and short-term
 investments. The proprietary earnings/cash returns retain those names. A separate
-NOPAT ROIC uses reported operating income, the median of at least two usable tax
+NOPAT ROIC uses reported or exactly reconciled operating income, the median of at least two usable tax
 rates from the latest three years, and average invested capital; pass-through
 entities suppress it. No excess-cash estimate is invented.
+
+Engine v116 adds RONTA = normalized NOPAT / average net tangible operating
+assets. Each NTOA endpoint is the exact-date cash-excluded capital above, less
+goodwill, other intangible assets, and one filed noncurrent-investment balance.
+The noncurrent-investment alternatives are `OtherLongTermInvestments`,
+`LongTermInvestments`, `MarketableSecuritiesNoncurrent`,
+`AvailableForSaleSecuritiesNoncurrent`,
+`DebtSecuritiesAvailableForSaleNoncurrent`, `HeldToMaturitySecuritiesNoncurrent`,
+then `EquityMethodInvestments`. They are never summed because footnote categories
+often overlap a balance-sheet rollup. Absence is not zero: both exact endpoints
+and every deduction are required. The liability deduction remains current
+liabilities less short-term interest-bearing debt. That current portion is read
+independently even when a combined long-term-debt rollup contains it; the
+total-debt double-counting suppression does not apply to NIBCL. XBRL does not identify a
+complete cross-issuer set of noncurrent operating liabilities.
+
+Engine v117 serializes a provenance-backed cash-flow bridge for each of the
+latest ten owner-earnings fiscal-year slots. The identity is reported common net
+income + D&A + separately filed stock compensation + other reconciliation
+adjustments + the filed working-capital cash effect = operating cash flow;
+operating cash flow - cash CapEx = standard FCF. The "other" line is derived as
+the exact residual from those filed totals. If stock compensation or the aggregate
+working-capital cash effect is unavailable, it remains inside the residual instead
+of being assigned zero. CapEx uses the filed total; maintenance and growth portions
+remain missing unless a filing provides a reliable separate fact.
+
+Engine v118 compacts each direct bridge point to `[value, tag, form, accession,
+period end]`. Residual and FCF are audited derivations from those direct rows, so
+their source facts are not duplicated in the payload.
+
+Engine v130 makes operating-lease treatment internally consistent in RONTA.
+`OperatingLeaseLiabilityCurrent` (or the exact difference between
+`OperatingLeaseLiability` and `OperatingLeaseLiabilityNoncurrent`) is retained as
+financing instead of disappearing inside the non-interest-bearing-current-
+liability deduction; the noncurrent portion was already retained by construction.
+A second lease-neutral RONTA removes `OperatingLeaseRightOfUseAsset` from that
+denominator to compare post-ASC-842 balance sheets with their earlier reported
+presentation. It does not capitalize pre-adoption lease commitments. Both exact
+endpoints keep the lease tags and filing provenance; an incomplete post-recognition
+pair remains missing unless the explicit detail assumption mode is requested.
 
 The company panel carries the newest ten completed fiscal-year slots. Every year
 requires the three same-period floor inputs and that year's reported diluted weighted
@@ -172,10 +226,17 @@ increased, and years growing at least 6%. These are observations, never scores.
 | Concept | Tags |
 |---|---|
 | Reported earnings attributable to owners | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, then `ProfitLoss` when it is the only usable total |
-| D&A | `DepreciationDepletionAndAmortization`, `DepreciationAmortizationAndAccretionNet`, `DepreciationAndAmortization`, else `Depreciation` + `AmortizationOfIntangibleAssets` |
+| D&A | `DepreciationDepletionAndAmortization`, `DepreciationAmortizationAndAccretionNet`, `DepreciationAndAmortization`, else `Depreciation` + `AmortizationOfIntangibleAssets`; the explicitly allowlisted DERA extension `DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms` outranks a same-period standard narrative fact when it is at least as recent | FUSB's cash-flow statement reports $1.581m/$1.590m/$1.695m for FY2023–FY2025 through that issuer extension, while its standard element is a rounded note sentence and one filing loses the million scale. If the DERA extension is not cached, an earlier fact for the identical annual period is retained only when the newer value differs by exactly 1,000× or 1,000,000× and both adjacent years corroborate the earlier scale. A lone unusual value is never rescaled. |
 | Total capex | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets`, `PaymentsForCapitalImprovements` |
 | Operating cash flow (standard FCF only) | `NetCashProvidedByUsedInOperatingActivities`, `NetCashProvidedByUsedInOperatingActivitiesContinuingOperations` |
-| Cash & investments (netted from invested capital) | `CashAndCashEquivalentsAtCarryingValue`, `CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`; `ShortTermInvestments`, `AvailableForSaleSecuritiesCurrent`, `MarketableSecuritiesCurrent`, `OtherShortTermInvestments` |
+| Cash & investments (netted from invested capital) | `CashAndCashEquivalentsAtCarryingValue`, `CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`; `ShortTermInvestments`, `AvailableForSaleSecuritiesCurrent`, `MarketableSecuritiesCurrent`, `OtherShortTermInvestments`; modern `DebtSecuritiesHeldToMaturity*Current` only in filing-verified CIK/accession/date contexts |
+
+The modern held-to-maturity current elements are deliberately not general
+fallbacks. Vertiv's 2025 balance sheet proves a distinct `$99.5m` short-term-
+investment row, but Westlake's note classifies `$1.009bn` from the same tag
+family inside cash equivalents. Engine v139 accepts only the exact verified
+Vertiv statement contexts and preserves Westlake as an adverse no-double-count
+test; all other contexts remain missing until their statements are read.
 
 ### 1.7 Earnings-quality notes → criterion 1 disclosure
 
@@ -441,8 +502,9 @@ least one missing concept**.
     sum exists** — HBAN understated $758M (MSRs).
 11. **Series gap-fill without disclosure** — a `ProfitLoss`-filled year sits on
     a different NCI scope than its neighbours, silently.
-12. **Debt evidence has no recency bound** — one $1M entry from 2012 blocks
-    `assume_absent_zero` forever.
+12. ~~**Debt evidence has no recency bound.**~~ Resolved in engine 125: the
+    explicit opt-in searches the latest annual report and all later structured
+    filings, so retired historical borrowings do not masquerade as current debt.
 
 ### 2.2 Verified missing tags (accepted, with the guards verification added)
 

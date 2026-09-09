@@ -82,6 +82,91 @@ def test_current_continuing_series_beats_longer_dead_plain_series():
     assert "ContinuingOperations" in s.annual_eps[2025].provenance.tag
 
 
+def test_later_exact_scale_comparative_cannot_corrupt_statement_history():
+    """GSUN's later 20-F repeated whole-dollar digits under a false thousands header."""
+    from screener.normalize import (
+        _annual_gross_profit, _annual_net_income, _annual_operating_income,
+        _annual_revenue,
+    )
+
+    def history(tag, negative=False):
+        sign = -1 if negative else 1
+        return tagdata("USD", [
+            dur("2021-01-01", "2021-12-31", sign * 8_800_000,
+                accn=f"{tag}-21", filed="2022-03-01"),
+            dur("2022-01-01", "2022-12-31", sign * 4_800_000,
+                accn=f"{tag}-22-original", filed="2023-03-01"),
+            dur("2022-01-01", "2022-12-31", sign * 4_800_000_000,
+                accn="0001213900-25-013985", filed="2025-03-01"),
+            dur("2023-01-01", "2023-12-31", sign * 1_800_000,
+                accn=f"{tag}-23", filed="2024-03-01"),
+        ])
+
+    gaap = {
+        "Revenues": history("revenue"),
+        "GrossProfit": history("gross"),
+        "OperatingIncomeLoss": history("operating", negative=True),
+        "NetIncomeLoss": history("income", negative=True),
+    }
+
+    series = (
+        _annual_revenue(gaap), _annual_gross_profit(gaap),
+        _annual_operating_income(gaap), _annual_net_income(gaap),
+    )
+    for annual in series:
+        assert abs(annual[2022].value) == Decimal("4800000")
+        assert annual[2022].provenance.accession.endswith("22-original")
+        assert "1000x presentation-scale contradiction" in (
+            annual[2022].provenance.concept)
+
+
+def test_two_earlier_filings_prove_a_cash_flow_scale_error_without_smooth_neighbors():
+    """GSUN's lumpy OCF is proved by two filings, not a company-size heuristic."""
+    from screener.normalize import _annual_union
+
+    tag = "NetCashProvidedByUsedInOperatingActivities"
+    gaap = {tag: tagdata("USD", [
+        dur("2020-10-01", "2021-09-30", 31_893,
+            accn="ocf-21", filed="2022-03-01"),
+        dur("2021-10-01", "2022-09-30", 910_251,
+            accn="ocf-22-original", filed="2023-03-01"),
+        dur("2021-10-01", "2022-09-30", 910_251,
+            accn="ocf-22-repeated", filed="2024-03-01"),
+        dur("2021-10-01", "2022-09-30", 910_251_000,
+            accn="0001213900-25-013985", filed="2025-03-01"),
+        dur("2022-10-01", "2023-09-30", -4_216_061,
+            accn="ocf-23", filed="2026-03-01"),
+    ])}
+
+    annual = _annual_union(gaap, (tag,))
+
+    assert annual[2022].value == Decimal("910251")
+    assert annual[2022].provenance.accession == "ocf-22-repeated"
+    assert "two earlier annual filings" in annual[2022].provenance.concept
+
+
+def test_unreviewed_alternating_scale_history_is_not_automatically_rewritten():
+    """IOR proves that adjacent malformed filings can point in opposite directions."""
+    from screener.normalize import _annual_net_income
+
+    gaap = {"NetIncomeLoss": tagdata("USD", [
+        dur("2009-01-01", "2009-12-31", 920,
+            accn="ior-2011", filed="2012-03-30"),
+        dur("2010-01-01", "2010-12-31", 1_838,
+            accn="ior-2011", filed="2012-03-30"),
+        dur("2010-01-01", "2010-12-31", 1_838_000,
+            accn="ior-2012", filed="2013-04-16"),
+        dur("2011-01-01", "2011-12-31", 669,
+            accn="ior-2013", filed="2014-03-31"),
+    ])}
+
+    annual = _annual_net_income(gaap)
+
+    assert annual[2010].value == Decimal("1838000")
+    assert annual[2010].provenance.accession == "ior-2012"
+
+
+
 def test_stale_continuing_ops_series_not_preferred():
     cont = [dur(f"{y}-01-01", f"{y}-12-31", 1.0, accn=f"c{y}", filed=f"{y + 1}-02-15")
             for y in (2015, 2016, 2017, 2018, 2019)]
@@ -105,6 +190,74 @@ def test_overlapping_period_never_invents_a_later_year():
     s = build(gaap)
     assert sorted(s.annual_eps) == [2022]
     assert float(s.annual_eps[2022].value) == -1.0  # SEC's own label is authoritative
+
+
+def test_eighteen_day_bankruptcy_stub_is_not_a_redated_fiscal_year():
+    """Weatherford's predecessor ended December 13 and its successor covered the
+    remaining 18 days.  Those are separate reporting periods, not two 52/53-week
+    renditions of one year, so only one may own FY2019."""
+    from screener.normalize import _fy_labels
+
+    ends = ["2019-12-13", "2019-12-31", "2020-12-31"]
+    by_end = {
+        end: {"end": end, "fy": 2020 if end == "2020-12-31" else 2019}
+        for end in ends
+    }
+    labels = _fy_labels(ends, {"2020-12-31": 2020}, by_end)
+
+    assert labels["2019-12-13"] == 2019
+    assert "2019-12-31" not in labels
+
+
+def test_fresh_start_balance_dates_do_not_replace_the_fiscal_year_end():
+    """A predecessor close and successor opening balance in the annual report
+    must not supply the capital base for the combined full-year earnings."""
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            {**dur("2024-01-01", "2024-12-31", -120,
+                   accn="k25", filed="2026-03-16"), "frame": "CY2024"},
+            {**dur("2025-01-01", "2025-12-31", -276,
+                   accn="ka25", filed="2026-04-30"), "frame": "CY2025"},
+        ]),
+        "Assets": tagdata("USD", [
+            inst("2025-03-12", 872, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-03-13", 872, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-12-31", 599, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+        ]),
+        "Liabilities": tagdata("USD", [
+            inst("2025-03-12", 799, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-03-13", 799, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-12-31", 808, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+        ]),
+        "AssetsCurrent": tagdata("USD", [
+            inst("2025-03-12", 300, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-12-31", 100, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+        ]),
+        "LiabilitiesCurrent": tagdata("USD", [
+            inst("2025-03-12", 100, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+            inst("2025-12-31", 50, form="10-K", accn="k25",
+                 filed="2026-03-16"),
+        ]),
+    }
+    from screener.normalize import _annual_net_income, annual_ratios, fiscal_year_ends
+
+    income = _annual_net_income(gaap)
+    assert fiscal_year_ends(gaap)[2025] == "2025-12-31"
+
+    ratios = annual_ratios(gaap, income, {}, {})
+    assert ratios[2025]["end"] == "2025-12-31"
+    assert ratios[2025]["current_ratio"] == 2
+    assert "return_on_book" not in ratios[2025]
+    assert "return_on_equity" not in ratios[2025]
 
 
 def test_label_never_lands_after_the_year_the_period_ends_in():
@@ -317,11 +470,13 @@ def test_january_filer_uses_one_filing_declared_calendar_across_every_series():
     income = [annual(2024, 525.705e6), annual(2025, 714.138e6),
               annual(2026, 908.906e6)]
     revenue = [annual(2024, 2.36e9), annual(2025, 2.75e9), annual(2026, 3.10e9)]
+    gross = [annual(2024, 1.18e9), annual(2025, 1.65e9), annual(2026, 1.86e9)]
     operating = [annual(2024, 500e6), annual(2025, 620e6), annual(2026, 760e6)]
     gaap = {
         "EarningsPerShareDiluted": tagdata("USD/shares", eps),
         "NetIncomeLoss": tagdata("USD", income),
         "Revenues": tagdata("USD", revenue),
+        "GrossProfit": tagdata("USD", gross),
         "OperatingIncomeLoss": tagdata("USD", operating),
         "Assets": tagdata("USD", [
             {**inst(f"{y}-01-31", 5e9 + y, form="10-K", accn=f"k{y}",
@@ -354,7 +509,36 @@ def test_january_filer_uses_one_filing_declared_calendar_across_every_series():
     ratios = annual_ratios(gaap, annual_income, annual_sales, annual_op,
                            annual_eps=annual_eps)
     assert ratios[2025]["end"] == "2025-01-31"
+    assert ratios[2025]["revenue"] == 2.75e9
+    assert ratios[2025]["gross_margin"] == 60.0
     assert ratios[2025]["net_margin"] == round(714.138e6 / 2.75e9 * 100, 4)
+
+
+def test_ratio_history_defaults_to_latest_ten_fiscal_years():
+    from screener.normalize import _annual_net_income, _annual_revenue, annual_ratios
+
+    years = range(2015, 2027)
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur(f"{year}-01-01", f"{year}-12-31", 10, accn=f"k{year}",
+                filed=f"{year + 1}-02-15") for year in years]),
+        "Revenues": tagdata("USD", [
+            dur(f"{year}-01-01", f"{year}-12-31", 100, accn=f"k{year}",
+                filed=f"{year + 1}-02-15") for year in years]),
+        "GrossProfit": tagdata("USD", [
+            dur(f"{year}-01-01", f"{year}-12-31", 40, accn=f"k{year}",
+                filed=f"{year + 1}-02-15") for year in years]),
+        "Assets": tagdata("USD", [
+            inst(f"{year}-12-31", 1000, form="10-K", accn=f"k{year}",
+                 filed=f"{year + 1}-02-15") for year in years]),
+    }
+
+    revenue = _annual_revenue(gaap)
+    ratios = annual_ratios(gaap, _annual_net_income(gaap), revenue, {})
+
+    assert list(ratios) == list(range(2017, 2027))
+    assert ratios[2026]["revenue"] == 100
+    assert ratios[2026]["gross_margin"] == 40
 
 
 def test_current_january_convention_overrides_inconsistent_old_sec_fy_metadata():
@@ -421,6 +605,30 @@ def test_one_split_restated_across_two_filings_is_counted_once():
     assert round(float(s.annual_eps[2024].value), 4) == 4.8
 
 
+def test_filing_that_explicitly_restated_a_split_is_not_adjusted_twice():
+    """Zoomcar's FY2025 10-K already reflects the March 2025 1-for-20 split.
+
+    A later quarter is when the same restatement became observable in Company
+    Facts.  The detector therefore dates the event after the annual filing, but
+    the primary report itself proves the annual comparative is already rebased.
+    """
+    accession = "0001213900-25-059675"
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            _yr(2024, -3839.73, "2025-06-30", accession),
+            dur("2025-04-01", "2025-06-30", -2,
+                form="10-Q", accn="q1-original", filed="2025-08-14"),
+            dur("2025-04-01", "2025-06-30", -40,
+                form="10-Q", accn="q1-restated", filed="2025-11-14"),
+        ]),
+    }
+    from screener.normalize import _annual_eps, _with_fiscal_calendar
+
+    eps = _annual_eps(_with_fiscal_calendar(gaap, cik="0001854275"))
+
+    assert eps[2024].value == Decimal("-3839.73")
+
+
 def test_two_genuine_splits_a_year_apart_both_apply():
     """Texas Pacific Land split 3:1 twice. Collapsing them would leave the oldest years
     understated by a factor of three."""
@@ -437,6 +645,35 @@ def test_two_genuine_splits_a_year_apart_both_apply():
     s = build(gaap)
     assert round(float(s.annual_eps[2021].value), 2) == 10.0     # 90 / 9
     assert round(float(s.annual_eps[2024].value), 2) == 6.57
+
+
+def test_conversion_exchange_ratio_is_not_rounded_into_a_stock_split():
+    """Marathon Bancorp restated an old quarter by its 1.3728 conversion ratio.
+
+    Rounded EPS moved from $0.09 to $0.06, which looks exactly like 1.5:1 in
+    isolation.  The same-period weighted share count moved by 1.3728 instead and
+    must veto that false split; otherwise every annual EPS is divided by 1.5.
+    """
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2024-07-01", "2025-06-30", 0.02,
+                accn="annual", filed="2025-09-26"),
+            dur("2024-07-01", "2024-09-30", 0.09,
+                form="10-Q", accn="old-q", filed="2024-11-13"),
+            dur("2024-07-01", "2024-09-30", 0.06,
+                form="10-Q", accn="conversion-q", filed="2025-11-12"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2024-07-01", "2024-09-30", 2_035_131,
+                form="10-Q", accn="old-q", filed="2024-11-13"),
+            dur("2024-07-01", "2024-09-30", 2_793_828,
+                form="10-Q", accn="conversion-q", filed="2025-11-12"),
+        ]),
+    }
+    from screener.normalize import _annual_eps, _with_fiscal_calendar
+
+    wrapped = _with_fiscal_calendar(gaap, cik="0001835385")
+    assert _annual_eps(wrapped)[2025].value == Decimal("0.02")
 
 
 def test_a_quarter_and_a_year_to_date_closing_together_are_not_a_split():
@@ -1112,6 +1349,765 @@ def test_statement_share_scale_is_reconciled_from_same_filing_arithmetic():
     assert _basis_conflict(gaap, {}, eps, income, {}, False) is None
 
 
+def test_eps_sign_can_use_direct_common_income_even_with_nci():
+    """Neonode's common numerator settles a bad positive loss-per-share sign.
+
+    The consolidated parent has NCI, but the same filing separately reports the
+    common loss.  Once the sign is corrected, that filing also proves that its
+    displayed 9,989 weighted shares mean 9.989 million.
+    """
+    accession = "0001213900-22-011462"
+    gaap = {
+        "EarningsPerShareBasicAndDiluted": tagdata("USD/shares", [
+            dur("2020-01-01", "2020-12-31", 0.56,
+                accn=accession, filed="2022-03-10")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2020-01-01", "2020-12-31", -6_282_000,
+                accn=accession, filed="2022-03-10")]),
+        "NetIncomeLossAvailableToCommonStockholdersBasic": tagdata("USD", [
+            dur("2020-01-01", "2020-12-31", -5_638_000,
+                accn=accession, filed="2022-03-10")]),
+        "WeightedAverageNumberOfSharesOutstandingBasic": tagdata("shares", [
+            dur("2020-01-01", "2020-12-31", 9_989,
+                accn=accession, filed="2022-03-10")]),
+        "MinorityInterest": tagdata("USD", [
+            inst("2020-12-31", 1_000_000, accn=accession)]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0000087050")
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert eps[2020].value == Decimal("-0.56")
+    assert "primary statement presentation verified" in eps[2020].provenance.concept
+    assert counts[2020].value == Decimal("9989000")
+
+
+def test_common_income_xbrl_sign_does_not_override_unreviewed_eps():
+    """Same-filing arithmetic is insufficient because either sign can be bad."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", 0.34,
+                accn="unreviewed", filed="2026-03-01")]),
+        "NetIncomeLossAvailableToCommonStockholdersDiluted": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", -3_400_000,
+                accn="unreviewed", filed="2026-03-01")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 10_000_000,
+                accn="unreviewed", filed="2026-03-01")]),
+    }
+    from screener.normalize import _annual_eps
+
+    assert _annual_eps(gaap)[2025].value == Decimal("0.34")
+
+
+def test_share_comparative_scale_does_not_use_current_count_as_period_proof():
+    """Today's count cannot decide the basis of an older comparative.
+
+    Issuance, splits, classes and depositary ratios can all move the count by an
+    exact-looking factor.  Without filing-local arithmetic or a reviewed primary
+    statement, the latest same-period observation remains untouched.
+    """
+    gaap = {
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2018-01-01", "2018-12-31", 6_000_000,
+                accn="k18", filed="2019-03-01"),
+            dur("2019-01-01", "2019-12-31", 7_000_000,
+                accn="k19", filed="2020-03-01"),
+            dur("2019-01-01", "2019-12-31", 7_000,
+                accn="k20-bad", filed="2021-03-01"),
+            dur("2020-01-01", "2020-12-31", 8_000_000,
+                accn="k20", filed="2021-03-01"),
+            dur("2021-01-01", "2021-12-31", 8_200,
+                accn="k21-bad", filed="2022-03-01"),
+            dur("2021-01-01", "2021-12-31", 8_200_000,
+                accn="k22-fixed", filed="2023-03-01"),
+            dur("2022-01-01", "2022-12-31", 8_400_000,
+                accn="k22-fixed", filed="2023-03-01"),
+        ]),
+        "CommonStockSharesOutstanding": tagdata("shares", [
+            inst("2022-12-31", 8_500_000, accn="k22-fixed")]),
+    }
+    from screener.normalize import _annual_share_counts
+
+    counts = _annual_share_counts(gaap, {}, {}, {})
+
+    assert counts[2019].value == Decimal("7000")
+    assert counts[2019].provenance.accession == "k20-bad"
+    assert counts[2021].value == Decimal("8200000")
+    assert counts[2021].provenance.accession == "k22-fixed"
+
+
+def test_filing_local_rounded_eps_proves_a_thousands_share_scale():
+    """A cent-rounded EPS is tested as a displayed value, not false precision."""
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2019-01-01", "2019-12-31", -0.04,
+                accn="k21", filed="2022-03-01")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2019-01-01", "2019-12-31", -20_812_000,
+                accn="k21", filed="2022-03-01")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2018-01-01", "2018-12-31", 440_016_000,
+                accn="k20", filed="2021-03-01"),
+            dur("2019-01-01", "2019-12-31", 564_188,
+                accn="k21", filed="2022-03-01"),
+            dur("2020-01-01", "2020-12-31", 725_129_000,
+                accn="k21", filed="2022-03-01"),
+        ]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2019].value == Decimal("564188000")
+    assert "reconciled to EPS and income" in counts[2019].provenance.concept
+
+
+def test_zero_diluted_count_falls_back_but_contradictory_eps_is_withheld():
+    """A loss year's zero diluted denominator is missing, never zero evidence."""
+    accession = "0001654954-19-005469"
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2017-01-01", "2017-12-31", 0,
+                accn=accession, filed="2019-04-01")]),
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2017-01-01", "2017-12-31", 997.64,
+                accn=accession, filed="2019-04-01")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2017-01-01", "2017-12-31", -10_696_000,
+                accn=accession, filed="2019-04-01")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2017-01-01", "2017-12-31", 0,
+                accn=accession, filed="2019-04-01")]),
+        "WeightedAverageNumberOfSharesOutstandingBasic": tagdata("shares", [
+            dur("2017-01-01", "2017-12-31", 11,
+                accn=accession, filed="2019-04-01")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0000924515")
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert 2017 not in eps
+    assert counts[2017].value == Decimal("11000")
+    assert "primary statement share presentation verified" in (
+        counts[2017].provenance.concept)
+
+
+def test_share_scale_uses_raw_filing_eps_before_later_split_restatement():
+    """A later split changes history EPS, not the old filing's own identity.
+
+    PACCAR's FY2016 report says 351.8 shares in millions, $1.48 EPS and
+    $521.7M net income. Its split-adjusted history carries $0.9867 EPS, so the
+    selected public series cannot be the evidence used to recover the scale.
+    """
+    from dataclasses import replace
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2016-01-01", "2016-12-31", 1.48,
+                accn="k18", filed="2019-02-26")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2016-01-01", "2016-12-31", 521.7e6,
+                accn="k18", filed="2019-02-26")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2016-01-01", "2016-12-31", 351.8,
+                accn="k18", filed="2019-02-26")]),
+    }
+    filed_eps = _annual_eps(gaap)
+    split_adjusted = {2016: replace(
+        filed_eps[2016], value=Decimal("0.9866666666666667"))}
+
+    counts = _annual_share_counts(
+        gaap, {}, split_adjusted, _annual_net_income(gaap))
+
+    assert counts[2016].value == Decimal("351800000.0")
+    assert "scaled 1000000x" in counts[2016].provenance.concept
+
+
+def test_share_scale_reconciliation_repairs_an_over_scaled_raw_fact():
+    """Northern Trust's renderer displays 224,053,430 shares while its raw
+    comparative carries 224,053,430,000,000 under the plain shares unit."""
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2008-01-01", "2008-12-31", 3.47,
+                accn="k10", filed="2011-02-25")]),
+        "NetIncomeLossAvailableToCommonStockholdersBasic": tagdata("USD", [
+            dur("2008-01-01", "2008-12-31", 776.5e6,
+                accn="k10", filed="2011-02-25")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2007-01-01", "2007-12-31", 223_079_180,
+                accn="k09", filed="2010-02-26"),
+            dur("2008-01-01", "2008-12-31", 224_053_430_000_000,
+                accn="k10", filed="2011-02-25")]),
+    }
+
+    counts = _annual_share_counts(
+        gaap, {}, _annual_eps(gaap), _annual_net_income(gaap))
+
+    assert counts[2008].value == Decimal("224053430.000000")
+    assert "scaled 0.000001x" in counts[2008].provenance.concept
+
+
+def test_a_bad_income_eps_pair_cannot_shrink_a_continuous_share_count():
+    """An exact three-cell identity does not by itself identify the bad cell.
+
+    TCI's surrounding reports keep the weighted count near 8.1M; a filing-local
+    loss/EPS pair implying 8.1 thousand therefore cannot rescale that count.
+    """
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2011-01-01", "2011-12-31", -8.41,
+                accn="bad", filed="2013-03-29")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2011-01-01", "2011-12-31", -67_196,
+                accn="bad", filed="2013-03-29")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2010-01-01", "2010-12-31", 8_220_000,
+                accn="prior", filed="2012-03-30"),
+            dur("2011-01-01", "2011-12-31", 8_113_575,
+                accn="bad", filed="2013-03-29"),
+            dur("2012-01-01", "2012-12-31", 8_370_729,
+                accn="next", filed="2014-03-28"),
+        ]),
+    }
+
+    counts = _annual_share_counts(
+        gaap, {}, _annual_eps(gaap), _annual_net_income(gaap))
+
+    assert counts[2011].value == Decimal("8113575")
+    assert "scaled" not in counts[2011].provenance.concept
+
+
+def test_reconciled_income_scale_cannot_be_transferred_into_share_count():
+    """GSUN's bad comparative income must not make its good count 1,000x larger.
+
+    The later 20-F repeats the prior $2.139M loss as $2.139B.  Annual income has
+    already retained the corroborated original value, so the malformed raw
+    numerator is not independent evidence for changing 1.443M filed shares.
+    """
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _with_fiscal_calendar,
+    )
+
+    bad_accession = "0001213900-25-013985"
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2021-10-01", "2022-09-30", -1.48,
+                accn=bad_accession, filed="2025-02-14")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2020-10-01", "2021-09-30", -8_800_000,
+                accn="income-21", filed="2022-03-01"),
+            dur("2021-10-01", "2022-09-30", -2_139_320,
+                accn="income-22-original", filed="2023-03-01"),
+            dur("2021-10-01", "2022-09-30", -2_139_320,
+                accn="income-22-repeated", filed="2024-03-01"),
+            dur("2021-10-01", "2022-09-30", -2_139_320_000,
+                accn=bad_accession, filed="2025-02-14"),
+            dur("2022-10-01", "2023-09-30", -1_800_000,
+                accn="income-23", filed="2024-03-01"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2021-10-01", "2022-09-30", 1_443_316,
+                accn=bad_accession, filed="2025-02-14")]),
+    }
+    gaap = _with_fiscal_calendar(gaap, cik="0001826376")
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert income[2022].value == Decimal("-2139320")
+    assert counts[2022].value == Decimal("1443316")
+    assert "scaled" not in counts[2022].provenance.concept
+
+
+def test_diluted_share_scale_can_use_same_filing_if_converted_numerator():
+    """SBFG's diluted EPS adds convertible preferred dividends back.
+
+    Its primary FY2017 statement prints all dollar figures and share counts in
+    thousands: $7.619M total income, $6.663M basic common income, 6.423M diluted
+    shares and $1.19 diluted EPS.  The basic numerator must not hide the exact
+    diluted identity carried by the same report.
+    """
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2015-01-01", "2015-12-31", 1.19,
+                accn="0001213900-18-002757", filed="2018-03-09")]),
+        "NetIncomeLossAvailableToCommonStockholdersBasic": tagdata("USD", [
+            dur("2015-01-01", "2015-12-31", 6_663_000,
+                accn="0001213900-18-002757", filed="2018-03-09")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2015-01-01", "2015-12-31", 7_619_000,
+                accn="0001213900-18-002757", filed="2018-03-09")]),
+        "PreferredStockDividendsAndOtherAdjustments": tagdata("USD", [
+            dur("2015-01-01", "2015-12-31", 956_000,
+                accn="0001213900-18-002757", filed="2018-03-09")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2015-01-01", "2015-12-31", 6_423,
+                accn="0001213900-18-002757", filed="2018-03-09")]),
+    }
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2015].value == Decimal("6423000")
+    assert "scaled 1000x" in counts[2015].provenance.concept
+
+
+def test_direct_common_identity_blocks_malformed_preferred_fallback():
+    """A bad preferred-dividend fact cannot inflate NOTVQ's sound 7.96M count."""
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2013-10-01", "2014-09-30", -0.13,
+                accn="notvq-14", filed="2015-12-01")]),
+        "NetIncomeLossAvailableToCommonStockholdersBasic": tagdata("USD", [
+            dur("2013-10-01", "2014-09-30", -1_070_000,
+                accn="notvq-14", filed="2015-12-01")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2013-10-01", "2014-09-30", -1_070_000,
+                accn="notvq-14", filed="2015-12-01")]),
+        "DividendsPreferredStock": tagdata("USD", [
+            dur("2013-10-01", "2014-09-30", 991_080_000,
+                accn="notvq-14", filed="2015-12-01")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2013-10-01", "2014-09-30", 7_960_000,
+                accn="notvq-14", filed="2015-12-01")]),
+    }
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2014].value == Decimal("7960000")
+    assert "scaled" not in counts[2014].provenance.concept
+
+
+def test_rounded_eps_recovers_scale_without_inventing_false_precision():
+    """CCBG's $0.01 EPS can still prove that 17,220 means 17.220M.
+
+    $108K / 17.220M is $0.0063, which the statement legitimately displays as
+    one cent.  Testing the displayed EPS interval recovers the exact thousands
+    scale without pretending that the rounded cent is infinitely precise.
+    """
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2011-01-01", "2011-12-31", 0.29,
+                accn="k11", filed="2012-03-01"),
+            dur("2012-01-01", "2012-12-31", 0.01,
+                accn="k12", filed="2013-03-01"),
+            dur("2013-01-01", "2013-12-31", 0.59,
+                accn="k13", filed="2014-03-01"),
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2011-01-01", "2011-12-31", 4_897_000,
+                accn="k11", filed="2012-03-01"),
+            dur("2012-01-01", "2012-12-31", 108_000,
+                accn="k12", filed="2013-03-01"),
+            dur("2013-01-01", "2013-12-31", 10_265_000,
+                accn="k13", filed="2014-03-01"),
+        ]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2011-01-01", "2011-12-31", 17_140_000,
+                accn="k11", filed="2012-03-01"),
+            dur("2012-01-01", "2012-12-31", 17_220,
+                accn="k12", filed="2013-03-01"),
+            dur("2013-01-01", "2013-12-31", 17_399_000,
+                accn="k13", filed="2014-03-01"),
+        ]),
+    }
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2012].value == Decimal("17220000")
+    assert "reconciled to EPS and income" in counts[2012].provenance.concept
+
+
+def test_berkshire_old_derived_history_is_put_on_class_b_basis():
+    """Berkshire's statement expressly makes one Class A share equal to 1,500
+    Class B shares. Old whole-company arithmetic must use the priced B basis."""
+    from screener.models import Fact, Provenance
+    from screener.normalize import _restate_verified_equivalent_class_history
+
+    source = Provenance(
+        concept="EarningsPerShare (derived: earnings available to common / share count)",
+        tag="us-gaap:NetIncomeLoss / us-gaap:WeightedAverageNumberOfSharesOutstandingBasic",
+        fiscal_year=2009, form="10-K", accession="0001193125-12-079022",
+        filed=date(2012, 2, 27), period_end=date(2009, 12, 31),
+        period_start=date(2009, 1, 1),
+    )
+    count_source = Provenance(
+        concept="WeightedAverageNumberOfSharesOutstandingBasic",
+        tag="us-gaap:WeightedAverageNumberOfSharesOutstandingBasic",
+        fiscal_year=2009, form="10-K", accession="0001193125-12-079022",
+        filed=date(2012, 2, 27), period_end=date(2009, 12, 31),
+        period_start=date(2009, 1, 1),
+    )
+
+    eps, counts = _restate_verified_equivalent_class_history(
+        ("0001067983", "BRK-B"),
+        {2009: Fact(Decimal("5193"), source)},
+        {2009: Fact(Decimal("1551174"), count_source)},
+    )
+
+    assert eps[2009].value == Decimal("3.462")
+    assert counts[2009].value == Decimal("2326761000")
+    assert "Class A to Class B basis" in eps[2009].provenance.concept
+
+
+def test_wrong_common_income_scale_cannot_rescale_a_correct_share_count():
+    """KFFB's common-income tag is 1,000x above its printed net income.
+
+    The filed EPS already reconciles the ordinary NetIncomeLoss and the raw
+    weighted count, which proves the count without trusting the malformed
+    common-income sibling.
+    """
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2023-07-01", "2024-06-30", -0.21,
+                accn="0001213900-25-093967", filed="2025-09-30")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2023-07-01", "2024-06-30", -1721000,
+                accn="0001213900-25-093967", filed="2025-09-30")]),
+        "NetIncomeLossAvailableToCommonStockholdersDiluted": tagdata("USD", [
+            dur("2023-07-01", "2024-06-30", -1721000000,
+                accn="0001213900-25-093967", filed="2025-09-30")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2023-07-01", "2024-06-30", 8098715,
+                accn="0001213900-25-093967", filed="2025-09-30")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _common_owner_earnings, _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0001297341")
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2024].value == Decimal("8098715")
+    assert "scaled" not in counts[2024].provenance.concept
+    owner = _common_owner_earnings(gaap)[2024]
+    assert owner.value == Decimal("-1721000")
+    assert owner.provenance.tag == "us-gaap:NetIncomeLoss"
+
+
+def test_verified_statement_share_scale_handles_rounded_one_cent_eps():
+    """Zion labels the count itself as thousands; one-cent EPS is too rounded
+    for the ordinary income/EPS identity to prove the exact multiplier."""
+    gaap = {
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2025-01-01", "2025-12-31", -0.01,
+                accn="0001437749-26-009073", filed="2026-03-19")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2025-01-01", "2025-12-31", -7627000,
+                accn="0001437749-26-009073", filed="2026-03-19")]),
+        "WeightedAverageNumberOfSharesOutstandingBasic": tagdata("shares", [
+            dur("2025-01-01", "2025-12-31", 1083276,
+                accn="0001437749-26-009073", filed="2026-03-19")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0001131312")
+    counts = _annual_share_counts(
+        gaap, {}, _annual_eps(gaap), _annual_net_income(gaap))
+
+    assert counts[2025].value == Decimal("1083276000")
+    assert "primary statement share presentation verified" in (
+        counts[2025].provenance.concept)
+
+
+def test_verified_statement_share_scale_can_reduce_a_pre_ipo_comparative():
+    """BCAX's primary statement settles the old denominator despite the IPO.
+
+    A current-count continuity heuristic would reject the genuine 580,109-share
+    pre-IPO denominator because the 2024 IPO expanded the company to millions of
+    common shares. The exact reviewed accession is therefore the proof.
+    """
+    accession = "0002023658-25-000012"
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2023-01-01", "2023-12-31", -89.61,
+                accn=accession, filed="2025-03-27")]),
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2023-01-01", "2023-12-31", -51_985_000,
+                accn=accession, filed="2025-03-27")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2023-01-01", "2023-12-31", 580_109_000,
+                accn=accession, filed="2025-03-27")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+        _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0002023658")
+    counts = _annual_share_counts(
+        gaap, {}, _annual_eps(gaap), _annual_net_income(gaap))
+
+    assert counts[2023].value == Decimal("580109.000")
+    assert "primary statement share presentation verified" in (
+        counts[2023].provenance.concept)
+
+
+def test_verified_statement_share_scale_is_exactly_accession_scoped():
+    """A reviewed PAGS comparative does not authorize a company-wide guess."""
+    gaap = {
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2021-01-01", "2021-12-31", 332_174_824_000,
+                accn="0001628280-24-018744", filed="2024-04-25"),
+            dur("2022-01-01", "2022-12-31", 329_234_693,
+                accn="unreviewed-accession", filed="2025-04-25"),
+        ]),
+    }
+    from screener.normalize import _annual_share_counts, _with_fiscal_calendar
+
+    gaap = _with_fiscal_calendar(gaap, cik="0001712807")
+    counts = _annual_share_counts(gaap, {}, {}, {})
+
+    assert counts[2021].value == Decimal("332174824.000")
+    assert counts[2022].value == Decimal("329234693")
+    assert "scaled" not in counts[2022].provenance.concept
+
+
+def test_verified_cross_tag_eps_scale_uses_the_primary_statement_value():
+    """Zion's FY2021 primary 10-K says $(0.04); the next comparative's
+    Inline-XBRL says $(40) under a different EPS tag."""
+    gaap = {
+        "EarningsPerShareBasicAndDiluted": tagdata("USD/shares", [
+            dur("2020-01-01", "2020-12-31", -0.04,
+                accn="k20", filed="2021-03-24")]),
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2021-01-01", "2021-12-31", -40,
+                accn="0001213900-23-023118", filed="2023-03-27"),
+            dur("2022-01-01", "2022-12-31", -0.12,
+                accn="k22", filed="2024-03-20")]),
+    }
+    from screener.normalize import _annual_eps, _with_fiscal_calendar
+
+    eps = _annual_eps(_with_fiscal_calendar(gaap, cik="0001131312"))
+
+    assert eps[2021].value == Decimal("-0.040")
+    assert "primary statement per-share presentation verified" in (
+        eps[2021].provenance.concept)
+
+
+def test_verified_eps_scale_is_exactly_accession_scoped():
+    """ADSE's reviewed FY2020 comparative cannot authorize a broad EPS guess."""
+    gaap = {
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2020-01-01", "2020-12-31", -320.86,
+                accn="0001213900-23-038592", filed="2023-05-11", form="20-F"),
+            dur("2021-01-01", "2021-12-31", -3.46,
+                accn="unreviewed-accession", filed="2024-05-11", form="20-F"),
+        ]),
+    }
+    from screener.normalize import _annual_eps, _with_fiscal_calendar
+
+    eps = _annual_eps(_with_fiscal_calendar(gaap, cik="0001879248"))
+
+    assert eps[2020].value == Decimal("-0.32086")
+    assert eps[2021].value == Decimal("-3.46")
+    assert "primary statement per-share presentation verified" in (
+        eps[2020].provenance.concept)
+    assert "scaled" not in eps[2021].provenance.concept
+
+
+def test_verified_monetary_table_scale_repairs_income_and_operating_profit():
+    """TCI's primary table states both rows in thousands, beside $8.41 EPS."""
+    accession = "0001010549-13-000233"
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2010-01-01", "2010-12-31", -67_196,
+                accn=accession, filed="2013-03-28")]),
+        "OperatingIncomeLoss": tagdata("USD", [
+            dur("2010-01-01", "2010-12-31", -16_337,
+                accn=accession, filed="2013-03-28")]),
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2010-01-01", "2010-12-31", -8.41,
+                accn=accession, filed="2013-03-28")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata("shares", [
+            dur("2010-01-01", "2010-12-31", 8_113_575,
+                accn=accession, filed="2013-03-28")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_operating_income,
+        _annual_share_counts, _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0000733590")
+    income = _annual_net_income(gaap)
+    operating = _annual_operating_income(gaap)
+    counts = _annual_share_counts(gaap, {}, _annual_eps(gaap), income)
+
+    assert income[2010].value == Decimal("-67196000")
+    assert operating[2010].value == Decimal("-16337000")
+    assert counts[2010].value == Decimal("8113575")
+    assert "primary statement monetary presentation verified" in (
+        income[2010].provenance.concept)
+
+
+def test_verified_monetary_scale_is_exactly_tag_and_accession_scoped():
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2010-01-01", "2010-12-31", -67_196,
+                accn="0001010549-13-000233", filed="2013-03-28"),
+            dur("2011-01-01", "2011-12-31", -46_603,
+                accn="unreviewed-accession", filed="2014-03-28"),
+        ]),
+        "ProfitLoss": tagdata("USD", [
+            dur("2012-01-01", "2012-12-31", -12_345,
+                accn="0001010549-13-000233", filed="2015-03-28"),
+        ]),
+    }
+    from screener.normalize import _annual_net_income, _with_fiscal_calendar
+
+    income = _annual_net_income(_with_fiscal_calendar(gaap, cik="0000733590"))
+
+    assert income[2010].value == Decimal("-67196000")
+    assert income[2011].value == Decimal("-46603")
+    assert income[2012].value == Decimal("-12345")
+
+
+def test_verified_amendment_scale_can_restore_a_loss_sign():
+    accession = "0001193125-25-107562"
+    gaap = {"NetIncomeLoss": tagdata("USD", [
+        dur("2020-01-01", "2020-12-31", 428_700,
+            accn=accession, filed="2025-04-30", form="10-K/A"),
+    ])}
+    from screener.normalize import _annual_net_income, _with_fiscal_calendar
+
+    income = _annual_net_income(_with_fiscal_calendar(gaap, cik="0001498710"))
+
+    assert income[2020].value == Decimal("-428700000")
+    assert "sign-corrected" in income[2020].provenance.concept
+
+
+def test_verified_apptech_comparative_restores_money_scale_and_loss_sign():
+    accession = "0001903596-23-000201"
+    gaap = {
+        "GrossProfit": tagdata("USD", [
+            dur("2021-01-01", "2021-12-31", 204,
+                accn=accession, filed="2023-03-24")]),
+        "OperatingIncomeLoss": tagdata("USD", [
+            dur("2021-01-01", "2021-12-31", 77_320,
+                accn=accession, filed="2023-03-24")]),
+    }
+    from screener.normalize import (
+        _annual_gross_profit, _annual_operating_income, _with_fiscal_calendar,
+    )
+
+    gaap = _with_fiscal_calendar(gaap, cik="0001070050")
+    gross = _annual_gross_profit(gaap)
+    operating = _annual_operating_income(gaap)
+
+    assert gross[2021].value == Decimal("204000")
+    assert operating[2021].value == Decimal("-77320000")
+    assert "sign-corrected" in operating[2021].provenance.concept
+
+
+def test_verified_amendment_cannot_replace_repeated_income_at_a_million_x():
+    """Identiv's amendment has no replacement income statement, while its
+    machine comparative is one million times three identical annual reports."""
+    gaap = {"NetIncomeLoss": tagdata("USD", [
+        dur("2021-01-01", "2021-12-31", 1620000,
+            accn="k21", filed="2022-03-14"),
+        dur("2021-01-01", "2021-12-31", 1620000,
+            accn="k22", filed="2023-03-16"),
+        dur("2021-01-01", "2021-12-31", 1620000000000,
+            accn="0001193125-24-122187", filed="2024-04-29", form="10-K/A"),
+    ])}
+    from screener.normalize import _annual_net_income
+
+    income = _annual_net_income(gaap)
+
+    assert income[2021].value == Decimal("1620000")
+    assert "exact 1000000x presentation-scale contradiction" in (
+        income[2021].provenance.concept)
+
+
+def test_dover_continuing_eps_repairs_the_comparative_share_scale():
+    """Dover's FY2011 10-K prints FY2009 diluted shares as 186,736 in
+    thousands and continuing earnings of 373,423 thousand beside $2.00 EPS.
+
+    The later comparative XBRL fact lost the table scale and reached Company
+    Facts as 186,736 shares.  The same accession's continuing-income numerator
+    proves 186,736,000 without mixing discontinued operations into the check.
+    """
+    gaap = {
+        "IncomeLossFromContinuingOperationsPerDilutedShare": tagdata(
+            "USD/shares", [dur("2009-01-01", "2009-12-31", 2.00,
+                               accn="0000029905-12-000008", filed="2012-02-10")]),
+        "IncomeLossFromContinuingOperations": tagdata(
+            "USD", [dur("2009-01-01", "2009-12-31", 373_423_000,
+                        accn="0000029905-12-000008", filed="2012-02-10")]),
+        "NetIncomeLoss": tagdata(
+            "USD", [dur("2009-01-01", "2009-12-31", 356_438_000,
+                        accn="0000029905-12-000008", filed="2012-02-10")]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata(
+            "shares", [dur("2009-01-01", "2009-12-31", 186_736,
+                           accn="0000029905-12-000008", filed="2012-02-10")]),
+    }
+    from screener.normalize import (
+        _annual_eps, _annual_net_income, _annual_share_counts,
+    )
+
+    eps, income = _annual_eps(gaap), _annual_net_income(gaap)
+    counts = _annual_share_counts(gaap, {}, eps, income)
+
+    assert counts[2009].value == Decimal("186736000")
+    assert "scaled 1000x" in counts[2009].provenance.concept
+    assert {part.tag for part in counts[2009].provenance.components} == {
+        "us-gaap:WeightedAverageNumberOfDilutedSharesOutstanding",
+        "us-gaap:IncomeLossFromContinuingOperationsPerDilutedShare",
+        "us-gaap:IncomeLossFromContinuingOperations",
+    }
+
+    # A continuing-operations EPS cannot be checked against total net income.
+    # Without its own numerator the wrong scale stays visible rather than guessed.
+    del gaap["IncomeLossFromContinuingOperations"]
+    counts = _annual_share_counts(gaap, {}, eps, income)
+    assert counts[2009].value == Decimal("186736")
+
+
 def test_non_decimal_security_basis_mismatch_is_not_scaled_away():
     """A 13x ADR/class mismatch is not a thousands-or-millions presentation scale."""
     gaap = {
@@ -1301,6 +2297,51 @@ def test_interest_income_still_stands_where_there_is_no_net_line():
     assert float(_annual_revenue(gaap)[2025].value) == 500e6
 
 
+def test_verified_nonoperating_interest_is_not_published_as_revenue():
+    """Bion's 10-K prints no revenue and $62 of interest below operations.
+
+    Its Company Facts record calls that InterestIncomeOperating.  The exact
+    filing is withheld instead of turning non-operating interest into sales or
+    inventing a zero-valued fact without provenance.
+    """
+    gaap = {
+        "InterestIncomeOperating": tagdata("USD", [
+            dur("2024-07-01", "2025-06-30", 62,
+                accn="0001079973-25-001516", filed="2025-09-29"),
+        ]),
+    }
+    from screener.normalize import _annual_revenue, _with_fiscal_calendar
+
+    wrapped = _with_fiscal_calendar(gaap, cik="0000875729")
+    assert _annual_revenue(wrapped) == {}
+
+
+def test_newer_basic_only_filing_supersedes_obsolete_diluted_comparative():
+    """A post-split annual report can stop tagging diluted EPS altogether.
+
+    Flash Sports' current report restates FY2024 basic EPS to -$73.12.  Keeping
+    -$2.62 from the older diluted-only report and mechanically applying the
+    reverse split produces -$65.50, a number no current statement reports.
+    """
+    gaap = {
+        "EarningsPerShareDiluted": tagdata("USD/shares", [
+            dur("2024-01-01", "2024-12-31", -2.62,
+                accn="old-k", filed="2026-01-16"),
+        ]),
+        "EarningsPerShareBasic": tagdata("USD/shares", [
+            dur("2024-01-01", "2024-12-31", -73.12,
+                accn="0001213900-26-046211", filed="2026-04-21"),
+            dur("2025-01-01", "2025-12-31", -41.83,
+                accn="0001213900-26-046211", filed="2026-04-21"),
+        ]),
+    }
+    from screener.normalize import _annual_eps, _with_fiscal_calendar
+
+    series = _annual_eps(_with_fiscal_calendar(gaap, cik="0001706524"))
+    assert series[2024].value == Decimal("-73.12")
+    assert series[2024].provenance.accession == "0001213900-26-046211"
+
+
 def test_sales_tax_cannot_be_larger_than_the_sale():
     """Thirty filers tag an assessed-tax pair no rate of tax explains — Precision
     Optics at 2.2x, SS Innovations at exactly 1000x, which is a units error wearing
@@ -1389,6 +2430,418 @@ def test_old_calendar_dates_do_not_shift_the_current_filing_calendar():
     assert float(series[2024].value) == 8.890e6
     assert float(series[2025].value) == 4.877e6
     assert float(series[2026].value) == 7.112e6
+
+
+def test_tag_local_calendar_collision_does_not_shift_shared_statement_years():
+    """Value Line carries two calendar-year NetIncomeLoss contexts beside its
+    April fiscal years.  Those isolated dates must lose to the company-wide
+    statement calendar instead of shifting every April result backward a year."""
+    from screener.normalize import _FiscalTaxonomy, _annual_series
+
+    correct = [
+        {**dur("2018-05-01", "2019-04-30", 12.009e6,
+               accn="k20", filed="2020-07-29"), "fy": 2020},
+        {**dur("2019-05-01", "2020-04-30", 14.943e6,
+               accn="k20", filed="2020-07-29"), "fy": 2020},
+        {**dur("2021-05-01", "2022-04-30", 23.822e6,
+               accn="k24", filed="2024-07-26"), "fy": 2024},
+        {**dur("2022-05-01", "2023-04-30", 18.069e6,
+               accn="k24", filed="2024-07-26"), "fy": 2024},
+        {**dur("2023-05-01", "2024-04-30", 19.016e6,
+               accn="k24", filed="2024-07-26"), "fy": 2024},
+    ]
+    calendar_noise = [
+        {**dur("2019-01-01", "2019-12-31", 12.009e6,
+               accn="old", filed="2021-07-28"), "frame": "CY2019"},
+        {**dur("2020-01-01", "2020-12-31", 14.943e6,
+               accn="old", filed="2021-07-28"), "frame": "CY2020"},
+    ]
+    gaap = _FiscalTaxonomy({
+        "NetIncomeLoss": tagdata("USD", [*calendar_noise, *correct]),
+    })
+    gaap.fiscal_labels = {
+        "2019-04-30": 2019,
+        "2020-04-30": 2020,
+        "2022-04-30": 2022,
+        "2023-04-30": 2023,
+        "2024-04-30": 2024,
+    }
+
+    series = _annual_series(gaap, "NetIncomeLoss", unit=("USD",))
+
+    assert {year: float(fact.value) for year, fact in series.items()} == {
+        2019: 12.009e6,
+        2020: 14.943e6,
+        2022: 23.822e6,
+        2023: 18.069e6,
+        2024: 19.016e6,
+    }
+
+
+def test_unmatched_element_date_cannot_reuse_a_company_wide_fiscal_year():
+    """A predecessor/calendar context on one tag must not enter beside a different
+    company-wide year end merely because that tag lacks the winning date."""
+    from screener.normalize import _FiscalTaxonomy, _annual_series
+
+    gaap = _FiscalTaxonomy({
+        "GrossProfit": tagdata("USD", [
+            dur("2023-01-01", "2023-12-31", 129.707e6,
+                accn="predecessor", filed="2024-02-23"),
+        ]),
+    })
+    gaap.fiscal_labels = {"2023-09-30": 2023}
+
+    assert _annual_series(gaap, "GrossProfit", unit=("USD",)) == {}
+
+
+def test_nearby_unmatched_element_date_keeps_the_shared_fiscal_year():
+    """A statement row may end a few days from the dominant 52/53-week date.
+    It is the same fiscal year, not a reason to erase that row from history."""
+    from screener.normalize import _FiscalTaxonomy, _annual_series
+
+    gaap = _FiscalTaxonomy({
+        "GrossProfit": tagdata("USD", [
+            dur("2021-11-28", "2022-11-26", 248.339e6,
+                accn="k25", filed="2025-02-14"),
+        ]),
+    })
+    gaap.fiscal_labels = {"2022-11-25": 2022}
+
+    series = _annual_series(gaap, "GrossProfit", unit=("USD",))
+
+    assert series[2022].value == Decimal("248339000")
+    assert series[2022].provenance.period_end == date(2022, 11, 26)
+
+
+def test_note_only_calendar_dates_cannot_hijack_the_statement_calendar():
+    """Caleres' statements end in January/February while annual note contexts
+    also end on December 31.  A note date cannot evict the audited statement."""
+    from screener.normalize import _with_fiscal_calendar
+
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            dur("2017-01-29", "2018-02-03", 87e6,
+                accn="k18", filed="2018-03-30"),
+            dur("2018-02-04", "2019-02-02", -5e6,
+                accn="k19", filed="2019-03-29"),
+        ]),
+        "OperatingLeaseCost": tagdata("USD", [
+            dur("2017-01-01", "2017-12-31", 10e6,
+                accn="note18", filed="2018-03-30"),
+            dur("2018-01-01", "2018-12-31", 11e6,
+                accn="note19", filed="2019-03-29"),
+        ]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert wrapped.fiscal_labels == {
+        "2018-02-03": 2018,
+        "2019-02-02": 2019,
+    }
+
+
+def test_early_january_53_week_end_does_not_skip_a_fiscal_year():
+    """A late-December year followed 371 days later by early January crosses two
+    calendar numbers, but it is still one ordinary successive fiscal year."""
+    from screener.normalize import _with_fiscal_calendar
+
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            {**dur("2023-12-31", "2024-12-28", -336e6,
+                   accn="k24", filed="2025-02-28"), "fy": 2024},
+            {**dur("2024-12-29", "2026-01-03", 44e6,
+                   accn="k25", filed="2026-02-27"), "fy": 2026},
+        ]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert wrapped.fiscal_labels == {
+        "2024-12-28": 2024,
+        "2026-01-03": 2025,
+    }
+
+
+def test_each_historical_early_january_close_keeps_its_local_frame():
+    """A later March calendar must not shift old Saturday-nearest-December
+    periods forward. V.F. Corp has several independent Jan 1-3 year ends, and
+    each SEC frame supplies the missing local anchor."""
+    from screener.normalize import _with_fiscal_calendar
+
+    entries = [
+        {**dur("2007-12-30", "2009-01-03", 1.0,
+               accn="k10", filed="2011-02-25"), "fy": 2010, "frame": "CY2008"},
+        {**dur("2009-01-04", "2010-01-02", 2.0,
+               accn="k11", filed="2012-02-24"), "fy": 2011, "frame": "CY2009"},
+        {**dur("2010-01-03", "2011-01-01", 3.0,
+               accn="k12", filed="2013-02-27"), "fy": 2012, "frame": "CY2010"},
+        {**dur("2011-01-02", "2011-12-31", 4.0,
+               accn="k13", filed="2014-02-26"), "fy": 2013, "frame": "CY2011"},
+        {**dur("2013-12-29", "2015-01-03", 5.0,
+               accn="k16", filed="2017-02-27"), "fy": 2016, "frame": "CY2014"},
+        {**dur("2015-01-04", "2016-01-02", 6.0,
+               accn="k17", filed="2018-02-28"), "fy": 2017, "frame": "CY2015"},
+        {**dur("2025-03-30", "2026-03-28", 7.0,
+               accn="k26", filed="2026-05-22"), "fy": 2026},
+    ]
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", entries),
+        "Revenues": tagdata("USD", [dict(entry) for entry in entries]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert wrapped.fiscal_labels["2009-01-03"] == 2008
+    assert wrapped.fiscal_labels["2010-01-02"] == 2009
+    assert wrapped.fiscal_labels["2011-01-01"] == 2010
+    assert wrapped.fiscal_labels["2011-12-31"] == 2011
+    assert wrapped.fiscal_labels["2015-01-03"] == 2014
+    assert wrapped.fiscal_labels["2016-01-02"] == 2015
+    assert wrapped.fiscal_labels["2026-03-28"] == 2026
+
+
+def test_abnormal_gap_anchors_both_sides_of_a_fiscal_calendar_change():
+    """A short transition period is not a comparable annual fact, but it leaves
+    the surrounding full years more than 400 days apart. Their own filing labels
+    keep the pre-change and post-change calendars from shifting each other."""
+    from screener.normalize import _with_fiscal_calendar
+
+    old = {
+        **dur("2017-01-01", "2017-12-30", 1.0,
+              accn="k17", filed="2018-02-23"),
+        "fy": 2017,
+    }
+    new = {
+        **dur("2018-04-01", "2019-03-30", 2.0,
+              accn="k19", filed="2019-05-24"),
+        "fy": 2019,
+    }
+    current = {
+        **dur("2025-03-30", "2026-03-28", 3.0,
+              accn="k26", filed="2026-05-22"),
+        "fy": 2026,
+    }
+    entries = [old, new, current]
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", entries),
+        "Revenues": tagdata("USD", [dict(entry) for entry in entries]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert wrapped.fiscal_labels["2017-12-30"] == 2017
+    assert wrapped.fiscal_labels["2019-03-30"] == 2019
+    assert wrapped.fiscal_labels["2026-03-28"] == 2026
+
+
+def test_post_transition_regime_uses_its_latest_filing_convention():
+    """Dycom's own reports call the year ended 2019-01-26 fiscal 2019, but
+    Company Facts labels the first three post-transition annual accessions one
+    year behind. A later correct filing must settle the whole January regime
+    without shifting the old July regime or inventing a full FY2018."""
+    from screener.normalize import _annual_net_income, _with_fiscal_calendar
+
+    transition = {
+        **dur("2017-07-30", "2018-01-27", 68.835e6,
+              accn="k18", filed="2019-03-04"),
+        "fy": 2018,
+    }
+    entries = [
+        {**dur("2016-07-31", "2017-07-29", 157.217e6,
+               accn="k17", filed="2017-09-01"), "fy": 2017},
+        transition,
+        {**dur("2018-01-28", "2019-01-26", 62.907e6,
+               accn="k18", filed="2019-03-04"), "fy": 2018},
+        {**dur("2019-01-27", "2020-01-25", 57.215e6,
+               accn="k19", filed="2020-03-02"), "fy": 2019},
+        {**dur("2020-01-26", "2021-01-30", 34.337e6,
+               accn="k20", filed="2021-03-05"), "fy": 2020},
+        {**dur("2021-01-31", "2022-01-29", 48.574e6,
+               accn="k22", filed="2022-03-04"), "fy": 2022},
+        {**dur("2022-01-30", "2023-01-28", 142.213e6,
+               accn="k23", filed="2023-03-03"), "fy": 2023},
+    ]
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", entries),
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata(
+            "USD", [dict(entry) for entry in entries]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap, cik="67215")
+    series = _annual_net_income(wrapped)
+
+    assert wrapped.fiscal_labels["2017-07-29"] == 2017
+    assert wrapped.fiscal_labels["2019-01-26"] == 2019
+    assert wrapped.fiscal_labels["2020-01-25"] == 2020
+    assert wrapped.fiscal_labels["2021-01-30"] == 2021
+    assert wrapped.fiscal_labels["2022-01-29"] == 2022
+    assert sorted(series) == [2017, 2019, 2020, 2021, 2022, 2023]
+
+
+def test_verified_filing_end_rejects_a_contradictory_sibling_context():
+    """RBC Bearings' FY2022 10-K/A contains stray April-30 revenue and gross-
+    profit contexts, while the audited statements and period of report end April
+    2. The verified filing date must not erase net income, EPS and cash flow."""
+    from screener.normalize import _annual_net_income, _with_fiscal_calendar
+
+    def annual(tag_value, end="2022-04-02"):
+        return {
+            **dur("2021-04-04", end, tag_value,
+                  accn="0001213900-22-045106", filed="2022-08-05"),
+            "form": "10-K/A", "fy": 2022,
+        }
+
+    gaap = {
+        "Revenues": tagdata("USD", [
+            annual(942.937e6), annual(942.937e6, "2022-04-30")]),
+        "GrossProfit": tagdata("USD", [
+            annual(357.068e6), annual(357.068e6, "2022-04-30")]),
+        "NetIncomeLoss": tagdata("USD", [annual(54.710e6)]),
+        "OperatingIncomeLoss": tagdata("USD", [annual(121.094e6)]),
+        "EarningsPerShareDiluted": tagdata("USD/shares", [annual(1.56)]),
+        "WeightedAverageNumberOfDilutedSharesOutstanding": tagdata(
+            "shares", [annual(27_311_029)]),
+        "NetCashProvidedByUsedInOperatingActivities": tagdata(
+            "USD", [annual(180.293e6)]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap, cik="1324948")
+    income = _annual_net_income(wrapped)
+
+    assert wrapped.fiscal_labels["2022-04-02"] == 2022
+    assert "2022-04-30" not in wrapped.fiscal_labels
+    assert income[2022].value == Decimal("54710000")
+
+
+def test_pre_ipo_comparative_before_short_transition_uses_right_anchor():
+    """ServiceNow's June-2011 year has no annual accession of its own; the next
+    10-K anchors December-2012 after a six-month transition. The last full year
+    before that transition is FY2011, not FY2010."""
+    from screener.normalize import _with_fiscal_calendar
+
+    prior = dur("2010-07-01", "2011-06-30", 1.0,
+                accn="comparative", filed="2013-03-01")
+    current = {
+        **dur("2012-01-01", "2012-12-31", 2.0,
+              accn="k12", filed="2013-03-01"),
+        "fy": 2012,
+    }
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [prior, current]),
+        "Revenues": tagdata("USD", [dict(prior), dict(current)]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert wrapped.fiscal_labels == {
+        "2011-06-30": 2011,
+        "2012-12-31": 2012,
+    }
+
+
+def test_variable_january_retail_calendar_uses_the_filers_preceding_year():
+    """Build-A-Bear's SEC metadata says FY2026 for the 10-K ending 2026-01-31,
+    while the audited report calls it fiscal 2025.  A Saturday-nearest-January
+    calendar crosses Jan/Feb without skipping or duplicating an issuer year."""
+    from screener.normalize import _with_fiscal_calendar
+
+    gaap = {
+        "NetIncomeLoss": tagdata("USD", [
+            {**dur("2023-01-29", "2024-02-03", 52.805e6,
+                   accn="k25", filed="2026-04-16"), "fy": 2026},
+            {**dur("2024-02-04", "2025-02-01", 51.785e6,
+                   accn="k25", filed="2026-04-16"), "fy": 2026},
+            {**dur("2025-02-02", "2026-01-31", 52.203e6,
+                   accn="k25", filed="2026-04-16"), "fy": 2026},
+        ]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap, cik="1113809")
+
+    assert wrapped.fiscal_labels == {
+        "2024-02-03": 2023,
+        "2025-02-01": 2024,
+        "2026-01-31": 2025,
+    }
+
+
+def test_latest_filing_wins_a_distant_same_year_period_collision():
+    """RUSHA has a stale 2022-12-12 ProfitLoss context beside the later-filed
+    audited 2022-12-31 statements. Traversal order must not preserve the typo."""
+    from screener.normalize import _annual_net_income, _with_fiscal_calendar
+
+    gaap = {
+        "ProfitLoss": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-12", 392.085e6,
+                   accn="k22-old", filed="2023-02-24"), "fy": 2022},
+        ]),
+        # More old tags must not outweigh a newer filing. This also protects a
+        # current issuer from broader predecessor facts under the same CIK.
+        "Revenues": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-12", 1e9,
+                   accn="k22-old", filed="2023-02-24"), "fy": 2022},
+        ]),
+        "NetCashProvidedByUsedInOperatingActivities": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-12", 100e6,
+                   accn="k22-old", filed="2023-02-24"), "fy": 2022},
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-31", 391.382e6,
+                   accn="k24", filed="2025-02-21"), "fy": 2024},
+            {**dur("2023-01-01", "2023-12-31", 347.055e6,
+                   accn="k24", filed="2025-02-21"), "fy": 2024},
+            {**dur("2024-01-01", "2024-12-31", 304.153e6,
+                   accn="k24", filed="2025-02-21"), "fy": 2024},
+        ]),
+        "RevenueFromContractWithCustomerExcludingAssessedTax": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-31", 7.10167e9,
+                   accn="k24", filed="2025-02-21"), "fy": 2024},
+        ]),
+        "OperatingIncomeLoss": tagdata("USD", [
+            {**dur("2022-01-01", "2022-12-31", 506.113e6,
+                   accn="k24", filed="2025-02-21"), "fy": 2024},
+        ]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+    series = _annual_net_income(wrapped)
+
+    assert "2022-12-12" not in wrapped.fiscal_labels
+    assert wrapped.fiscal_labels["2022-12-31"] == 2022
+    assert series[2022].value == Decimal("391382000")
+
+
+def test_primary_statement_breadth_wins_a_same_filing_period_collision():
+    """CODI and Timken contain one note-like concept on a wrong annual end in
+    the same accession as many rows on the audited statement end."""
+    from screener.normalize import _with_fiscal_calendar
+
+    gaap = {
+        "Revenues": tagdata("USD", [
+            {**dur("2016-01-01", "2016-12-13", 1e6,
+                   accn="later-note", filed="2020-02-27"), "fy": 2019},
+            {**dur("2016-01-01", "2016-12-31", 978.309e6,
+                   accn="k18", filed="2019-02-27"), "fy": 2018},
+            {**dur("2017-01-01", "2017-12-31", 1.002783e9,
+                   accn="k18", filed="2019-02-27"), "fy": 2018},
+            {**dur("2018-01-01", "2018-12-31", 1.35732e9,
+                   accn="k18", filed="2019-02-27"), "fy": 2018},
+        ]),
+        "NetIncomeLoss": tagdata("USD", [
+            {**dur("2016-01-01", "2016-12-31", 54.685e6,
+                   accn="k18", filed="2019-02-27"), "fy": 2018},
+        ]),
+        "NetCashProvidedByUsedInOperatingActivities": tagdata("USD", [
+            {**dur("2016-01-01", "2016-12-31", 111.372e6,
+                   accn="k18", filed="2019-02-27"), "fy": 2018},
+        ]),
+    }
+
+    wrapped = _with_fiscal_calendar(gaap)
+
+    assert "2016-12-13" not in wrapped.fiscal_labels
+    assert wrapped.fiscal_labels["2016-12-31"] == 2016
 
 
 def test_the_balance_sheet_follows_the_earnings_labelling():

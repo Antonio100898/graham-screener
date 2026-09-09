@@ -1,13 +1,14 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { fetchJson } from "./api.js";
 import { awardOverhang, totalCapitalisation, workingCapitalToDebt } from "./capital.js";
 import { byN, currentRatio as currentRatioOf, pe3, priceToBook as priceToBookOf,
-  recurringDividendPresentation, reportedRate } from "./screen.js";
+  recurringDividendPresentation, reportedRate, valuationPrice } from "./screen.js";
 import { profileMeta } from "./Alignment.jsx";
-import AnnualFinancialHistory from "./AnnualFinancialHistory.jsx";
 import EpsCurve from "./EpsCurve.jsx";
-import { ownerEarningsTrend, ownerMetricTrend } from "./ownerEarnings.js";
+import { ownerEarningsTrend } from "./ownerEarnings.js";
 import { payloadWarnings } from "./warnings.js";
 import { quoteStatus, quoteTitle } from "./quote.js";
+import { companyIntrinsicValuePrefill, openIntrinsicValueCalculator } from "./intrinsicValue.js";
 
 const ENTERPRISING = {
   1: { label: "Earnings valuation", rule: "P/E < 10.0" },
@@ -20,12 +21,49 @@ const ENTERPRISING = {
 
 /** A compact investment snapshot: current market and financial facts first,
  * then the two Graham frameworks without trend charts or audit-trail clutter. */
-export default function Detail({ row, onClose, tracked = false, onToggleTracked, onRecordTrade }) {
+export default function Detail({ row: baseRow, onClose, tracked = false, onToggleTracked, onRecordTrade }) {
+  const [assumedRow, setAssumedRow] = useState(null);
+  const [assumptionEnabled, setAssumptionEnabled] = useState(false);
+  const [assumptionLoading, setAssumptionLoading] = useState(false);
+  const [assumptionError, setAssumptionError] = useState(null);
+  const [assumptionAttempt, setAssumptionAttempt] = useState(0);
+
   useEffect(() => {
     const esc = (event) => event.key === "Escape" && onClose();
     window.addEventListener("keydown", esc);
     return () => window.removeEventListener("keydown", esc);
   }, [onClose]);
+
+  useEffect(() => {
+    if (!assumptionEnabled) {
+      setAssumedRow(null);
+      setAssumptionError(null);
+      setAssumptionLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setAssumedRow(null);
+    setAssumptionError(null);
+    setAssumptionLoading(true);
+    fetchJson(
+      `/company/${encodeURIComponent(baseRow.ticker)}/dashboard?assume_absent_zero=true`,
+      { timeoutMs: 30_000 },
+    ).then((next) => {
+      if (!cancelled) setAssumedRow(next);
+    }).catch((error) => {
+      if (!cancelled) setAssumptionError(error.message);
+    }).finally(() => {
+      if (!cancelled) setAssumptionLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [baseRow.cik, baseRow.ticker, assumptionAttempt, assumptionEnabled]);
+
+  const row = assumedRow ?? baseRow;
+  const currency = row.currency ?? "USD";
+  const quoteCurrency = row.quote_currency ?? currency;
+  const financialPrice = valuationPrice(row);
+  const assumptionActive = (assumedRow != null
+    && assumedRow.assumption_mode?.status !== "UNAVAILABLE");
 
   const profile = profileMeta(row);
   const ca = row.current_assets;
@@ -41,8 +79,8 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
   const defensive = row.alignment?.defensive;
   const enterprising = row.alignment?.enterprising;
   const ch13 = row.ch13 ?? {};
-  // Graham's two profitability ratios, chapter 13: profit against sales, and
-  // profit against the shareholders' own capital. Neither is a criterion.
+  // Profit against sales and the shareholders' book/tangible capital. These are
+  // descriptive ratios, not enterprising-screen criteria.
   const prof = row.profitability ?? {};
   // Graham's chapter-18 comparisons carry two figures this panel did not: what the
   // whole enterprise costs (the common's market value plus the debt ahead of it),
@@ -52,6 +90,7 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
   const awards = awardOverhang(row);
   const wcToDebt = workingCapitalToDebt(row);
   const dividend = row.dividend_record;
+  const intrinsicPrefill = companyIntrinsicValuePrefill(row);
 
   return (
     <>
@@ -64,8 +103,18 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
             <p className="sub">{row.name}</p>
           </div>
           <div className="detail-head-actions">
+            <button type="button" className="intrinsic-detail-button"
+                    disabled={!intrinsicPrefill.ready}
+                    onClick={() => openIntrinsicValueCalculator(intrinsicPrefill)}
+                    title={intrinsicPrefill.ready
+                      ? `Open IV with FY${intrinsicPrefill.fiscalYear} FCF and current shares`
+                      : intrinsicPrefill.currentIncome == null
+                        ? "No annual free cash flow is available in the displayed cash bridge"
+                        : "Current shares outstanding are unavailable"}>
+              Calculate IV
+            </button>
             {onRecordTrade && (
-              <button className="trade-button" onClick={onRecordTrade}>Record trade</button>
+              <button className="trade-button" onClick={() => onRecordTrade(row)}>Record trade</button>
             )}
             {onToggleTracked && (
               <button className={`track-btn ${tracked ? "on" : ""}`} onClick={onToggleTracked}
@@ -80,33 +129,45 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
 
         <DataWarnings row={row} />
         <AnalysisRoutes routes={row.analysis_routes} />
+        <AssumptionControl row={row} active={assumptionActive}
+                           loading={assumptionLoading} error={assumptionError}
+                           onEnable={() => setAssumptionEnabled(true)}
+                           onDisable={() => setAssumptionEnabled(false)}
+                           onRetry={() => setAssumptionAttempt((attempt) => attempt + 1)} />
 
         <section className="snapshot-section" aria-label="Market and financial snapshot">
           <h3>Market &amp; financial snapshot</h3>
           <div className="snapshot-grid">
-            <Metric label="Price" sub={quoteStatus(row)} value={moneyPrice(row.price)}
+            <Metric label="Price" sub={quoteStatus(row)} value={moneyPrice(row.price, quoteCurrency)}
                     title={quoteTitle(row)} />
             <Metric label="TTM EPS" sub={row.ttm_basis ?? "trailing twelve months"}
-                    value={moneyPrice(row.ttm_eps)} />
-            <Metric label="52-week high" sub="weekly close" value={moneyPrice(row.price_stats?.high_52w)} />
-            <Metric label="Current vs 3Y avg" sub={row.price_stats?.average_3y == null ? undefined : `3Y avg ${moneyPrice(row.price_stats.average_3y)}`} value={signedPercent(row.price_stats?.pct_vs_3y_average)} />
-            <Metric label="Market cap" value={money(marketCap)} />
+                    value={moneyPrice(row.ttm_eps, currency)} />
+            <Metric label="52-week high" sub="weekly close" value={moneyPrice(row.price_stats?.high_52w, quoteCurrency)} />
+            <Metric label="Current vs 3Y avg" sub={row.price_stats?.average_3y == null ? undefined : `3Y avg ${moneyPrice(row.price_stats.average_3y, quoteCurrency)}`} value={signedPercent(row.price_stats?.pct_vs_3y_average)} />
+            <Metric label="Market cap" value={money(marketCap, quoteCurrency)} />
+            {quoteCurrency !== currency && <Metric label="Price on statement basis"
+                    sub={`${quoteCurrency} converted to ${currency}`}
+                    value={moneyPrice(financialPrice, currency)} />}
             <Metric label="Working capital" sub="= net current assets, criterion 3's base"
-                    value={money(workingCapital)} />
+                    value={money(workingCapital, currency)} />
             <Metric label="Total capitalisation" sub="market value of the common plus its debt"
-                    value={money(capitalisation)} />
+                    value={money(capitalisation, currency)} />
             <Metric label="Equity awards" sub={row.awards_basis ? `${row.awards_basis}, % of shares` : "options and restricted stock, % of shares"}
                     value={rateOrDash(awards)} />
-            <Metric label="Long-term debt" value={money(ltd)} />
-            <Metric label="Short-term debt" sub="due within a year" value={money(row.short_term_debt)} />
+            <Metric label="Long-term debt" value={money(ltd, currency)} />
+            <Metric label="Short-term debt" sub="due within a year" value={money(row.short_term_debt, currency)} />
             <Metric label="Operating-lease liabilities" sub="outside Graham's debt test"
-                    value={money(row.operating_lease_liability)} />
+                    value={money(row.operating_lease_liability, currency)} />
             <Metric label="Lease-adjusted debt" sub="reported debt plus operating leases"
-                    value={money(row.lease_adjusted_debt)} />
+                    value={money(row.lease_adjusted_debt, currency)} />
             <Metric label="Fixed-charge coverage" sub="reported operating-income proxy"
                     value={multiple(row.fixed_charge_coverage)} />
-            <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} emphasis={row.ncavps != null && row.price != null && row.price <= row.ncavps} />
+            <Metric label="NCAV / share" value={moneyPrice(row.ncavps, currency)} emphasis={row.ncavps != null && financialPrice != null && financialPrice <= row.ncavps} />
           </div>
+          {quoteCurrency !== currency && row.fx && <p className="criteria-note"><b>Currency bridge:</b>{" "}
+            1 {row.fx.base} = {number(row.fx.rate)} {row.fx.counter} as of {String(row.fx.asof).slice(0, 10)}
+            {row.fx.source ? ` (${row.fx.source})` : ""}. The traded quote and market cap remain in {quoteCurrency};
+            filing totals stay in {currency}; only cross-currency valuation uses this rate.</p>}
         </section>
 
         <Ratios row={row} currentRatio={currentRatio} priceToBook={priceToBook}
@@ -114,7 +175,7 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
 
         <AssetProtection row={row} />
 
-        <EpsCurve annualEps={row.annual_eps} ttmEps={row.ttm_eps} />
+        <EpsCurve annualEps={row.annual_eps} ttmEps={row.ttm_eps} currency={currency} />
 
         <CriteriaSection
           title="Enterprising criteria"
@@ -129,7 +190,10 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
           rows={defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook })}
         />
 
-        <OwnerEarnings oe={row.owner_earnings} cik={row.cik} />
+        <OwnerEarnings oe={row.owner_earnings} cik={row.cik}
+                       annualEps={row.annual_eps}
+                       annualWeightedShares={row.annual_weighted_shares}
+                       currency={currency} />
         <Notes title="What the multiples do not say"
                subtitle="Cash conversion, dilution, interest cover, leases, receivables and inventory against sales, untaxed profits, tax charged but not paid, valuation allowances, an eroding margin, a foreign listing whose ratio is only on the cover page, a book value made of acquisitions, the shape of the ten-year record, peer efficiency, warrants, debt discount, and the events the company's own filing index proves — context, never part of a grade"
                notes={row.context_notes} />
@@ -137,12 +201,63 @@ export default function Detail({ row, onClose, tracked = false, onToggleTracked,
                subtitle="Non-recurring lines large enough to decide criterion 1 on their own"
                notes={row.earnings_quality} />
         <ProseGaps row={row} />
-        <AnnualFinancialHistory annualEps={row.annual_eps} annualNetIncome={row.annual_net_income}
-                                weightedShares={row.annual_weighted_shares} />
         <SeriesMix mix={row.series_mix} />
         <Provenance row={row} />
       </aside>
     </>
+  );
+}
+
+function AssumptionControl({ row, active, loading, error, onEnable, onDisable, onRetry }) {
+  const applied = row.assumption_mode?.applied ?? row.assumptions ?? [];
+  const details = row.assumption_mode?.details ?? [];
+  const labels = applied.map((value) => (
+    value === "debt" ? "long- and short-term debt"
+      : value === "short_term_debt" ? "short-term debt"
+      : value === "short_term_investments" ? "short-term investments"
+      : value === "noncurrent_investments" ? "noncurrent investments"
+      : value === "intangibles" ? "other intangible assets"
+      : value
+  ));
+  const unavailable = row.assumption_mode?.status === "UNAVAILABLE";
+  return (
+    <section className={`assumption-control ${active ? "active" : ""}`}
+             aria-label="Filing-silence assumptions">
+      <div>
+        <b>Filing-silence assumptions</b>
+        <p>{loading
+          ? "Checking the current annual report and later structured filings before applying any zero."
+          : unavailable
+          ? "Assumption-enhanced calculations were unavailable; strict filing values remain in use."
+          : active
+          ? (labels.length
+            ? `Zero assumptions applied: ${labels.join(", ")}. Open the exact list below for every affected year and ratio.`
+            : "No value qualified: the filing history contains contrary evidence or the required classified balance sheet is unavailable.")
+          : error
+          ? "Could not reach the local assumption service; strict filing values remain in use."
+          : "Strict filing values are in use. Missing evidence stays blank unless you explicitly apply zero assumptions."}</p>
+        {row.assumption_mode?.note && <small>{row.assumption_mode.note}</small>}
+        {error && <small className="err">{error}</small>}
+        {active && details.length > 0 && (
+          <details className="assumption-details">
+            <summary>Exactly what was not reported ({details.length})</summary>
+            <ul>
+              {details.map((detail, index) => (
+                <li key={`${detail.scope}-${detail.fiscal_year ?? "current"}-${index}`}>
+                  {detail.fiscal_year != null && <b>FY{detail.fiscal_year}: </b>}
+                  {detail.message}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+      {error
+        ? <button onClick={onRetry}>Retry assumption check</button>
+        : active
+        ? <button onClick={onDisable}>Use strict filing values</button>
+        : !loading && <button onClick={onEnable}>Apply zero assumptions</button>}
+    </section>
   );
 }
 
@@ -190,6 +305,8 @@ function AnalysisRoutes({ routes }) {
 }
 
 function AssetProtection({ row }) {
+  const currency = row.currency ?? "USD";
+  const quoteCurrency = row.quote_currency ?? currency;
   const quality = row.asset_quality ?? {};
   const marketCap = row.price != null && row.shares != null ? row.price * row.shares : null;
   if ([row.bvps, row.tbvps, row.ncavps, quality.common_equity, quality.inventory,
@@ -199,51 +316,120 @@ function AssetProtection({ row }) {
       <div className="criteria-title"><div><h3>Asset protection</h3>
         <p>Reported book and NCAV composition. No liquidation haircuts are assumed.</p></div></div>
       <div className="snapshot-grid">
-        <Metric label="Book value / share" value={moneyPrice(row.bvps)} />
-        <Metric label="Tangible book / share" value={moneyPrice(row.tbvps)} />
-        <Metric label="NCAV / share" value={moneyPrice(row.ncavps)} />
-        <Metric label="Common equity" value={money(quality.common_equity)} />
+        <Metric label="Book value / share" value={moneyPrice(row.bvps, currency)} />
+        <Metric label="Tangible book / share" value={moneyPrice(row.tbvps, currency)} />
+        <Metric label="NCAV / share" value={moneyPrice(row.ncavps, currency)} />
+        <Metric label="Common equity" value={money(quality.common_equity, currency)} />
         <Metric label="Goodwill / common equity" value={rateOrDash(quality.goodwill_to_common_equity)} />
         <Metric label="Goodwill + intangibles / equity"
                 value={rateOrDash(quality.goodwill_and_intangibles_to_common_equity)} />
         <Metric label="Inventory / positive NCAV" value={rateOrDash(quality.inventory_to_ncav)} />
         <Metric label="Receivables / positive NCAV" value={rateOrDash(quality.receivables_to_ncav)} />
         <Metric label="Net cash" sub="cash + short investments − reported debt"
-                value={money(quality.net_cash)} />
+                value={money(quality.net_cash, currency)} />
         <Metric label="Market cap / positive net cash"
-                sub={marketCap == null ? undefined : `market cap ${money(marketCap)}`}
+                sub={marketCap == null ? undefined : `market cap ${money(marketCap, quoteCurrency)}`}
                 value={multiple(quality.market_cap_to_net_cash)} />
       </div>
     </section>
   );
 }
 
-/** Every ratio the panel shows, at today's price and at each of the last five
+/** Every ratio the panel shows, at today's price and at each of the last ten
  * fiscal year ends. Chapter 13 compares companies by laying the same handful of
  * ratios side by side, and a single current column says how a business looks today
  * while saying nothing about how it got there. Each past column is struck on its own
  * year: that year's report, and the price as it stood then, over trailing earnings
  * computed from what had been filed by then — no column mixes eras. */
 function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awards }) {
+  const currency = row.currency ?? "USD";
   const history = row.annual_ratios ?? {};
-  // newest first: the current column, then back through the record
-  const years = Object.keys(history).map(Number).sort((a, b) => b - a).slice(0, 5);
+  const assumptionActive = row.assumption_mode?.status === "APPLIED";
+  const ownerReturns = row.operating_returns ?? row.owner_earnings ?? {};
+  const returnCaveats = ownerReturns.operating_return_caveats
+    ?? ownerReturns.caveats ?? [];
+  const nopatMissing = returnCaveats.find((text) => /NOPAT.*withheld|NOPAT and .*withheld/i.test(text))
+    ?? "NOPAT needs same-period operating income and at least one aligned filing-reported effective tax rate from the fiscal year or its prior two years.";
+  const capitalInputMissing = returnCaveats.find((text) =>
+    /non-interest-bearing current liabilities and invested capital|cash-excluded invested capital|beginning-and-ending cash-excluded capital/i.test(text));
+  const roicMissing = ownerReturns.nopat == null ? nopatMissing
+    : capitalInputMissing
+      ?? "NOPAT ROIC needs exact beginning and ending cash-excluded invested capital.";
+  const cashReturnMissing = ownerReturns.nopat == null ? nopatMissing
+    : returnCaveats.find((text) => /non-interest-bearing current liabilities and invested capital/i.test(text))
+      ?? "This return needs exact beginning and ending capital including cash.";
+  const rontaMissing = ownerReturns.nopat == null ? nopatMissing
+    : returnCaveats.find((text) => /RONTA/i.test(text)) ?? capitalInputMissing
+      ?? "RONTA needs exact beginning and ending net tangible operating assets.";
+  const leaseNeutralRontaMissing = ownerReturns.nopat == null ? nopatMissing
+    : returnCaveats.find((text) => /lease-neutral RONTA.*withheld/i.test(text))
+      ?? "Lease-neutral RONTA needs exact beginning and ending ROU assets and current lease liabilities after lease recognition.";
+  // Ten consecutive fiscal-year slots, newest first. Young or sparse filers keep
+  // visible gaps instead of silently reaching farther back or shrinking the table.
+  const observedYears = Object.keys(history).map(Number).filter(Number.isFinite);
+  const fallbackYear = row.balance_sheet_date
+    ? Number(row.balance_sheet_date.slice(0, 4)) : null;
+  const latestYear = observedYears.length ? Math.max(...observedYears) : fallbackYear;
+  const years = latestYear == null
+    ? [] : Array.from({ length: 10 }, (_, index) => latestYear - index);
+  const hasLeaseNeutral = ownerReturns.lease_neutral_ronta != null
+    || ownerReturns.lease_neutral_ronta_undefined
+    || years.some((year) => history[year]?.lease_neutral_ronta != null
+      || history[year]?.lease_neutral_ronta_undefined);
   const lines = [
     { label: "P/E", sub: row.ttm_basis ?? "trailing", now: byN(row, 1).value, key: "pe", fmt: multiple },
-    { label: "P/E", sub: "3-year average EPS", now: pe3Value, fmt: multiple },
+    { label: "P/E", sub: "3-year average EPS", now: pe3Value, key: "pe3", fmt: multiple },
     { label: "P/B", now: priceToBook, key: "pb", fmt: multiple },
     { label: "P/TBV", sub: "criterion 7 \u00b7 under 1.20\u00d7", now: byN(row, 7).value, key: "ptbv", fmt: multiple },
     { label: "P/NCAV", sub: "Graham buys under 0.67\u00d7", now: priceToNcav(row), key: "pncav", fmt: multiple },
     { label: "Current ratio", sub: "criterion 2 \u00b7 at least 1.50\u00d7", now: currentRatio, key: "current_ratio", fmt: multiple },
+    { label: "Debt / equity", sub: "combined interest-bearing debt / common equity · generally under 1.00×",
+      now: row.debt_to_equity, key: "debt_to_equity", fmt: multiple },
     { label: "Working capital / debt", sub: "Graham's chapter-18 comparison", now: wcToDebt,
+      key: "working_capital_to_debt",
       fmt: (v) => (typeof v === "string" ? v : multiple(v)) },
     { label: "Equity awards", sub: `${row.awards_basis ?? "options and restricted stock"} \u00b7 % of shares`,
-      now: awards, key: "award_pct", fmt: rateOrDash },
+      now: awards, key: "award_pct", fmt: rateOrDash, assumeZero: true },
+    { label: "Revenue", sub: "same fiscal-year top line", now: prof.revenue,
+      key: "revenue", fmt: (value) => money(value, currency), assumeZero: true },
+    { label: "Gross margin", sub: "gross profit / revenue", now: prof.gross,
+      key: "gross_margin", fmt: rateOrDash,
+      missing: "No same-period, filing-reported gross profit and revenue pair is available." },
     { label: "Net margin", sub: "profit per $ of sales", now: prof.net, key: "net_margin", fmt: rateOrDash },
     { label: "Operating margin", sub: "reported operating income / sales", now: prof.operating,
       key: "operating_margin", fmt: reportedRate,
       missing: "No same-period, filing-reported operating income and revenue pair is available; the screener does not invent an operating-profit subtotal from differently scoped lines." },
-    { label: "Return on book value", sub: "earnings on common equity", now: prof.on_book, key: "return_on_book", fmt: rateOrDash },
+    { label: "Return on book value", sub: "earnings on ending common equity", now: prof.on_book,
+      key: "return_on_book", fmt: rateOrDash },
+    { label: "Return on equity (ROE)", sub: "Finkle · net income / average common equity", now: prof.on_equity,
+      key: "return_on_equity", fmt: rateOrDash },
+    { label: "Normalized tax rate", sub: "median filing-reported effective rate · current FY and prior two FY",
+      now: ownerReturns.normalized_tax_rate, key: "normalized_tax_rate", fmt: rateOrDash,
+      missing: nopatMissing, operatingReturn: true },
+    { label: "NOPAT", sub: "operating income × (1 − normalized tax rate)",
+      now: ownerReturns.nopat, key: "nopat", fmt: (value) => money(value, currency), missing: nopatMissing,
+      operatingReturn: true },
+    { label: "NOPAT ROIC",
+      sub: `${ownerReturns.nopat == null ? "normalized NOPAT" : `${money(ownerReturns.nopat, currency)} normalized NOPAT`} / average invested capital excluding cash`,
+      now: ownerReturns.nopat_roic, key: "nopat_roic", fmt: rateOrDash, missing: roicMissing,
+      undefined: ownerReturns.nopat_roic_undefined,
+      operatingReturn: true },
+    { label: "NOPAT return including cash", sub: "normalized NOPAT / average capital including cash",
+      now: ownerReturns.nopat_return_including_cash, key: "nopat_return_including_cash", fmt: rateOrDash,
+      missing: cashReturnMissing, undefined: ownerReturns.nopat_return_including_cash_undefined,
+      operatingReturn: true },
+    { label: "RONTA", sub: "NOPAT / average net tangible operating assets",
+      now: ownerReturns.ronta, key: "ronta", fmt: rateOrDash, missing: rontaMissing,
+      undefined: ownerReturns.ronta_undefined,
+      operatingReturn: true },
+    ...(hasLeaseNeutral ? [{
+      label: "Lease-neutral RONTA",
+      sub: "historical comparison · removes recognized operating-lease ROU assets",
+      now: ownerReturns.lease_neutral_ronta, key: "lease_neutral_ronta", fmt: rateOrDash,
+      missing: leaseNeutralRontaMissing,
+      undefined: ownerReturns.lease_neutral_ronta_undefined,
+      operatingReturn: true,
+    }] : []),
   ];
   if (!years.length && lines.every((line) => line.now == null)) return null;
   return (
@@ -270,13 +456,26 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
             {lines.map((line) => (
               <tr key={line.label + (line.sub ?? "")}>
                 <td><b>{line.label}</b>{line.sub && <small>{line.sub}</small>}</td>
-                <td className="num current" title={line.now == null ? line.missing : undefined}>
-                  {line.fmt(line.now)}
+                <td className="num current"
+                    title={line.undefined ?? (line.now == null ? line.missing : undefined)}>
+                  {line.undefined
+                    ? "N/M"
+                    : assumptionActive && line.now == null
+                      ? (line.assumeZero ? line.fmt(0) : "N/M")
+                      : line.fmt(line.now)}
                 </td>
                 {years.map((y) => (
                   <td key={y} className="num"
-                    title={line.key && history[y]?.[line.key] == null ? line.missing : undefined}>
-                    {line.key ? line.fmt(history[y]?.[line.key]) : <span className="dim">{"—"}</span>}
+                    title={line.key && history[y]?.[`${line.key}_undefined`]
+                      ? history[y][`${line.key}_undefined`]
+                      : line.key && history[y]?.[line.key] == null
+                        ? (line.operatingReturn
+                          ? (history[y]?.operating_return_caveats?.join(" ") ?? line.missing)
+                          : line.missing)
+                        : undefined}>
+                    {line.key
+                      ? (history[y]?.[`${line.key}_undefined`] ? "N/M" : line.fmt(history[y]?.[line.key]))
+                      : <span className="dim">{"—"}</span>}
                   </td>
                 ))}
               </tr>
@@ -284,6 +483,11 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
           </tbody>
         </table>
       </div>
+      {hasLeaseNeutral && <p className="criteria-note"><b>Lease treatment:</b> RONTA
+        keeps both current and noncurrent operating-lease obligations with financing.
+        Lease-neutral RONTA also removes the reported ROU asset, matching the old
+        off-balance-sheet presentation for historical comparison. It does not estimate
+        or capitalize leases from pre-ASC 842 commitments.</p>}
     </section>
   );
 }
@@ -294,8 +498,9 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
  * meaningful while net current assets are positive — a negative denominator
  * turns "cheap" upside down. */
 function priceToNcav(row) {
-  if (row.price == null || row.ncavps == null || row.ncavps <= 0) return null;
-  const ratio = row.price / row.ncavps;
+  const price = valuationPrice(row);
+  if (price == null || row.ncavps == null || row.ncavps <= 0) return null;
+  const ratio = price / row.ncavps;
   // Graham buys under 0.67x. At 6,425,308x the figure has stopped being a
   // multiple of anything — the net current assets are a rounding error, which is
   // information the number itself no longer carries.
@@ -336,14 +541,15 @@ function ModernGrowth({ growth }) {
 }
 
 function defensiveRows({ row, defensive, ch13, dividend, currentRatio, workingCapital, ltd, marketCap, pe3Value, priceToBook }) {
+  const currency = row.currency ?? "USD";
   const test = (name) => defensive?.tests?.[name] ?? "INSUFFICIENT_DATA";
   const dividendEvidence = dividend?.latest != null && dividend?.streak_from != null
     ? `${dividend.latest - dividend.streak_from + 1} years (from ${dividend.streak_from})`
     : "No verified record";
-  const sizeValue = row.graham_profile === "UTILITY" ? money(row.total_assets) : money(row.ttm_revenue);
+  const sizeValue = row.graham_profile === "UTILITY" ? money(row.total_assets, currency) : money(row.ttm_revenue, currency);
   const financialValue = row.graham_profile === "UTILITY"
-    ? `LT debt ${money(ltd)} · equity ${money(row.total_assets != null && row.total_liabilities != null ? row.total_assets - row.total_liabilities : null)}`
-    : `CR ${multiple(currentRatio)} · WC ${money(workingCapital)} · LT debt ${money(ltd)}`;
+    ? `LT debt ${money(ltd, currency)} · equity ${money(row.total_assets != null && row.total_liabilities != null ? row.total_assets - row.total_liabilities : null, currency)}`
+    : `CR ${multiple(currentRatio)} · WC ${money(workingCapital, currency)} · LT debt ${money(ltd, currency)}`;
   const valuationProduct = pe3Value != null && priceToBook != null ? pe3Value * priceToBook : null;
   return [
     { label: "Adequate size", rule: row.graham_profile === "UTILITY" ? "Assets ≥ $50M" : "Revenue ≥ $100M", value: sizeValue, status: test("size") },
@@ -393,36 +599,122 @@ function enterprisingRow(criterion) {
 }
 
 /** Separately labelled evidence around Buffett owner earnings. Not a Graham criterion. */
-function OwnerEarnings({ oe, cik }) {
+function OwnerEarnings({ oe, cik, annualEps, annualWeightedShares, currency = "USD" }) {
   if (!oe) return null;
   const rate = (value) => (value == null ? "—" : `${number(value)}%`);
   const trend = ownerEarningsTrend(oe);
-  const fcfAfterSbc = ownerMetricTrend(
-    oe, "free_cash_flow_after_stock_compensation_per_share",
-    "free_cash_flow_after_stock_compensation");
   const latest = trend?.rows.find((row) => row.fiscalYear === oe.fiscal_year);
-  const beginning = oe.invested_capital_evidence?.beginning;
-  const ending = oe.invested_capital_evidence?.ending;
+  const years = trend?.rows ?? [];
+  const bridgePoint = (cell, key) => {
+    const point = cell?.cash_flow_bridge?.[key];
+    if (Array.isArray(point)) {
+      const [value, tag, form, accn, end, unit, document] = point;
+      return { value, source: { tag, form, accn, end, unit, document } };
+    }
+    if (typeof point === "number") return { value: point, source: null };
+    return point ?? null; // engine <=117 object compatibility
+  };
+  const hasBridgePoint = (key) => years.some(({ cell }) => bridgePoint(cell, key)?.value != null);
+  const bridgeRows = [
+    {
+      key: "eps",
+      label: "Diluted EPS",
+      note: "The filing-reported per-share result; it can differ from net income divided by shares because of allocation and dilution rules.",
+      value: (_, fiscalYear) => annualEps?.[fiscalYear] ?? annualEps?.[String(fiscalYear)],
+      format: (value) => moneyPrice(value, currency),
+    },
+    {
+      key: "shares",
+      label: "Diluted weighted shares",
+      note: "The average diluted security count behind EPS, restated for later splits and the priced receipt where applicable.",
+      value: (cell, fiscalYear) => (
+        annualWeightedShares?.[fiscalYear]
+        ?? annualWeightedShares?.[String(fiscalYear)]
+        ?? cell?.diluted_shares
+      ),
+      format: shareCount,
+    },
+    {
+      key: "net_income",
+      label: "Net income available to common",
+      note: "After corporate income tax and financing costs; the owner-earnings starting profit.",
+    },
+    {
+      key: "depreciation_and_amortisation",
+      label: "+ Depreciation & amortisation",
+      note: "A noncash expense added back in the operating cash-flow reconciliation.",
+    },
+    {
+      key: "stock_compensation",
+      label: "+ Stock compensation",
+      note: "A noncash employee-pay expense added back inside OCF when it is separately filed.",
+    },
+    {
+      key: "other_operating_cash_flow_adjustments",
+      label: "+/− Other OCF adjustments",
+      note: "Residual needed to reconcile the separately shown rows to OCF; it absorbs all other adjustments plus SBC or working capital when either cannot be isolated.",
+    },
+    {
+      key: "working_capital_cash_effect",
+      label: "+/− Working-capital cash effect",
+      note: "The filed cash-flow effect of Δ operating working capital: positive supplies cash and negative consumes cash.",
+    },
+    {
+      key: "operating_cash_flow",
+      label: "= Operating cash flow",
+      note: "Net cash provided by operating activities; after cash taxes, with interest classification following the filing.",
+    },
+    {
+      key: "total_capital_expenditure",
+      label: "− Total CapEx",
+      note: "Shown as a cash use. Primary XBRL normally does not identify maintenance versus growth CapEx; FCF stays blank if only an accrual-based CapEx fact is available.",
+      transform: (value) => -Math.abs(value),
+    },
+    ...(hasBridgePoint("maintenance_capital_expenditure") ? [{
+      key: "maintenance_capital_expenditure",
+      label: "  Maintenance CapEx",
+      note: "Displayed only when the filing separately identifies maintenance spending.",
+      transform: (value) => -Math.abs(value),
+    }] : []),
+    ...(hasBridgePoint("growth_capital_expenditure") ? [{
+      key: "growth_capital_expenditure",
+      label: "  Growth CapEx",
+      note: "Displayed only when the filing separately identifies growth spending.",
+      transform: (value) => -Math.abs(value),
+    }] : []),
+    {
+      key: "free_cash_flow",
+      label: "= Free cash flow",
+      note: "Operating cash flow less cash CapEx; cash available before acquisitions, debt repayment, dividends, and buybacks.",
+    },
+    ...(hasBridgePoint("share_repurchases") ? [{
+      key: "share_repurchases",
+      label: "− Share repurchases (buybacks)",
+      note: "Reported financing cash used to reacquire shares. It is shown as a use of FCF and is not deducted when calculating FCF.",
+      transform: (value) => -Math.abs(value),
+    }] : []),
+  ];
   return (
     <section className="criteria-section">
       <div className="criteria-title">
         <div><h3>Owner earnings &amp; cash-generation evidence</h3>
-          <p>No definitive owner-earnings number is claimed: maintenance capex and required
-             incremental working capital are not separately reported in primary XBRL.</p></div>
-        <b>Evidence lenses</b>
+          <p>Latest ten completed fiscal-year slots. The bridge shows how reported profit
+             becomes operating cash flow, then deducts cash CapEx to reach FCF. Missing
+             filing evidence remains a dash.</p></div>
+        <b>10-year record</b>
       </div>
       {trend && (
         <div className="snapshot-grid owner-earnings-summary">
           <Metric label={`FY${oe.fiscal_year} reported earnings / share`}
                   sub="maintenance capex assumed equal to D&A; equals earnings by construction"
-                  value={moneyPrice(latest?.perShare)} />
+                  value={moneyPrice(latest?.perShare, currency)} />
           <Metric label="10-slot CAGR" sub={`${trend.firstFiscalYear}–${trend.latestFiscalYear}`}
                   value={rate(trend.cagr)} />
           <Metric label="5-slot CAGR" value={rate(trend.cagr5)} />
           <Metric label="3-slot CAGR" value={rate(trend.cagr3)} />
           <Metric label="Total earnings CAGR" value={rate(trend.totalCagr)} />
           <Metric label="Diluted-share CAGR" value={rate(trend.shareCountCagr)} />
-          <Metric label="10-year median / share" value={moneyPrice(trend.median10)} />
+          <Metric label="10-year median / share" value={moneyPrice(trend.median10, currency)} />
           <Metric label="Latest vs 10-year median" value={signedPercent(trend.latestVsMedian10)} />
           <Metric label="Worst YoY decline" value={rate(trend.worstYoyDecline)} />
           <Metric label="Maximum peak-to-trough decline" value={rate(trend.maximumDrawdown)} />
@@ -435,110 +727,35 @@ function OwnerEarnings({ oe, cik }) {
         <p className="criteria-note warning"><b>Buyback-driven growth:</b> per-share results
           improved while total reported earnings declined because diluted shares fell.</p>
       )}
-      <table className="criteria-clean">
-        <thead><tr><th>Measurement</th><th className="num">FY{oe.fiscal_year}</th></tr></thead>
-        <tbody>
-          {oe.components.map(([label, value]) => (
-            <tr key={label}><td><b>{label}</b></td><td className="num">{money(value)}</td></tr>
-          ))}
-          <tr><td><b>Earnings after total capital expenditure</b>
-            <small>Growth and maintenance capex deducted together; not a guaranteed floor.</small></td>
-              <td className="num">{money(oe.all_capex_floor)}</td></tr>
-          <tr><td><b>Reported earnings — maintenance capex assumed equal to D&amp;A</b>
-            <small>The D&amp;A add-back and assumed maintenance deduction cancel by construction.</small></td>
-              <td className="num">{money(oe.maintenance_estimate)}</td></tr>
-          <tr><td><b>Standard free cash flow</b><small>Operating cash flow less cash capex.</small></td>
-              <td className="num">{money(oe.free_cash_flow)}</td></tr>
-          {oe.free_cash_flow_after_stock_compensation != null && <tr>
-            <td><b>FCF after stock compensation</b><small>Conservative shareholder-cost diagnostic.</small></td>
-            <td className="num">{money(oe.free_cash_flow_after_stock_compensation)}</td></tr>}
-          {oe.free_cash_flow_after_acquisitions != null && <tr>
-            <td><b>FCF after cash acquisitions</b></td>
-            <td className="num">{money(oe.free_cash_flow_after_acquisitions)}</td></tr>}
-          {oe.expanded_free_cash_flow != null && <tr>
-            <td><b>FCF after capitalized software and acquired intangibles</b></td>
-            <td className="num">{money(oe.expanded_free_cash_flow)}</td></tr>}
-          {oe.operating_cash_flow_before_working_capital != null && <tr>
-            <td><b>CFO before reported working-capital cash effect</b></td>
-            <td className="num">{money(oe.operating_cash_flow_before_working_capital)}</td></tr>}
-          {oe.average_working_capital_cash_effect_3y != null && <tr>
-            <td><b>Three-year average working-capital cash effect</b></td>
-            <td className="num">{money(oe.average_working_capital_cash_effect_3y)}</td></tr>}
-          {oe.stock_compensation_to_revenue != null && <tr>
-            <td><b>Stock compensation / revenue</b></td>
-            <td className="num">{rate(oe.stock_compensation_to_revenue)}</td></tr>}
-          {oe.stock_compensation_to_free_cash_flow != null && <tr>
-            <td><b>Stock compensation / standard FCF</b></td>
-            <td className="num">{rate(oe.stock_compensation_to_free_cash_flow)}</td></tr>}
-          {oe.acquisitions_to_free_cash_flow != null && <tr>
-            <td><b>Cash acquisitions / standard FCF</b></td>
-            <td className="num">{rate(oe.acquisitions_to_free_cash_flow)}</td></tr>}
-          {oe.acquisition_years_10 != null && <tr>
-            <td><b>Fiscal years with reported cash acquisitions</b><small>Latest ten fiscal-year slots; missing facts are not zero.</small></td>
-            <td className="num">{number(oe.acquisition_years_10)}</td></tr>}
-          <tr><td><b>Average invested capital</b>
-            <small>All cash and short-term investments excluded; exact beginning and ending balance sheets required.</small></td>
-              <td className="num">{money(oe.invested_capital)}</td></tr>
-          {(beginning || ending) && <tr><td><b>Capital endpoints</b></td>
-            <td className="num">{money(beginning?.value)} ({beginning?.end ?? "—"}) → {money(ending?.value)} ({ending?.end ?? "—"})</td></tr>}
-          <tr><td><b>Average capital including cash</b></td>
-              <td className="num">{money(oe.capital_including_cash)}</td></tr>
-          <tr><td><b>All-capex cash return / average invested capital</b></td>
-              <td className="num">{rate(oe.all_capex_return)}</td></tr>
-          <tr><td><b>Earnings-based return / average invested capital</b></td>
-              <td className="num">{rate(oe.maintenance_estimate_return)}</td></tr>
-          <tr><td><b>All-capex cash return / capital including cash</b></td>
-              <td className="num">{rate(oe.all_capex_return_including_cash)}</td></tr>
-          {oe.nopat_roic != null && <tr><td><b>NOPAT ROIC</b>
-            <small>Operating income after the median usable three-year tax rate, over average invested capital.</small></td>
-              <td className="num">{rate(oe.nopat_roic)}</td></tr>}
-          {oe.nopat_return_including_cash != null && <tr><td><b>NOPAT return including cash</b></td>
-              <td className="num">{rate(oe.nopat_return_including_cash)}</td></tr>}
-        </tbody>
-      </table>
-      {trend && (
-        <div className="annual-history-scroll owner-earnings-history">
-          <table className="annual-history-table">
-            <thead><tr><th>Fiscal year</th><th className="num">Reported earnings / share</th>
-              <th className="num">Reported earnings total</th><th className="num">YoY / share</th>
-              <th className="num">After total capex / share</th><th className="num">After total capex total</th>
-              <th className="num">Standard FCF / share</th><th className="num">Standard FCF total</th>
-              <th className="num">FCF after SBC / share</th><th className="num">FCF after acquisitions / share</th>
-              <th className="num">Expanded FCF / share</th><th className="num">Diluted shares</th></tr></thead>
-            <tbody>
-              {trend.rows.map(({ fiscalYear, cell, perShare, total, yoy }) => (
-                <tr key={fiscalYear} className={perShare != null && perShare < 0 ? "loss" : ""}>
-                  <td><b>FY{fiscalYear}</b>{fiscalYear === oe.fiscal_year && <small>latest completed</small>}</td>
-                  <td className="num">{moneyPrice(perShare)}</td>
-                  <td className="num">{money(total)}</td>
-                  <td className="num">{signedPercent(yoy)}</td>
-                  <td className="num">{moneyPrice(cell?.earnings_after_total_capex_per_share ?? cell?.all_capex_floor_per_share)}</td>
-                  <td className="num">{money(cell?.earnings_after_total_capex ?? cell?.all_capex_floor)}</td>
-                  <td className="num">{moneyPrice(cell?.free_cash_flow_per_share)}</td>
-                  <td className="num">{money(cell?.free_cash_flow)}</td>
-                  <td className="num">{moneyPrice(cell?.free_cash_flow_after_stock_compensation_per_share)}</td>
-                  <td className="num">{moneyPrice(cell?.free_cash_flow_after_acquisitions_per_share)}</td>
-                  <td className="num">{moneyPrice(cell?.expanded_free_cash_flow_per_share)}</td>
-                  <td className="num">{shareCount(cell?.diluted_shares)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-      {fcfAfterSbc?.yearsPresent > 1 && <p className="criteria-note">
-        <b>FCF after stock compensation record:</b> {fcfAfterSbc.yearsPresent}/10 years,
-        5-slot CAGR {rate(fcfAfterSbc.cagr5)}, maximum drawdown {rate(fcfAfterSbc.maximumDrawdown)}.
-      </p>}
-      {!!Object.keys(oe.sources ?? {}).length && (
-        <div className="owner-source-list">
-          <b>Latest-year filing inputs</b>
-          {Object.entries(oe.sources).map(([name, source]) => (
-            <span key={name}><code>{name.replaceAll("_", " ")}: {source.tag}</code>
-              <SourceCell cik={cik} source={source} /></span>
-          ))}
-        </div>
-      )}
+      <p className="criteria-note"><b>Cash bridge:</b> net income + D&amp;A + separately
+        reported stock compensation + other adjustments + the working-capital cash effect
+        = OCF; OCF − cash CapEx = FCF. Unseparated SBC or working-capital effects remain
+        inside the residual instead of becoming zero. Maintenance and growth CapEx appear only
+        when the filing identifies them.</p>
+      {!!years.length && <div className="annual-history-scroll owner-earnings-history">
+        <table className="annual-history-table owner-cash-bridge">
+          <thead><tr><th>Measurement</th>{years.map(({ fiscalYear }) => (
+            <th key={fiscalYear} className="num">FY{fiscalYear}</th>
+          ))}</tr></thead>
+          <tbody>{bridgeRows.map((row) => (
+            <tr key={row.key}>
+              <td><b>{row.label}</b><small>{row.note}</small></td>
+              {years.map(({ fiscalYear, cell }) => {
+                const point = bridgePoint(cell, row.key);
+                const rawValue = row.value ? row.value(cell, fiscalYear) : point?.value;
+                const value = rawValue == null ? null : (row.transform?.(rawValue) ?? rawValue);
+                return <td key={fiscalYear} className={`num ${value < 0 ? "negative" : ""}`}
+                  title={point?.source?.tag}>
+                  <b>{row.format ? row.format(value) : money(value, currency)}</b>
+                  {point?.source && <span className="bridge-source">
+                    <SourceCell cik={cik} source={point.source} />
+                  </span>}
+                </td>;
+              })}
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>}
       {!!oe.caveats?.length && <ul className="disclosure-notes compact">
         {oe.caveats.map((caveat) => <li key={caveat}>{caveat}</li>)}
       </ul>}
@@ -582,7 +799,7 @@ const SOURCE_LABELS = {
 /** The filing's index page, which names its primary document — not the bare
  * archive folder, which leaves the reader to guess which file is the filing. */
 function edgarUrl(cik, accn) {
-  if (!cik || !accn) return null;
+  if (!cik || !accn || !/^\d{10}$/.test(String(cik))) return null;
   return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replaceAll("-", "")}/${accn}-index.htm`;
 }
 
@@ -593,7 +810,7 @@ function SourceCell({ cik, source }) {
     <>
       {url ? <a href={url} target="_blank" rel="noreferrer" title={`Open filing ${source.accn}`}>{label}</a>
            : label}
-      <small className="accn">{source.accn}</small>
+      <small className="accn">{source.document ?? source.accn}</small>
     </>
   );
 }
@@ -605,7 +822,7 @@ function Provenance({ row }) {
   return (
     <section className="criteria-section provenance-section">
       <div className="criteria-title"><div><h3>Data provenance</h3>
-        <p>Which XBRL tag, in which SEC filing, dated when. Filing links open EDGAR.</p></div></div>
+        <p>Exact source element or workbook row, document, and reporting date.</p></div></div>
       <div className="provenance-scroll">
         <table className="criteria-clean">
           <thead><tr><th>Figure</th><th>Value</th><th>Tag</th><th>Filing</th></tr></thead>
@@ -615,7 +832,7 @@ function Provenance({ row }) {
               const stored = row[key] ?? row.asset_quality?.[key];
               const raw = key === "dividend" && stored == null ? undefined : stored;
               const value = key === "shares" ? number(raw)
-                : key === "fixed_charge_coverage" ? multiple(raw) : money(raw);
+                : key === "fixed_charge_coverage" ? multiple(raw) : money(raw, row.currency);
               const out = [(
                 <tr key={key}>
                   <td><b>{label}</b></td>
@@ -703,30 +920,38 @@ function number(value) {
 function multiple(value) { return value == null ? "—" : `${number(value)}×`; }
 function signedPercent(value) { return value == null ? "—" : `${value >= 0 ? "+" : ""}${number(value)}%`; }
 function signed(value) { return value >= 0 ? `+${number(value)}` : number(value); }
-function money(value) {
+function money(value, currency = "USD") {
   if (value == null) return "—";
   // the minus sign belongs in front of the amount, not between the currency and
   // the digits: Walmart's working capital rendered as "$-26.2B"
   const sign = value < 0 ? "−" : "";
+  const symbol = ({ EUR: "€", GBP: "£", JPY: "¥" }[currency] ?? "$");
   const absolute = Math.abs(value);
   for (const [divisor, suffix] of [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "K"]])
-    if (absolute >= divisor)
-      return `${sign}$${(absolute / divisor).toFixed(absolute / divisor < 10 ? 1 : 0)}${suffix}`;
-  return `${sign}$${number(absolute)}`;
+    if (absolute >= divisor) {
+      const scaled = absolute / divisor;
+      const precision = suffix === "B" ? 2 : (scaled < 10 ? 1 : 0);
+      return `${sign}${symbol}${scaled.toFixed(precision)}${suffix}`;
+    }
+  return `${sign}${symbol}${number(absolute)}`;
 }
 function rateOrDash(value) {
   return value == null ? "—" : `${Number(value).toFixed(1)}%`;
 }
-function moneyPrice(value) {
+function moneyPrice(value, currency = "USD") {
   if (value == null) return "—";
   const sign = value < 0 ? "−" : "";
+  const symbol = ({ EUR: "€", GBP: "£", JPY: "¥" }[currency] ?? "$");
   const absolute = Math.abs(value);
-  if (absolute < 1) return `${sign}$${absolute.toFixed(3)}`;
-  return `${sign}$${absolute.toFixed(2)}`;
+  if (absolute < 1) return `${sign}${symbol}${absolute.toFixed(3)}`;
+  return `${sign}${symbol}${absolute.toFixed(2)}`;
 }
 function shareCount(value) {
   if (!(value > 0)) return "—";
   for (const [divisor, suffix] of [[1e9, "B"], [1e6, "M"], [1e3, "K"]])
-    if (value >= divisor) return `${number(value / divisor)}${suffix}`;
+    if (value >= divisor) {
+      const scaled = value / divisor;
+      return `${suffix === "B" ? scaled.toFixed(2) : number(scaled)}${suffix}`;
+    }
   return number(value);
 }

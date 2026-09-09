@@ -1,9 +1,18 @@
 """Evidence assembly and invalidation — the boundary shared by every pipeline."""
 import json
 import zipfile
+from datetime import date
 
 from screener import evidence, store
 from screener.sources import dera
+
+
+def test_dera_candidate_is_the_immediately_preceding_closed_quarter():
+    """A missing newest zip is already a harmless 404 in ``download``; holding
+    the cursor back an extra quarter instead hides datasets that SEC did publish."""
+    assert dera.latest_published(date(2026, 1, 1)) == dera.Quarter(2025, 4)
+    assert dera.latest_published(date(2026, 4, 1)) == dera.Quarter(2026, 1)
+    assert dera.latest_published(date(2026, 9, 8)) == dera.Quarter(2026, 2)
 
 
 class EdgarStub:
@@ -154,3 +163,27 @@ def test_dera_recognizes_ifrs_version_as_standard_and_keeps_per_share_fact(tmp_p
         ["BasicEarningsLossPerShare"]["units"]["USD/shares"]
     assert entries[0]["val"] == 1.25
     assert entries[0]["segments"] == "ClassesOfShareCapital=ClassA;"
+
+
+def test_dera_keeps_allowlisted_small_statement_extension_below_materiality_floor(tmp_path):
+    archive = tmp_path / "2025q1.zip"
+    tag = "DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms"
+    with zipfile.ZipFile(archive, "w") as z:
+        z.writestr(
+            "sub.txt",
+            "adsh\tcik\tform\tfiled\nfusb-k24\t717806\t10-K\t20250314\n",
+        )
+        z.writestr(
+            "num.txt",
+            "adsh\ttag\tversion\tcoreg\tvalue\tddate\tqtrs\tuom\tsegments\n"
+            f"fusb-k24\t{tag}\tfusb/2024\t\t1581000\t20231231\t4\tUSD\t\n"
+            "fusb-k24\tUnrelatedSmallExtension\tfusb/2024\t\t2000000\t"
+            "20231231\t4\tUSD\t\n",
+        )
+
+    harvested = dera.harvest(
+        archive, {"0000717806"}, frozenset({tag}),
+    )["0000717806"]["facts"]
+
+    assert harvested["ext:fusb/2024"][tag]["units"]["USD"][0]["val"] == 1_581_000
+    assert "UnrelatedSmallExtension" not in harvested["ext:fusb/2024"]

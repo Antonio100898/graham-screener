@@ -74,7 +74,9 @@ def _verdict(criteria: tuple[CriterionResult, ...]) -> Verdict:
 
 def _unclassified_balance_sheet(s: FinancialSnapshot) -> bool:
     # Banks/REITs file no classified balance sheet: AssetsCurrent absent while Assets exists
-    return s.current_assets is None and s.current_liabilities is None and s.total_assets is not None
+    return (s.unclassified_balance_sheet
+            or (s.current_assets is None and s.current_liabilities is None
+                and s.total_assets is not None))
 
 
 _NA_NOTE = "no classified balance sheet (typical for banks/REITs); criterion not assessable"
@@ -168,7 +170,12 @@ def settled_debt(s: FinancialSnapshot) -> tuple[Decimal | None, tuple[Fact, ...]
     named = {"long-term debt": s.long_term_debt, "short-term debt": s.short_term_debt}
     inputs = tuple(f for f in named.values() if f is not None)
     missing = [k for k, f in named.items() if f is None]
-    if missing and "debt" not in s.assumed_zero:
+    allowed_missing = {
+        "long-term debt": "debt" in s.assumed_zero,
+        "short-term debt": bool(
+            {"debt", "short_term_debt"} & s.assumed_zero),
+    }
+    if any(not allowed_missing[name] for name in missing):
         return None, inputs, missing
     return sum((f.value for f in named.values() if f is not None), Decimal(0)), inputs, missing
 
@@ -195,7 +202,8 @@ def _c3_debt(s: FinancialSnapshot) -> CriterionResult:
                                note="missing: " + ", ".join(missing))
     if missing:
         notes.append("assumed 0 for " + ", ".join(missing)
-                     + " (no debt evidence in any filing; assume_absent_zero opt-in)")
+                     + " (no debt evidence in the current annual-report filing window; "
+                       "assume_absent_zero opt-in)")
     nca = s.current_assets.value - s.current_liabilities.value
     status = Status.PASS if debt <= DEBT_TO_NCA_MAX * nca else Status.FAIL
     ratio = (debt / nca).quantize(_CENT) if nca > 0 else None
@@ -340,7 +348,8 @@ def _c7_tangible_asset_valuation(s: FinancialSnapshot, q: Quote | None) -> Crite
     notes = []
     if assumed:
         notes.append("assumed 0 for " + ", ".join(sorted(assumed))
-                     + " (no evidence in any filing; assume_absent_zero opt-in)")
+                     + " (no evidence in the current annual-report filing window; "
+                       "assume_absent_zero opt-in)")
     if s.preferred_stock is None:
         notes.append("no preferred-stock value tagged; defaulted to 0 (flagged per §5.1)")
     if s.temporary_equity is not None:

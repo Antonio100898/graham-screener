@@ -24,15 +24,16 @@ import argparse
 import json
 import random
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 from . import evidence, store
 from .sources.edgar import EdgarClient
 from . import profiles
 from .sync import (
-    DASHBOARD_JSON, _derive_cached_worker, _index_tickers, _mark_peer_efficiency,
-    _price_the_ratio_history, apply_price,
+    DASHBOARD_JSON, PRICEABLE_LISTINGS, _derive_cached_worker, _index_tickers, _mark_peer_efficiency,
+    _price_the_ratio_history, _reporting_currency, _strip_detail_only_evidence,
+    apply_price,
 )
 
 # Fields whose value is a live quote or a clock reading rather than a product of
@@ -86,9 +87,18 @@ def _price_history_for_row(conn, cik: str, row: dict) -> list:
     UI export deliberately withholds that series unless the company is currently
     resolved as listed, so the regression rebuild must do the same.
     """
-    if row.get("listed") != "y":
+    if row.get("listed") not in PRICEABLE_LISTINGS:
         return []
     return store.price_history(conn, cik)
+
+
+def _fx_history_for_row(conn, row: dict) -> list:
+    """Mirror export's stored FX history for foreign statement currencies."""
+    reporting = _reporting_currency(row)
+    if reporting == "USD":
+        return []
+    record = store.fx_history(conn, "USD", reporting)
+    return (record or {}).get("closes") or []
 
 
 def compare(sample: int | None, tickers: set[str] | None, field: str | None,
@@ -119,46 +129,68 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
     # Consume completed futures promptly so one unusually large early filer cannot
     # hold thousands of later results in memory. Candidates are sorted back into
     # `chosen` order afterward, keeping two reports directly diffable.
+    prepared = []
+    for order, row in enumerate(chosen):
+        cik = row["cik"]
+        path = Path(edgar.cache_dir) / f"companyfacts_{cik}.json"
+        if not path.exists():
+            continue
+        ticker = index.get(cik, (row["ticker"], None))[0] or row["ticker"]
+        ticker, receipt = loader.identity(cik, ticker)
+        task = (cik, ticker, receipt, str(edgar.cache_dir))
+        prepared.append((order, row, task))
+
     jobs = {}
     completed: dict[int, tuple[dict, dict]] = {}
-    with ProcessPoolExecutor(max_workers=4) as pool:
-        for order, row in enumerate(chosen):
-            cik = row["cik"]
-            path = Path(edgar.cache_dir) / f"companyfacts_{cik}.json"
-            if not path.exists():
-                continue
-            ticker = index.get(cik, (row["ticker"], None))[0] or row["ticker"]
-            ticker, receipt = loader.identity(cik, ticker)
-            task = (cik, ticker, receipt, str(edgar.cache_dir))
-            jobs[pool.submit(_derive_cached_worker, task)] = (order, row)
+    max_workers = 4
+    max_in_flight = max_workers * 4
+    total_jobs = len(prepared)
+    progress(f"  {total_jobs} companies queued for recomputation")
+    prepared_iter = iter(prepared)
 
-        total_jobs = len(jobs)
-        for i, future in enumerate(as_completed(jobs), 1):
-            order, row = jobs.pop(future)
-            cik = row["cik"]
-            try:
-                _, result = future.result()
-                status, fresh = result if result is not None else (None, None)
-            except Exception as exc:                 # one bad filing must not stop the sweep
-                failed.append((row["ticker"], repr(exc)[:80]))
-                continue
-            if not fresh:
-                continue
-            # `derive` is only half the pipeline. Export merges stored metadata into
-            # the row and enriches it; retain fields that derive does not own.
-            merged = {**row, **fresh,
-                      "filing_events": events.get(cik, []),
-                      "events_from": events_from.get(cik),
-                      "last_filing": conn.execute(
-                          "SELECT last_filing FROM company WHERE cik = ?", (cik,)
-                      ).fetchone()["last_filing"]}
-            # Settle with the exact quote already shown by the UI, so only engine
-            # changes—not a live-price move—reach the comparison.
-            apply_price(merged, row.get("price"))
-            _price_the_ratio_history(merged, _price_history_for_row(conn, cik, merged))
-            completed[order] = (row, merged)
-            if i % 250 == 0:
-                progress(f"  {i}/{total_jobs} recomputed")
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        def submit_available() -> None:
+            while len(jobs) < max_in_flight:
+                try:
+                    order, row, task = next(prepared_iter)
+                except StopIteration:
+                    return
+                jobs[pool.submit(_derive_cached_worker, task)] = (order, row)
+
+        submit_available()
+        recomputed = 0
+        while jobs:
+            done, _ = wait(jobs, return_when=FIRST_COMPLETED)
+            for future in done:
+                order, row = jobs.pop(future)
+                cik = row["cik"]
+                recomputed += 1
+                try:
+                    _, result = future.result()
+                    status, fresh = result if result is not None else (None, None)
+                except Exception as exc:             # one bad filing must not stop the sweep
+                    failed.append((row["ticker"], repr(exc)[:80]))
+                    continue
+                if not fresh:
+                    continue
+                # `derive` is only half the pipeline. Export merges stored metadata into
+                # the row and enriches it; retain fields that derive does not own.
+                merged = {**row, **fresh,
+                          "filing_events": events.get(cik, []),
+                          "events_from": events_from.get(cik),
+                          "last_filing": conn.execute(
+                              "SELECT last_filing FROM company WHERE cik = ?", (cik,)
+                          ).fetchone()["last_filing"]}
+                # Settle with the exact quote already shown by the UI, so only engine
+                # changes—not a live-price move—reach the comparison.
+                apply_price(merged, row.get("price"))
+                _price_the_ratio_history(
+                    merged, _price_history_for_row(conn, cik, merged),
+                    _fx_history_for_row(conn, merged))
+                completed[order] = (row, merged)
+            if recomputed % 250 < len(done):
+                progress(f"  {recomputed}/{total_jobs} recomputed")
+            submit_available()
 
     candidates = [completed[order] for order in sorted(completed)]
 
@@ -176,6 +208,7 @@ def compare(sample: int | None, tickers: set[str] | None, field: str | None,
         for gone in ("filing_events", "events_from", "last_filing",
                      "ttm_eps_vintage"):                 # popped on the way out
             merged.pop(gone, None)
+        _strip_detail_only_evidence(merged)
         old, new = _flat(row), _flat(merged)
         for key in sorted(set(old) | set(new)):
             if field and not key.startswith(field):

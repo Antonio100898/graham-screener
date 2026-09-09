@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from functools import lru_cache
@@ -17,7 +18,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import auth, evidence, jobs, portfolio, pricestats, store
+from . import auth, evidence, jobs, portfolio, pricestats, profiles, store, sync
 from .models import CriterionResult, Fact, FinancialSnapshot, ScreenResult
 from .normalize import UnsupportedFilerError, build_snapshot
 from .screens.enterprising import evaluate
@@ -85,12 +86,30 @@ def _price_stats(hist) -> dict | None:
                                        for k, v in stats.items()}
 
 
+def _market_evidence(ticker: str, snap: FinancialSnapshot, *, history: bool):
+    """Raw US quote/history plus a quote converted to the filing currency."""
+    market = (_prices.history(ticker, expected_currency="USD") if history
+              else _prices.quote(ticker, expected_currency="USD"))
+    quote = market.quote if history and market else market
+    if quote is None or snap.reporting_currency == "USD":
+        return market, quote
+    fx = _prices.exchange_rate_history("USD", snap.reporting_currency)
+    if fx is None:
+        return market, None
+    converted = replace(
+        quote,
+        price=quote.price * fx.quote.price,
+        source=f"{quote.source} + {fx.quote.source}",
+    )
+    return market, converted
+
+
 @app.get("/screen/enterprising/{ticker}")
 def screen_enterprising(ticker: str, assume_absent_zero: bool = False):
     snap = _snapshot_for(ticker, assume_absent_zero)
     # one request carries both the quote and the five-year weekly series
-    hist = _prices.history(ticker)
-    result = _screen_dict(evaluate(snap, hist.quote if hist else None))
+    hist, quote = _market_evidence(ticker, snap, history=True)
+    result = _screen_dict(evaluate(snap, quote))
     result["price_stats"] = _price_stats(hist)
     return result
 
@@ -106,7 +125,8 @@ def screen_enterprising_batch(req: BatchRequest):
     for ticker in req.tickers:
         try:
             snap = _snapshot_for(ticker, req.assume_absent_zero)
-            results.append(_screen_dict(evaluate(snap, _prices.quote(ticker))))
+            _, quote = _market_evidence(ticker, snap, history=False)
+            results.append(_screen_dict(evaluate(snap, quote)))
         except HTTPException as exc:
             results.append({"ticker": ticker.upper(), "error": exc.detail})
         except Exception as exc:  # one malformed filing must not void the whole batch
@@ -236,6 +256,213 @@ def _dashboard_payload() -> dict:
 def _portfolio_rows() -> tuple[dict, dict[str, dict]]:
     dashboard = _dashboard_payload()
     return dashboard, {row["cik"]: row for row in dashboard.get("rows", [])}
+
+
+_ANNUAL_RATIO_INPUTS = {
+    "pe": ("fiscal-year-end market price", "vintage trailing EPS"),
+    "pe3": ("fiscal-year-end market price", "three-year average EPS"),
+    "pb": ("fiscal-year-end market price", "common book value per share"),
+    "ptbv": ("fiscal-year-end market price", "tangible book value per share"),
+    "pncav": ("fiscal-year-end market price", "net current asset value per share"),
+    "current_ratio": ("same-year current assets", "same-year current liabilities"),
+    "debt_to_equity": ("same-year combined debt", "same-year common equity"),
+    "working_capital_to_debt": (
+        "same-year current assets", "same-year current liabilities",
+        "same-year combined debt"),
+    "award_pct": ("same-year equity-award count", "same-year share count"),
+    "revenue": ("same-year revenue",),
+    "gross_margin": ("same-year gross profit", "same-year revenue"),
+    "net_margin": ("same-year net income", "same-year revenue"),
+    "operating_margin": ("same-year operating income", "same-year revenue"),
+    "return_on_book": ("same-year net income", "ending common equity"),
+    "return_on_equity": ("same-year net income", "average common equity"),
+    "return_on_net_tangible_assets": (
+        "same-year net income", "net tangible assets"),
+}
+
+
+def _fill_assumed_ratio_gaps(row: dict) -> list[dict]:
+    """Remove ratio-table dashes in explicit assumption mode, with disclosure.
+
+    Direct missing observations (revenue and awards) become zero. A missing
+    quotient is marked N/M because replacing both inputs with zero produces an
+    undefined denominator, not a defensible 0% return.
+    """
+    details = []
+    direct_zero = {"revenue", "award_pct"}
+    for year, cell in sorted((row.get("annual_ratios") or {}).items()):
+        for key, inputs in _ANNUAL_RATIO_INPUTS.items():
+            if cell.get(key) is not None or cell.get(f"{key}_undefined") is not None:
+                continue
+            named = ", ".join(inputs)
+            if key in direct_zero:
+                cell[key] = 0.0
+                message = (
+                    f"{named} was not reported in recognized source evidence for FY{year}; "
+                    "the displayed value was assumed to be 0")
+            else:
+                message = (
+                    f"{key.replace('_', ' ')} could not be measured because the "
+                    f"required {named} was not reported/available for FY{year}; "
+                    "missing inputs were assumed to be 0, leaving no meaningful "
+                    "denominator, so the table displays N/M")
+                cell[f"{key}_undefined"] = message
+            details.append({
+                "scope": "historical",
+                "fiscal_year": int(year),
+                "field": key,
+                "message": message,
+            })
+    return details
+
+
+@app.get("/company/{ticker}/dashboard")
+def company_dashboard(ticker: str, assume_absent_zero: bool = False):
+    """Rebuild one displayed row under an explicit evidence assumption.
+
+    The static universe remains strict: missing evidence is missing. This route
+    is intentionally per-company and query-gated; the detail panel requests it
+    explicitly and discloses every zero substitution. It reads the same cached
+    filing bundle as derive, then runs the same price and profile enrichment used
+    by the exported payload.
+    """
+    wanted = ticker.upper()
+    base = next(
+        (row for row in _dashboard_payload().get("rows", [])
+         if str(row.get("ticker", "")).upper() == wanted),
+        None,
+    )
+    if base is None:
+        raise HTTPException(404, f"{wanted} is not in the current dashboard")
+    if not assume_absent_zero:
+        return base
+
+    conn = store.connect()
+    try:
+        try:
+            bundle = evidence.EvidenceLoader(conn, _edgar).load(
+                base["cik"], base.get("ticker"))
+            status, derived = sync._derive_evidence(
+                bundle, assume_absent_zero=True)
+        except Exception as exc:
+            return {
+                **base,
+                "assumption_mode": {
+                    "requested": True,
+                    "status": "UNAVAILABLE",
+                    "applied": [],
+                    "details": [],
+                    "note": f"Local evidence rebuild failed for {wanted}: {exc!r}"[:300],
+                },
+            }
+        if derived is None or status not in {"ok", "pending_facts"}:
+            detail = (derived or {}).get("error") or status
+            return {
+                **base,
+                "assumption_mode": {
+                    "requested": True,
+                    "status": "UNAVAILABLE",
+                    "applied": [],
+                    "details": [],
+                    "note": f"Local evidence rebuild could not derive {wanted}: {detail}"[:300],
+                },
+            }
+
+        # Export removes these engine-only inputs. Restore the filing-index data
+        # needed to reproduce its stale-data and profile notes for this one row.
+        company = conn.execute(
+            "SELECT last_filing, events_from FROM company WHERE cik = ?",
+            (base["cik"],),
+        ).fetchone()
+        filing_events = [dict(row) for row in conn.execute(
+            "SELECT filed, item, accn FROM filing_event WHERE cik = ? ORDER BY filed",
+            (base["cik"],),
+        )]
+        closes = store.price_history(conn, base["cik"])
+        reporting_currency = (
+            derived.get("reporting_currency") or derived.get("currency") or "USD")
+        fx_record = (store.fx_history(conn, "USD", reporting_currency)
+                     if reporting_currency != "USD" else None)
+    finally:
+        conn.close()
+
+    row = {**base, **derived}
+    row["last_filing"] = company["last_filing"] if company else None
+    row["events_from"] = company["events_from"] if company else None
+    row["filing_events"] = filing_events
+    sync._set_fx(row, fx_record)
+    sync.apply_price(row, row.get("price"))
+    sync._price_the_ratio_history(
+        row, closes, (fx_record or {}).get("closes") or [])
+    for key in ("graham_profile", "graham_profile_meta", "analysis_routes",
+                "prose_gaps", "alignment"):
+        row.pop(key, None)
+    row.update(profiles.enrich(row))
+    ratio_gap_details = _fill_assumed_ratio_gaps(row)
+    historical_assumptions = {
+        assumption
+        for cell in (row.get("annual_ratios") or {}).values()
+        for assumption in (cell.get("operating_return_assumptions") or ())
+    }
+    applied = sorted(set(row.get("assumptions") or ()) | historical_assumptions)
+    labels = {
+        "debt": "long- and short-term debt",
+        "short_term_debt": "short-term debt",
+        "short_term_investments": "short-term investments",
+        "noncurrent_investments": "noncurrent investments",
+        "goodwill": "goodwill",
+        "intangibles": "other intangible assets",
+        "operating_income": "operating income",
+        "tax_rate": "effective income-tax rate",
+        "total_assets": "total assets",
+        "current_liabilities": "current liabilities",
+        "cash": "cash and cash equivalents",
+        "restricted_cash": "restricted cash included in the cash rollup",
+    }
+    details = list(ratio_gap_details)
+    current_end = row.get("balance_sheet_date") or "the latest balance sheet"
+    currency = row.get("currency") or "USD"
+    for field in sorted(row.get("assumptions") or ()):
+        details.append({
+            "scope": "current",
+            "field": field,
+                "message": (
+                    f"{labels.get(field, field.replace('_', ' '))} was not reported "
+                    f"in recognized current source evidence at {current_end}; "
+                    f"assumed 0 {currency}"),
+        })
+    for year, cell in sorted((row.get("annual_ratios") or {}).items()):
+        for message in cell.get("operating_return_caveats") or ():
+            lower = message.lower()
+            if (("assum" in lower and "0" in lower)
+                    and ("not reported" in lower or "no exact-date" in lower)):
+                details.append({
+                    "scope": "historical",
+                    "fiscal_year": int(year),
+                    "message": message,
+                })
+    unique_details = []
+    seen_details = set()
+    for detail in details:
+        identity = (detail.get("scope"), detail.get("fiscal_year"),
+                    detail.get("field"), detail["message"])
+        if identity not in seen_details:
+            seen_details.add(identity)
+            unique_details.append(detail)
+    row["assumption_mode"] = {
+        "requested": True,
+        "status": "APPLIED",
+        "applied": applied,
+        "details": unique_details,
+        "note": ("Current screening assumptions require silence in the latest annual "
+                 "report and later structured filings. Historical ratio details list "
+                 "every recognized filing, workbook, or market input that was not reported or "
+                 "available and was therefore replaced by zero in this detail-only "
+                 "mode; N/M identifies a resulting zero or invalid denominator."),
+    }
+    for key in ("ttm_eps_vintage", "filing_events", "events_from", "last_filing"):
+        row.pop(key, None)
+    return row
 
 
 def _portfolio_response(conn, selected: dict) -> dict:

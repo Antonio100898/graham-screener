@@ -44,7 +44,7 @@ def _foreign_ifrs(*, currency="USD", filed="2026-03-25", accn="ifrs25"):
         "IntangibleAssetsOtherThanGoodwill": tagdata(currency, [instant(5_000_000)]),
         "NumberOfSharesOutstanding": tagdata("shares", [instant(100_000_000)]),
         "WeightedAverageShares": tagdata("shares", [annual(100_000_000)]),
-        "DilutedEarningsLossPerShare": tagdata("USD/shares", [annual(2.0)]),
+        "DilutedEarningsLossPerShare": tagdata(f"{currency}/shares", [annual(2.0)]),
         "ProfitLossAttributableToOwnersOfParent": tagdata(currency, [annual(200_000_000)]),
         "ProfitLoss": tagdata(currency, [annual(210_000_000)]),
         "ProfitLossAttributableToNoncontrollingInterests": tagdata(
@@ -133,23 +133,26 @@ def test_current_ifrs_report_uses_its_own_basis_not_old_us_gaap_history():
     assert snapshot.total_assets.provenance.tag == "ifrs-full:Assets"
 
 
-def test_non_usd_foreign_statements_are_not_compared_to_a_us_price():
+def test_foreign_statement_currency_prefers_a_real_usd_balance_anchor():
     gaap = _foreign_gaap()
-    gaap["AssetsCurrent"] = tagdata("CAD", [
-        inst("2025-12-31", 280e9, form="20-F", accn="k25", filed="2026-02-15")])
-    with pytest.raises(UnsupportedFilerError, match="non-USD"):
-        build_snapshot(
-            "TEST", "0000000001", facts_doc(gaap),
-            receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
-                     "accn": "k25"},
-        )
+    gaap["AssetsCurrent"]["units"]["CAD"] = [
+        inst("2025-12-31", 280e9, form="20-F", accn="k25", filed="2026-02-15")]
+    snapshot = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap),
+        receipt={"symbol": "TEST", "title": "Ordinary Shares", "ratio": None,
+                 "accn": "k25"},
+    )
+    assert snapshot.reporting_currency == "USD"
+    # A convenience/secondary CAD line cannot be mixed into the USD statement.
+    assert snapshot.current_assets.value == Decimal("300000000000.0")
+    assert snapshot.current_assets.provenance.accession == "q126"
 
 
 def test_foreign_ifrs_without_a_usd_balance_anchor_remains_unsupported():
     facts = {"facts": {"ifrs-full": {
         "Revenue": tagdata("USD", [dur("2025-01-01", "2025-12-31", 1.0, form="20-F")])
     }}}
-    with pytest.raises(UnsupportedFilerError, match="supported USD"):
+    with pytest.raises(UnsupportedFilerError, match="coherent standard"):
         build_snapshot("IFRS", "0000000002", facts)
 
 
@@ -185,14 +188,18 @@ def test_cover_verified_usd_ifrs_filer_uses_equivalent_concepts_with_original_pr
     assert row["sources"]["eps"]["tag"] == "ifrs-full:DilutedEarningsLossPerShare"
 
 
-def test_non_usd_ifrs_statements_are_not_compared_to_a_us_price():
+def test_non_usd_ifrs_statements_are_normalized_in_their_reported_currency():
     facts = {"facts": {"ifrs-full": _foreign_ifrs(currency="EUR")}}
-    with pytest.raises(UnsupportedFilerError, match="non-USD"):
-        build_snapshot(
-            "IFRS", "0000000002", facts,
-            receipt={"symbol": "IFRS", "title": "Ordinary Shares",
-                     "ratio": None, "accn": "ifrs25"},
-        )
+    snapshot = build_snapshot(
+        "IFRS", "0000000002", facts,
+        receipt={"symbol": "IFRS", "title": "Ordinary Shares",
+                 "ratio": None, "accn": "ifrs25"},
+    )
+    assert snapshot.reporting_currency == "EUR"
+    assert snapshot.total_assets.value == Decimal("1000000000")
+    assert snapshot.total_assets.provenance.unit == "EUR"
+    assert snapshot.annual_eps[2025].value == Decimal("2.0")
+    assert snapshot.annual_eps[2025].provenance.unit == "EUR/shares"
 
 
 def test_dividend_recent_positive_payment():
@@ -280,10 +287,18 @@ def test_foreign_ifrs_filer_requires_an_exact_cover_security():
         build_snapshot("IFRS", "0000000003", facts)
 
 
-def test_assume_zero_blocked_by_debt_evidence():
-    # a material debt-instrument fact anywhere in history blocks the assumption
+def test_historical_debt_does_not_block_a_current_filing_silence_opt_in():
+    # Retired historical borrowings do not prove a current balance.
     gaap = dict(GAAP)
     gaap["UnsecuredDebt"] = tagdata("USD", [inst("2018-12-31", 500e6, form="10-K", accn="k18", filed="2019-02-15")])
+    s = build_snapshot("TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
+    assert "debt" in s.assumed_zero
+
+
+def test_assume_zero_blocked_by_current_annual_debt_evidence():
+    gaap = dict(GAAP)
+    gaap["UnsecuredDebt"] = tagdata("USD", [
+        inst("2025-12-31", 500e6, form="10-K", accn="k25", filed="2026-02-15")])
     s = build_snapshot("TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
     assert "debt" not in s.assumed_zero
 
@@ -401,6 +416,45 @@ def test_additional_sale_gain_tags_use_the_same_earnings_quality_guard():
                     if label in n["text"].lower())
 
         assert "added to" in note
+
+
+def test_debt_conversion_and_inflation_effects_are_earnings_quality_inputs():
+    gaap = dict(GAAP)
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+        tagdata("USD", [dur("2026-01-01", "2026-03-31", 1e9,
+                            form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["InducedConversionOfConvertibleDebtExpense"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 250e6,
+            form="10-Q", accn="q126", filed="2026-05-05")])
+    gaap["AmountRecognizedInIncomeDueToInflationaryAccounting"] = tagdata("USD", [
+        dur("2026-01-01", "2026-03-31", 150e6,
+            form="10-Q", accn="q126", filed="2026-05-05")])
+
+    notes = [n["text"] for n in build(gaap).earnings_quality]
+    conversion = next(n for n in notes if "debt-conversion" in n.lower())
+    inflation = next(n for n in notes if "inflationary" in n.lower())
+    assert "reduced pre-tax income" in conversion
+    assert "direction the filing's sign convention cannot settle" in inflation
+
+
+def test_other_nonrecurring_expense_successor_is_visible_without_duplication():
+    gaap = dict(GAAP)
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = \
+        tagdata("USD", [dur("2026-01-01", "2026-03-31", 200e6,
+                            form="10-Q", accn="q126", filed="2026-05-05")])
+    current = dur("2026-01-01", "2026-03-31", 39.4e6,
+                  form="10-Q", accn="q126", filed="2026-05-05")
+    gaap["OtherNonrecurringExpense"] = tagdata("USD", [current])
+    notes = [n["text"] for n in build(gaap).earnings_quality
+             if "nonrecurring" in n["text"].lower()]
+    assert len(notes) == 1 and "reduced pre-tax income" in notes[0]
+
+    # BRKR tags one printed rollup under both predecessor and successor. Equal
+    # facts are one economic event and must remain one warning.
+    gaap["OtherNonrecurringIncomeExpense"] = tagdata("USD", [current])
+    notes = [n["text"] for n in build(gaap).earnings_quality
+             if "nonrecurring" in n["text"].lower()]
+    assert len(notes) == 1
 
 
 def test_afs_successor_tag_is_the_fragment_never_the_total_pfe_style():
