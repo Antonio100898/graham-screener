@@ -48,6 +48,38 @@ _prices = YahooPriceProvider()
 _crypto = CoinbaseCryptoProvider()
 
 
+_QUARTERLY_FORMS = frozenset({"10-Q", "10-Q/A", "6-K", "6-K/A"})
+
+
+def _latest_quarterly_filing(cik: str) -> dict | None:
+    """Return the newest interim/quarterly filing from the SEC submissions index."""
+    try:
+        submissions = _edgar.submissions(cik)
+    except Exception:
+        return None
+    recent = (submissions.get("filings") or {}).get("recent") or {}
+    fields = (recent.get("form") or [], recent.get("filingDate") or [],
+              recent.get("reportDate") or [], recent.get("accessionNumber") or [],
+              recent.get("primaryDocument") or [])
+    candidates = []
+    for form, filed, period, accession, document in zip(*fields):
+        if form not in _QUARTERLY_FORMS or not accession or not filed:
+            continue
+        candidates.append({
+            "form": form, "filed": filed, "period": period or None,
+            "accession": accession, "document": document or None,
+        })
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda item: (item["filed"], item["accession"]))
+    if str(cik).isdigit():
+        latest["url"] = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
+            f"{latest['accession'].replace('-', '')}/{latest['accession']}-index.htm"
+        )
+    return latest
+
+
 def _snapshot_for(ticker: str, assume_absent_zero: bool = False) -> FinancialSnapshot:
     try:
         cik = _edgar.cik_for(ticker)
@@ -317,14 +349,14 @@ def _fill_assumed_ratio_gaps(row: dict) -> list[dict]:
 
 
 @app.get("/company/{ticker}/dashboard")
-def company_dashboard(ticker: str, assume_absent_zero: bool = False):
+def company_dashboard(ticker: str, assume_absent_zero: bool = True):
     """Rebuild one displayed row under an explicit evidence assumption.
 
     The static universe remains strict: missing evidence is missing. This route
-    is intentionally per-company and query-gated; the detail panel requests it
-    explicitly and discloses every zero substitution. It reads the same cached
-    filing bundle as derive, then runs the same price and profile enrichment used
-    by the exported payload.
+    is intentionally per-company and defaults on for the detail panel, which
+    discloses every zero substitution and offers a strict-value switch. It reads
+    the same cached filing bundle as derive, then runs the same price and profile
+    enrichment used by the exported payload.
     """
     wanted = ticker.upper()
     base = next(
@@ -334,8 +366,9 @@ def company_dashboard(ticker: str, assume_absent_zero: bool = False):
     )
     if base is None:
         raise HTTPException(404, f"{wanted} is not in the current dashboard")
+    latest_quarterly_filing = _latest_quarterly_filing(base["cik"])
     if not assume_absent_zero:
-        return base
+        return {**base, "latest_quarterly_filing": latest_quarterly_filing}
 
     conn = store.connect()
     try:
@@ -347,6 +380,7 @@ def company_dashboard(ticker: str, assume_absent_zero: bool = False):
         except Exception as exc:
             return {
                 **base,
+                "latest_quarterly_filing": latest_quarterly_filing,
                 "assumption_mode": {
                     "requested": True,
                     "status": "UNAVAILABLE",
@@ -359,6 +393,7 @@ def company_dashboard(ticker: str, assume_absent_zero: bool = False):
             detail = (derived or {}).get("error") or status
             return {
                 **base,
+                "latest_quarterly_filing": latest_quarterly_filing,
                 "assumption_mode": {
                     "requested": True,
                     "status": "UNAVAILABLE",
@@ -387,6 +422,7 @@ def company_dashboard(ticker: str, assume_absent_zero: bool = False):
         conn.close()
 
     row = {**base, **derived}
+    row["latest_quarterly_filing"] = latest_quarterly_filing
     row["last_filing"] = company["last_filing"] if company else None
     row["events_from"] = company["events_from"] if company else None
     row["filing_events"] = filing_events

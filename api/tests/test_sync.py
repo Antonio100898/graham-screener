@@ -3,6 +3,7 @@ from dataclasses import replace
 import json
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -62,7 +63,12 @@ def test_export_strip_keeps_operating_returns_but_moves_evidence_to_detail():
         "operating_return_assumptions": ["intangibles"],
         "operating_return_caveats": ["disclosed"],
         "operating_return_evidence": {"operating_income": [["tag"]]},
-    }}}
+    }}, "operating_returns_estimate": {
+        "status": "CONSERVATIVE_LOWER_BOUND",
+        "ronta": 25.0,
+        "operating_return_assumptions": ["intangibles"],
+        "operating_return_evidence": {"operating_income": [["tag"]]},
+    }}
 
     sync._strip_detail_only_evidence(payload)
 
@@ -73,6 +79,72 @@ def test_export_strip_keeps_operating_returns_but_moves_evidence_to_detail():
         "operating_return_assumptions": ["intangibles"],
         "operating_return_caveats": ["disclosed"],
     }
+    assert payload["operating_returns_estimate"] == {
+        "status": "CONSERVATIVE_LOWER_BOUND",
+        "ronta": 25.0,
+        "operating_return_assumptions": ["intangibles"],
+    }
+
+
+def test_return_quality_assumption_serializes_only_ranking_inputs_and_disclosure():
+    assumed_row = {
+        "profitability": {"on_equity": 30.0},
+        "operating_returns": {
+            "nopat_roic": 20.0,
+            "ronta": 40.0,
+            "operating_return_assumptions": ["intangibles", "cash"],
+        },
+        "debt_to_equity": 0.0,
+        "assumptions": ["debt", "goodwill"],
+    }
+
+    payload = sync._return_quality_assumption(assumed_row)
+
+    assert payload["status"] == "APPLIED"
+    assert payload["roe"] == 30.0
+    assert payload["nopat_roic"] == 20.0
+    assert payload["ronta"] == 40.0
+    assert payload["debt_to_equity"] == 0.0
+    assert payload["applied"] == ["cash", "debt", "intangibles"]
+    assert payload["input_assumptions"]["debt_to_equity"] == ["debt"]
+    assert "do not change Graham criteria or verdicts" in payload["note"]
+
+
+def test_production_derivation_keeps_strict_row_and_attaches_assumed_quality(monkeypatch):
+    strict = {
+        "criteria": [{"n": 3, "status": "INSUFFICIENT_DATA"}],
+        "verdict": "INDETERMINATE",
+    }
+    assumed = {
+        "criteria": [{"n": 3, "status": "PASS"}],
+        "verdict": "PASS",
+        "profitability": {"on_equity": 30.0},
+        "operating_returns": {
+            "nopat_roic": 20.0,
+            "ronta": 40.0,
+            "operating_return_assumptions": ["intangibles"],
+        },
+        "debt_to_equity": 0.0,
+        "assumptions": ["debt"],
+    }
+    calls = []
+
+    def fake_derive(*args, assume_absent_zero=False, **kwargs):
+        calls.append(assume_absent_zero)
+        return "ok", assumed if assume_absent_zero else strict
+
+    monkeypatch.setattr(sync, "_derive", fake_derive)
+    bundle = SimpleNamespace(
+        cik="0000000001", ticker="TEST", facts={}, dimensioned=None, receipt=None)
+
+    status, payload = sync._derive_evidence(bundle)
+
+    assert status == "ok"
+    assert calls == [False, True]
+    assert payload["criteria"] == [{"n": 3, "status": "INSUFFICIENT_DATA"}]
+    assert payload["verdict"] == "INDETERMINATE"
+    assert payload["return_quality_assumption"]["nopat_roic"] == 20.0
+    assert payload["return_quality_assumption"]["applied"] == ["debt", "intangibles"]
 
 
 def test_price_settles_valuation_criteria():

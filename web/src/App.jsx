@@ -6,10 +6,8 @@ import EarningsEvidence, { epsEvidence } from "./EarningsEvidence.jsx";
 import { fetchJson, send } from "./api.js";
 import { below, spell } from "./format.js";
 import { hasActiveFilters, loadView, saveView, takeOverScrollRestoration, unfilteredView } from "./view.js";
-import { TOTAL_CRITERIA, byN, currentRatio, indexValuation, pe3, priceToBook,
-         valuationPrice } from "./screen.js";
-import { AlignmentCompact } from "./Alignment.jsx";
-import { alignmentSortValue } from "./alignment.js";
+import { TOTAL_CRITERIA, byN, indexValuation, pe3,
+         returnQuality, valuationPrice } from "./screen.js";
 import { compareRows, normalizeSort, updateSort } from "./sort.js";
 import { payloadWarnings } from "./warnings.js";
 import Portfolio from "./Portfolio.jsx";
@@ -37,7 +35,8 @@ function matcher(query) {
 // These columns sort best-first by negating their value, so ascending order puts the
 // largest at the top. The arrow must describe what the reader sees, not the sign.
 const DESCENDING_BY_DEFAULT = new Set([
-  "fit", "n_pass", "mcap", "ni", "trend", "offhigh", "eps10", "current_ratio",
+  "n_pass", "mcap", "ni", "trend", "offhigh", "eps10",
+  "returns",
 ]);
 const EPS_POSITIVE_FLOORS = [5, 6, 7, 9, 10];
 const LENSES = ["BOTH", "ENTERPRISING", "DEFENSIVE"];
@@ -82,11 +81,11 @@ const saved = loadView();
 takeOverScrollRestoration();
 
 const TABLE_SORT_KEYS = new Set([
-  "ticker", "name", "sector", "fit", "eps10", "mcap", "price", "offhigh", "pe", "pe3",
-  "current_ratio", "pb",
+  "ticker", "name", "sector", "eps10", "returns", "mcap", "price", "offhigh",
+  "pe", "pe3", "dividend",
 ]);
 const initialSort = normalizeSort(normalizeSort(saved.sort)
-  .map((item) => ["grade", "ptbv"].includes(item.key) ? { key: "fit", dir: 1 } : item)
+  .map((item) => ["grade", "ptbv", "fit"].includes(item.key) ? { key: "n_pass", dir: 1 } : item)
   .filter((item) => TABLE_SORT_KEYS.has(item.key)));
 
 export default function App() {
@@ -97,6 +96,8 @@ export default function App() {
   const [fit, setFit] = useState(saved.fit);
   const [gaps, setGaps] = useState(saved.gaps);
   const [sort, setSort] = useState(() => normalizeSort(initialSort));
+  const [visibleCount, setVisibleCount] = useState(300);
+  const loadMoreRef = useRef(null);
   const [sectors_, setSectors] = useState(new Set(saved.sectors));
   const [profiles, setProfiles] = useState(new Set(saved.profiles));
   const [idxSel, setIdxSel] = useState(new Set(saved.indexes));
@@ -279,8 +280,8 @@ export default function App() {
           ? financialPrice / r.ncavps : null,
         idx: r.index_memberships ?? [],
         pe3: pe3(r),
-        currentRatio: currentRatio(r),
-        pb: priceToBook(r),
+        returnQuality: returnQuality(r),
+        dividendYield: dividendYield(r),
         // This is the explicitly labelled total-capex floor return, not a
         // definitive Buffett owner-earnings return.
         roic: r.owner_earnings?.all_capex_return ?? null,
@@ -339,15 +340,13 @@ export default function App() {
     const val = (r, key) => {
       // Graham fit displays Enterprising and Defensive points together, so its
       // sort follows that visible combined score rather than verdict labels.
-      if (key === "fit") return alignmentSortValue(r);
       if (key === "ticker") return r.ticker ?? "";
       if (key === "sector") return r.sector ?? null;
       if (key === "name") return r.name ?? "";
       if (key === "n_pass") return -r.n_pass;
       if (key === "pe") return byN(r, 1).value ?? null;
       if (key === "pe3") return r.pe3 ?? null;
-      if (key === "current_ratio") return r.currentRatio == null ? null : -r.currentRatio;
-      if (key === "pb") return r.pb ?? null;
+      if (key === "dividend") return r.dividendYield == null ? null : -r.dividendYield;
       // the interesting end is the most beaten-down, so sort those to the top
       if (key === "offhigh")
         return r.price_stats?.pct_below_52w_high == null
@@ -360,10 +359,30 @@ export default function App() {
         // positive years first on the initial descending-style sort.
         return r.eps10 ? -r.eps10.positive : null;
       }
+      if (key === "returns")
+        return r.returnQuality.score == null ? null : -r.returnQuality.score;
       return 0;
     };
     return out.sort((a, b) => compareRows(a, b, sort, val));
   }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
+
+  // Keep the initial DOM small, then append another page when the reader reaches
+  // the end. Filtering/sorting starts a fresh window; the sentinel below handles
+  // the rest without requiring a second click.
+  useEffect(() => {
+    setVisibleCount(300);
+  }, [q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet,
+    minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
+  useEffect(() => {
+    const node = loadMoreRef.current;
+    if (!node || visibleCount >= view.length || typeof IntersectionObserver === "undefined") return undefined;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting))
+        setVisibleCount((count) => Math.min(count + 300, view.length));
+    }, { rootMargin: "600px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [visibleCount, view.length]);
 
   // Counted over the rows on screen, not over all 5,893: with the app's own
   // defaults the "below NCAV" chip read 132 beside a table holding one of them,
@@ -590,8 +609,10 @@ export default function App() {
             <Th id="ticker" sort={sort} onSort={sortBy}>Ticker</Th>
             <Th id="name" sort={sort} onSort={sortBy}>Company</Th>
             <Th id="sector" sort={sort} onSort={sortBy}>Sector</Th>
-            <Th id="fit" sort={sort} onSort={sortBy}>Graham fit<em className="sub2">E · D</em></Th>
-            <Th id="eps10" sort={sort} onSort={sortBy}>10Y EPS evidence<em className="sub2">positive years · growth</em></Th>
+            <Th id="eps10" sort={sort} onSort={sortBy}>10Y EPS evidence<em className="sub2">positive years · FCF</em></Th>
+            <Th id="returns" sort={sort} onSort={sortBy} className="num returns-col">
+              Return quality<em className="sub2">score · ROE · ROIC · RONTA · D/E</em>
+            </Th>
             <Th id="mcap" sort={sort} onSort={sortBy} className="num">Mkt cap</Th>
             <Th id="price" sort={sort} onSort={sortBy} className="num">Price</Th>
             <Th id="offhigh" sort={sort} onSort={sortBy} className="num offhigh-col">
@@ -601,12 +622,11 @@ export default function App() {
             <Th id="pe3" sort={sort} onSort={sortBy} className="num">
               P/E 3y<em className="sub2">avg EPS</em>
             </Th>
-            <Th id="current_ratio" sort={sort} onSort={sortBy} className="num">Current ratio</Th>
-            <Th id="pb" sort={sort} onSort={sortBy} className="num">P/B</Th>
+            <Th id="dividend" sort={sort} onSort={sortBy} className="num">Dividend yield</Th>
           </tr>
         </thead>
         <tbody>
-          {view.slice(0, 300).map((r) => (
+          {view.slice(0, visibleCount).map((r) => (
             <tr key={r.cik} onClick={() => setSelected(r)}
                 className={`${tracked.has(r.cik) ? "istracked" : ""}${portfolioCiks.has(r.cik) ? " inportfolio" : ""}`.trim()}>
               <td className="starcol" data-label="">
@@ -647,8 +667,22 @@ export default function App() {
                 <span className="sector-name">{r.sector ?? "Unclassified"}</span>
                 {r.exchange === "OTC" && <span className="otc">OTC</span>}
               </td>
-              <td data-label="Graham fit"><AlignmentCompact row={r} /></td>
-              <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} /></td>
+              <td data-label="10Y EPS evidence"><EarningsEvidence annual={r.annual_eps} fcf={annualFcf(r)} /></td>
+              <td className="num return-quality" data-label="Return quality"
+                  title={r.returnQuality.assumptionMode
+                    ? `Zero-assumption Return Quality. ${r.returnQuality.estimateNote ?? ""} ${r.returnQuality.assumptions.length ? `Assumed absent: ${r.returnQuality.assumptions.join(", ")}.` : "No eligible absent input required substitution."}`
+                    : r.returnQuality.estimated
+                    ? `Conservative lower-bound score. ${r.returnQuality.estimateNote ?? ""} Assumed absent: ${r.returnQuality.assumptions.join(", ")}.`
+                    : "Harmonic mean of the available positive operating returns (ROE, NOPAT ROIC and, when meaningful, RONTA), divided by 1 + debt/equity. A missing or irrelevant RONTA is omitted rather than treated as zero."}>
+                <b>{r.returnQuality.assumptionApplied && r.returnQuality.score != null
+                  ? "≈ " : r.returnQuality.estimated && r.returnQuality.score != null ? "≥ " : ""}{fmtScore(r.returnQuality.score)}</b>
+                <span className="return-quality-parts">
+                  {fmtQualityRate(r.returnQuality.roe, r.returnQuality.estimatedInputs?.roe, r.returnQuality.assumedInputs?.roe)} · {fmtQualityRate(r.returnQuality.roic, r.returnQuality.estimatedInputs.roic, r.returnQuality.assumedInputs?.roic)} · {fmtQualityRate(r.returnQuality.ronta, r.returnQuality.estimatedInputs.ronta, r.returnQuality.assumedInputs?.ronta)} · {fmtQualityMultiple(r.returnQuality.debtToEquity, r.returnQuality.assumedInputs?.debtToEquity)}
+                </span>
+                {r.returnQuality.assumptionMode
+                  ? <span className="return-quality-estimate">zero-assumption mode</span>
+                  : r.returnQuality.estimated && <span className="return-quality-estimate">lower-bound estimate</span>}
+              </td>
               <td className="num" data-label="Mkt cap">{fmtCap(r.mcap, r.quote_currency ?? r.currency)}</td>
               <td className="num" data-label="Price">
                 {fmtPrice(r.price, r.quote_currency ?? r.currency)}
@@ -670,18 +704,20 @@ export default function App() {
                   title="current price over the average of the three latest annual EPS — one lucky or disastrous year moves it a third as much as it moves the TTM P/E">
                 {fmt(r.pe3)}
               </td>
-              <td className="num" data-label="Current ratio"
-                  title="current assets divided by current liabilities; blank when either required value is unavailable or current liabilities are not positive">
-                {r.currentRatio == null ? "—" : `${r.currentRatio.toFixed(2)}×`}
-              </td>
-              <td className="num" data-label="P/B"
-                  title="current price divided by book value per share; blank when book value is unavailable or not positive">
-                {r.pb == null ? "—" : `${r.pb.toFixed(2)}×`}
+              <td className="num" data-label="Dividend yield" title={dividendTitle(r)}>
+                {fmtPercent(r.dividendYield)}
               </td>
             </tr>
           ))}
         </tbody>
       </table>
+      {visibleCount < view.length && (
+        <div ref={loadMoreRef} className="load-more" aria-live="polite">
+          <button className="linkish" onClick={() => setVisibleCount((count) => Math.min(count + 300, view.length))}>
+            Load more ({Math.min(300, view.length - visibleCount).toLocaleString()})
+          </button>
+        </div>
+      )}
       {view.length === 0 && matchesAnywhere > 0 && (
         <p className="msg">
           No match inside the current filters, but <b>{matchesAnywhere.toLocaleString()}</b>{" "}
@@ -694,7 +730,6 @@ export default function App() {
       {view.length === 0 && matchesAnywhere === 0 && q.trim() && (
         <p className="msg dim">Nothing matches “{q.trim()}”.</p>
       )}
-      {view.length > 300 && <p className="msg dim">First 300 shown — narrow the filter to see more.</p>}
 
       {selected && <Detail row={selected} onClose={() => setSelected(null)}
                            tracked={tracked.has(selected.cik)}
@@ -744,10 +779,36 @@ function AppHeader({ page, onNavigate, rows, data, portfolioData, q, setQ, match
 }
 
 const fmt = (v) => (v == null ? "—" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
+const annualFcf = (r) => Object.fromEntries(Object.entries(r.owner_earnings?.annual_per_share ?? {})
+  .filter(([, v]) => v?.free_cash_flow_per_share != null)
+  .map(([year, v]) => [year, v.free_cash_flow_per_share]));
+const dividendYield = (r) => {
+  const dps = r.recurring_dividend_per_share ?? r.dividend_per_share;
+  const price = valuationPrice(r);
+  return dps != null && price > 0 ? (dps / price) * 100 : null;
+};
+const fmtPercent = (v) => (v == null ? "—" : `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 })}%`);
+function dividendTitle(r) {
+  const dps = r.recurring_dividend_per_share ?? r.dividend_per_share;
+  if (dps == null || r.dividendYield == null) return "No filing-backed dividend per share and current price pair is available";
+  const mode = r.recurring_dividend_per_share != null ? "Normal recurring annualized" : "Trailing twelve-month cash";
+  const special = r.recurring_dividend_per_share != null && r.dividend_per_share != null
+    && Math.abs(r.dividend_per_share - r.recurring_dividend_per_share) > 0.005
+    ? `; trailing cash including specials was ${fmtPrice(r.dividend_per_share, r.currency)}` : "";
+  return `${mode} dividend ${fmtPrice(dps, r.currency)} ÷ current price ${fmtPrice(valuationPrice(r), r.quote_currency ?? r.currency)}${special}`;
+}
+const fmtScore = (v) => (v == null ? "—" : Number(v).toLocaleString(undefined, {
+  minimumFractionDigits: 1, maximumFractionDigits: 1,
+}));
+const fmtRate = (v) => (v == null ? "—" : `${Number(v).toLocaleString(undefined, {
+  minimumFractionDigits: 1, maximumFractionDigits: 1,
+})}%`);
+const fmtQualityRate = (v, estimated, assumed) => `${assumed && v != null ? "≈ " : estimated && v != null ? "≥ " : ""}${fmtRate(v)}`;
 const fmtMultiple = (v) => (v == null ? "—" : `${v.toLocaleString(undefined, {
   minimumFractionDigits: 1,
   maximumFractionDigits: 1,
 })}×`);
+const fmtQualityMultiple = (v, assumed) => `${assumed && v != null ? "≈ " : ""}${fmtMultiple(v)}`;
 
 // penny stocks rounded to 2dp all read "$0.00", which looks like missing data
 const currencySymbol = (currency) => ({ EUR: "€", GBP: "£", JPY: "¥" }[currency] ?? "$");

@@ -4,7 +4,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
-test("the company detail panel defaults to strict filing values", async (t) => {
+test("the company detail panel enables zero assumptions by default", async (t) => {
   const previousWindow = globalThis.window;
   const previousLocalStorage = globalThis.localStorage;
   globalThis.window = {
@@ -39,22 +39,54 @@ test("the company detail panel defaults to strict filing values", async (t) => {
     ticker: "TEST",
     name: "Detail render fixture",
     cik: "1",
+    price: 10,
+    shares: 100,
+    bvps: 8,
+    tbvps: 7,
+    ncavps: 6,
+    asset_quality: { common_equity: 800, net_cash: 200 },
+    profitability: { on_book: 12, on_equity: 11 },
+    operating_returns: { normalized_tax_rate: 20, nopat: 75, nopat_roic: 15 },
     criteria,
     annual_ratios: { 2025: {} },
     assumption_mode: { status: "APPLIED", applied: [] },
+    latest_quarterly_filing: {
+      form: "10-Q", filed: "2026-08-01", period: "2026-06-30",
+      document: "test-10q.htm",
+      url: "https://www.sec.gov/Archives/edgar/data/1/000000000126000003/0000000001-26-000003-index.htm",
+    },
+    owner_earnings: {
+      fiscal_year: 2025,
+      annual_per_share: {
+        2025: { reported_earnings_assumption_per_share: 3 },
+      },
+    },
   };
 
   const markup = renderToStaticMarkup(
-    React.createElement(Detail, { row, onClose() {} }),
+    React.createElement(Detail, { row, tracked: true, onClose() {} }),
   );
 
   assert.match(markup, /class="detail clean-detail"/);
   assert.match(markup, />Ratios</);
   assert.match(markup, />TEST</);
-  assert.match(markup, /Strict filing values are in use/);
-  assert.match(markup, />Apply zero assumptions</);
-  assert.doesNotMatch(markup, />Use strict filing values</);
+  assert.match(markup, />Latest quarterly filing</);
+  assert.match(markup, /10-Q/);
+  assert.match(markup, /Read the SEC filing/);
+  assert.match(markup, /Checking the current annual report/);
+  assert.match(markup, />Use strict filing values</);
+  assert.doesNotMatch(markup, />Apply zero assumptions</);
   assert.doesNotMatch(markup, /Return on net tangible assets/);
+  assert.doesNotMatch(markup, />Asset protection</);
+  assert.doesNotMatch(markup, />P\/NCAV</);
+  assert.doesNotMatch(markup, />Return on book value</);
+  assert.doesNotMatch(markup, /<b>NOPAT<\/b>/);
+  assert.doesNotMatch(markup, />Normalized tax rate</);
+  assert.doesNotMatch(markup, />Worst YoY decline</);
+  assert.doesNotMatch(markup, />Maximum peak-to-trough decline</);
+  assert.doesNotMatch(markup, />Variability</);
+  assert.match(markup, /FY2015–FY2017 average → FY2025/);
+  assert.match(markup, /FY2020–FY2022 average → FY2025/);
 });
 
 test("foreign canonical rows render their reporting currency and workbook source", async (t) => {
@@ -129,4 +161,38 @@ test("the ratios history explains and displays lease-neutral RONTA", async (t) =
   assert.match(markup, /125\.2%/);
   assert.match(markup, /keeps both current and noncurrent operating-lease obligations with financing/);
   assert.match(markup, /does not estimate or capitalize leases from pre-ASC 842 commitments/);
+});
+
+test("the ratios panel labels conservative lower bounds separately from exact returns", async (t) => {
+  const previousWindow = globalThis.window;
+  globalThis.window = { location: { href: "http://localhost/", search: "" } };
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+  const vite = await createServer({ appType: "custom", server: { middlewareMode: true } });
+  t.after(() => vite.close());
+  const { default: Detail } = await vite.ssrLoadModule("/src/Detail.jsx");
+  const row = {
+    ticker: "LOW", name: "Lower bound fixture", cik: "0000000001",
+    criteria: [1, 2, 3, 4, 5, 7].map((n) => ({
+      n, status: "INSUFFICIENT_DATA", value: null,
+    })),
+    annual_ratios: { 2025: {} },
+    operating_returns: { nopat: 75, nopat_roic: null, ronta: null },
+    operating_returns_estimate: {
+      status: "CONSERVATIVE_LOWER_BOUND",
+      nopat_roic: 20,
+      ronta: 30,
+      operating_return_assumptions: ["intangibles", "noncurrent_investments"],
+      note: "Discovery-only lower bound.",
+    },
+  };
+
+  const markup = renderToStaticMarkup(React.createElement(Detail, { row, onClose() {} }));
+  assert.match(markup, /≥ 20\.0%/);
+  assert.match(markup, /≥ 30\.0%/);
+  assert.match(markup, /Conservative discovery estimate/);
+  assert.match(markup, /intangibles, noncurrent_investments/);
+  assert.match(markup, /exact reported ratios and Graham verdicts are unchanged/);
 });

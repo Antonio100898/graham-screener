@@ -143,10 +143,14 @@ class AnnualOperatingReturn:
     nopat_return_including_cash: Decimal | None
     ronta: Decimal | None
     lease_neutral_ronta: Decimal | None
-    # True only for the query-gated detail rebuild. The static dashboard remains
-    # filing-strict; this lets serialization distinguish an explicit all-missing-
-    # inputs-as-zero request from a filed zero.
+    # True only for a broad assumption calculation. The primary static dashboard
+    # row remains filing-strict, but a compact subset of these inputs is exported
+    # separately for Return Quality and the full row powers company detail.
     assumption_mode: bool = False
+    # A separate, non-Graham discovery value. Only denominator deductions whose
+    # absence makes zero the conservative direction may be bounded at zero;
+    # numerator, debt, lease, tax and core balance-sheet inputs remain strict.
+    conservative_estimate: bool = False
     assumed_zero: tuple[str, ...] = ()
     caveats: tuple[str, ...] = ()
 
@@ -305,6 +309,9 @@ class FinancialSnapshot:
     # Ten fiscal-year slots of operating returns, calculated independently of
     # owner-earnings/FCF availability and retaining every endpoint fact.
     annual_operating_returns: dict[int, AnnualOperatingReturn] = field(default_factory=dict)
+    # Latest-year lower-bound candidates used only for discovery/sorting. Exact
+    # returns above remain authoritative and every bounded field is disclosed.
+    conservative_operating_returns: dict[int, AnnualOperatingReturn] = field(default_factory=dict)
     # set when the earnings series and the share count cannot be the same security:
     # every per-share figure would be wrong by the factor between them
     basis_conflict: str | None = None

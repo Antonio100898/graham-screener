@@ -24,8 +24,11 @@ web/   React SPA (Vite, no runtime deps beyond React). One fetch of dashboard.js
   2026-08-21; `priceToPass()` — "what price would clear the tests" — is the only
   price arithmetic in the browser, and it is a different question. If a client-side
   refresh is ever built, that is when the two-places rule starts to apply.
-- **Missing is never zero.** A figure with no evidence stays INSUFFICIENT;
-  `?assume_absent_zero=true` is the only opt-out, and it is flagged in the response.
+- **Missing is never zero in evidence or Graham grades.** A figure with no evidence
+  stays INSUFFICIENT. Company detail defaults to the flagged
+  `?assume_absent_zero=true` view and can switch back to strict values; Return
+  Quality uses a separate disclosed zero-assumption overlay that cannot affect a
+  stored criterion or verdict.
 - **Grade precedence** (pinned by `web/test/grade.test.mjs`): definitive non-price
   FAIL → BLOCKED, any uncomputable criterion → UNGRADEABLE, valuation-only fails →
   NEAR-PASS/CLOSE. The engine verdict ranks a measured FAIL above INDETERMINATE.

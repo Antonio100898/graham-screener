@@ -20,18 +20,29 @@ function fixedWindowCagr(rows, slots, valueKey = "perShare") {
     : null;
 }
 
-function maximumDrawdown(values) {
-  let peak = null;
-  let worst = null;
-  for (const value of values) {
-    if (!Number.isFinite(value)) continue;
-    if (peak == null || value > peak) peak = value;
-    if (peak > 0) {
-      const decline = (value / peak - 1) * 100;
-      if (worst == null || decline < worst) worst = decline;
-    }
-  }
-  return worst == null ? null : Math.abs(Math.min(worst, 0));
+/** CAGR from a three-year average centred on the nominal starting slot.
+ * A five-slot measure uses slots 4/5/6; a ten-slot measure uses 9/10/11. */
+function averagedStartCagr(rows, slots, valueKey = "perShare") {
+  if (slots < 2 || rows.length < slots + 1) return { value: null, basis: null };
+  const window = rows.slice(-(slots + 1));
+  const basisRows = window.slice(0, 3);
+  const basisValues = basisRows.map((row) => row[valueKey]);
+  const latestRow = window[window.length - 1];
+  const basis = {
+    firstFiscalYear: basisRows[0].fiscalYear,
+    lastFiscalYear: basisRows[2].fiscalYear,
+    latestFiscalYear: latestRow.fiscalYear,
+  };
+  if (!basisValues.every((value) => Number.isFinite(value))
+      || !Number.isFinite(latestRow[valueKey])) return { value: null, basis };
+  const start = basisValues.reduce((sum, value) => sum + value, 0) / 3;
+  const latest = latestRow[valueKey];
+  return {
+    value: start > 0 && latest > 0
+      ? (Math.pow(latest / start, 1 / (slots - 1)) - 1) * 100
+      : null,
+    basis,
+  };
 }
 
 /** Build one explicit fiscal-year trend without bridging missing years.
@@ -47,8 +58,7 @@ export function ownerMetricTrend(
   if (!Number.isFinite(latestFiscalYear) || length < 1) return null;
 
   const firstFiscalYear = latestFiscalYear - length + 1;
-  const ascending = [];
-  for (let fiscalYear = firstFiscalYear; fiscalYear <= latestFiscalYear; fiscalYear += 1) {
+  const rowFor = (fiscalYear) => {
     const cell = annual[fiscalYear] ?? annual[String(fiscalYear)] ?? null;
     let value = finite(cell?.[perShareKey]);
     let total = finite(cell?.[totalKey]);
@@ -58,7 +68,7 @@ export function ownerMetricTrend(
     }
     const shares = finite(cell?.diluted_shares);
     if (total == null && value != null && shares != null) total = value * shares;
-    ascending.push({
+    return {
       fiscalYear,
       cell,
       perShare: value,
@@ -67,14 +77,18 @@ export function ownerMetricTrend(
       yoy: null,
       totalYoy: null,
       sharesYoy: null,
-    });
+    };
+  };
+  const ascending = [];
+  for (let fiscalYear = firstFiscalYear; fiscalYear <= latestFiscalYear; fiscalYear += 1) {
+    ascending.push(rowFor(fiscalYear));
   }
+  const cagrRows = [rowFor(firstFiscalYear - 1), ...ascending];
 
   let comparableSteps = 0;
   let rateSteps = 0;
   let yearsIncreased = 0;
   let yearsAtLeastSix = 0;
-  let worstYoyDecline = null;
   for (let i = 1; i < ascending.length; i += 1) {
     const previous = ascending[i - 1];
     const current = ascending[i];
@@ -85,8 +99,6 @@ export function ownerMetricTrend(
         current.yoy = (current.perShare / previous.perShare - 1) * 100;
         rateSteps += 1;
         if (current.yoy >= 6) yearsAtLeastSix += 1;
-        if (current.yoy < 0 && (worstYoyDecline == null || current.yoy < worstYoyDecline))
-          worstYoyDecline = current.yoy;
       }
     }
     if (previous.total > 0 && current.total != null)
@@ -97,17 +109,13 @@ export function ownerMetricTrend(
 
   const present = ascending.filter((row) => row.perShare != null);
   const values = present.map((row) => row.perShare);
-  const mean = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
-  const variability = mean > 0 && values.length > 1
-    ? Math.sqrt(values.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0)
-      / values.length) / Math.abs(mean) * 100
-    : null;
   const latest = ascending[ascending.length - 1].perShare;
   const median10 = median(values);
   const median5 = median(ascending.slice(-5).map((row) => row.perShare));
-  const cagr = fixedWindowCagr(ascending, length);
-  const totalCagr = fixedWindowCagr(ascending, length, "total");
-  const shareCountCagr = fixedWindowCagr(ascending, length, "shares");
+  const cagr = averagedStartCagr(cagrRows, length);
+  const cagr5 = averagedStartCagr(cagrRows, Math.min(5, length));
+  const totalCagr = averagedStartCagr(cagrRows, length, "total");
+  const shareCountCagr = averagedStartCagr(cagrRows, length, "shares");
 
   return {
     firstFiscalYear,
@@ -121,21 +129,21 @@ export function ownerMetricTrend(
     rateSteps,
     yearsIncreased,
     yearsAtLeastSix,
-    cagr,
-    cagr5: fixedWindowCagr(ascending, Math.min(5, length)),
+    cagr: cagr.value,
+    cagrBasis: cagr.basis,
+    cagr5: cagr5.value,
+    cagr5Basis: cagr5.basis,
     cagr3: fixedWindowCagr(ascending, Math.min(3, length)),
-    totalCagr,
-    shareCountCagr,
+    totalCagr: totalCagr.value,
+    shareCountCagr: shareCountCagr.value,
     median5,
     median10,
     latestVsMedian10: latest != null && median10 > 0
       ? (latest / median10 - 1) * 100
       : null,
-    worstYoyDecline: worstYoyDecline == null ? null : Math.abs(worstYoyDecline),
-    maximumDrawdown: maximumDrawdown(ascending.map((row) => row.perShare)),
-    variability,
-    buybackDriven: shareCountCagr != null && shareCountCagr < 0
-      && totalCagr != null && totalCagr < 0 && cagr != null && cagr > totalCagr,
+    buybackDriven: shareCountCagr.value != null && shareCountCagr.value < 0
+      && totalCagr.value != null && totalCagr.value < 0
+      && cagr.value != null && cagr.value > totalCagr.value,
   };
 }
 

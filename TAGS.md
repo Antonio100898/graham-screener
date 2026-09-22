@@ -208,26 +208,42 @@ presentation. It does not capitalize pre-adoption lease commitments. Both exact
 endpoints keep the lease tags and filing provenance; an incomplete post-recognition
 pair remains missing unless the explicit detail assumption mode is requested.
 
-The company panel carries the newest ten completed fiscal-year slots. Every year
+Engine v173 adds a separate conservative discovery estimate for current-year
+NOPAT ROIC and RONTA. It is never written into the exact history and never affects
+Graham criteria or verdicts. Only four absent denominator deductions may be
+bounded at zero: short-term investments, noncurrent investments, goodwill, and
+other intangibles. Zero is conservative for those fields because it maximizes the
+capital denominator and therefore gives a lower-bound positive return. The engine
+still requires exact operating income, tax evidence, assets, current liabilities,
+cash, current debt, and all applicable lease-liability/ROU-asset inputs. Existing
+denominator plausibility guards remain active. The payload uses the separate
+`operating_returns_estimate` field, lists every bounded input, and the UI prefixes
+the resulting metric and composite score with `≥`; an exact value always wins.
+
+The company panel displays the newest ten completed fiscal-year slots and retains
+one additional older slot solely to support the ten-slot CAGR basis. Every year
 requires the three same-period floor inputs and that year's reported diluted weighted
 average share count; a missing or differently dated input leaves the year blank.
-It shows total and per-share values together and supplements endpoint CAGR with
-three- and five-slot CAGR, medians, profitable/missing years, worst YoY decline,
-maximum drawdown, variability, and diluted-share CAGR. A declining total hidden
-by a falling share count is disclosed as buyback-driven per-share growth.
+Five- and ten-slot CAGRs use the average of the three fiscal years centred on the
+nominal starting year (slots 4/5/6 and 9/10/11 respectively), and are withheld if
+any basis year is missing or the averaged starting level is non-positive. The panel
+also shows total and per-share values, three-slot CAGR, medians,
+profitable/missing years, and diluted-share CAGR.
+A declining total hidden by a falling share count is disclosed as buyback-driven
+per-share growth.
 Historical denominators are rebased for filing-observed later splits and for the
 priced depositary-receipt ratio, so the per-share values are on today's traded-
 security basis. If one interior denominator is an exact 1,000x/1,000,000x table-
 scale outlier and both adjacent split-adjusted years agree, that exact correction
 is applied to this series and disclosed; otherwise the filed count is not guessed.
-The UI shows each year, YoY change, endpoint CAGR, coverage, years
+The UI shows each year, YoY change, averaged-start CAGR, coverage, years
 increased, and years growing at least 6%. These are observations, never scores.
 
 | Concept | Tags |
 |---|---|
 | Reported earnings attributable to owners | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, then `ProfitLoss` when it is the only usable total |
 | D&A | `DepreciationDepletionAndAmortization`, `DepreciationAmortizationAndAccretionNet`, `DepreciationAndAmortization`, else `Depreciation` + `AmortizationOfIntangibleAssets`; the explicitly allowlisted DERA extension `DepreciationAndAmortizationOfPropertyPlantAndEquipmentAndComputerPrograms` outranks a same-period standard narrative fact when it is at least as recent | FUSB's cash-flow statement reports $1.581m/$1.590m/$1.695m for FY2023–FY2025 through that issuer extension, while its standard element is a rounded note sentence and one filing loses the million scale. If the DERA extension is not cached, an earlier fact for the identical annual period is retained only when the newer value differs by exactly 1,000× or 1,000,000× and both adjacent years corroborate the earlier scale. A lone unusual value is never rescaled. |
-| Total capex | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets`, `PaymentsForCapitalImprovements` |
+| Total capex | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets`, `PaymentsForProceedsFromProductiveAssets`, `PaymentsToAcquireOtherPropertyPlantAndEquipment`, `PaymentsToAcquireMachineryAndEquipment`, `PaymentsToAcquireOtherProductiveAssets`, `PaymentsForCapitalImprovements` |
 | Operating cash flow (standard FCF only) | `NetCashProvidedByUsedInOperatingActivities`, `NetCashProvidedByUsedInOperatingActivitiesContinuingOperations` |
 | Cash & investments (netted from invested capital) | `CashAndCashEquivalentsAtCarryingValue`, `CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents`; `ShortTermInvestments`, `AvailableForSaleSecuritiesCurrent`, `MarketableSecuritiesCurrent`, `OtherShortTermInvestments`; modern `DebtSecuritiesHeldToMaturity*Current` only in filing-verified CIK/accession/date contexts |
 

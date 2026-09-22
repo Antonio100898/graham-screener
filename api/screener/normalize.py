@@ -2,8 +2,8 @@
 
 All XBRL messiness lives here: tag fallback chains, annual-only selection,
 restatement resolution (latest-filed wins), provenance. Missing stays missing in
-the exported screen; the query-gated ``assume_absent_zero`` detail rebuild marks
-every substituted zero explicitly.
+the exported screen and Graham grades; the ``assume_absent_zero`` detail/Return
+Quality calculation marks every substituted zero explicitly.
 """
 from __future__ import annotations
 
@@ -101,7 +101,9 @@ _IFRS_ALIASES: dict[str, tuple[str, ...]] = {
     "CommonStockDividendsPerShareCashPaid": ("DividendsPaidOrdinarySharesPerShare",),
     "DividendsPayableCurrent": ("CurrentDividendPayables",),
     # owner-earnings and contextual evidence
-    "DepreciationAndAmortization": ("AdjustmentsForDepreciationAndAmortisationExpense",),
+    "DepreciationAndAmortization": (
+        "AdjustmentsForDepreciationAndAmortisationExpense", "DepreciationExpense",
+    ),
     "AmortizationOfIntangibleAssets": ("AmortisationIntangibleAssetsOtherThanGoodwill",),
     "IncomeTaxExpenseBenefit": ("IncomeTaxExpenseContinuingOperations",),
     "IncomeTaxesPaidNet": ("IncomeTaxesPaidRefundClassifiedAsOperatingActivities",),
@@ -1101,6 +1103,15 @@ def build_snapshot(
         assume_absent_zero=assume_absent_zero,
         all_facts=facts,
         fallback_end=balance_sheet_date)
+    conservative_operating_returns = (
+        _annual_operating_returns(
+            gaap, annual_operating_income,
+            cik=cik,
+            years=1,
+            conservative_missing_zero=True,
+            all_facts=facts,
+            fallback_end=balance_sheet_date)
+        if not assume_absent_zero else {})
     owner_earnings = _owner_earnings(gaap, {
         "total_assets": total_assets,
         "current_liabilities": current_liabilities,
@@ -1202,6 +1213,7 @@ def build_snapshot(
                                      fresh, dimensioned),
         tax_record=_tax_record(gaap, fresh),
         annual_operating_returns=annual_operating_returns,
+        conservative_operating_returns=conservative_operating_returns,
         owner_earnings=owner_earnings,
         basis_conflict=basis_conflict,
         reporting_currency=reporting_currency,
@@ -4278,6 +4290,14 @@ DEFERRED_TAX_ALLOWANCE_TAGS = ("DeferredTaxAssetsValuationAllowance",)
 CASH_CAPEX_TAGS = (
     "PaymentsToAcquirePropertyPlantAndEquipment",
     "PaymentsToAcquireProductiveAssets",
+    # Some filers label the cash-flow row "Purchase of equipment and leasehold
+    # improvements" with this older standard element (e.g. CLMB's 2025 10-K).
+    "PaymentsForProceedsFromProductiveAssets",
+    # Standard subtype rows used when the filing does not use the umbrella
+    # property/productive-assets element.
+    "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+    "PaymentsToAcquireMachineryAndEquipment",
+    "PaymentsToAcquireOtherProductiveAssets",
     "PaymentsForCapitalImprovements",
 )
 CAPEX_TAGS = (
@@ -5235,7 +5255,8 @@ def _capital_fact(gaap: dict, end: date | None, exclude_cash: bool,
                   assumed_zero: set[str] | None = None,
                   assumable_zero: set[str] | None = None,
                   exact: dict | None = None,
-                  annual_only: bool = False) -> Fact | None:
+                  annual_only: bool = False,
+                  conservative_estimate: bool = False) -> Fact | None:
     """Invested capital at one exact date, retaining every filed input."""
     exact = (_taxonomy_at_end(gaap, end, annual_only=annual_only)
              if exact is None else exact)
@@ -5350,9 +5371,14 @@ def _capital_fact(gaap: dict, end: date | None, exclude_cash: bool,
             return None
         if investments is None:
             caveats.append(
-                f"short-term investments were assumed to be 0 at {end.isoformat()} "
-                f"because no {absent_source} reports them; this is the "
-                "explicit assume_absent_zero opt-in")
+                (f"short-term investments were conservatively bounded at 0 at "
+                 f"{end.isoformat()} because no {absent_source} reports them; "
+                 "the deduction's zero lower bound maximizes invested capital "
+                 "and therefore produces a lower-bound return estimate")
+                if conservative_estimate else
+                (f"short-term investments were assumed to be 0 at {end.isoformat()} "
+                 f"because no {absent_source} reports them; this is the "
+                 "explicit assume_absent_zero opt-in"))
             if assumed_zero is not None:
                 assumed_zero.add("short_term_investments")
         if (cash is not None
@@ -5463,6 +5489,7 @@ def _net_tangible_operating_assets_fact(
     exact: dict | None = None,
     annual_only: bool = False,
     lease_neutral: bool = False,
+    conservative_estimate: bool = False,
 ) -> Fact | None:
     """NTOA at one exact balance-sheet date, with every deduction evidenced.
 
@@ -5485,7 +5512,8 @@ def _net_tangible_operating_assets_fact(
         assume_absent_optional_zero=assume_absent_optional_zero,
         assume_absent_all_zero=assume_absent_all_zero,
         assumed_zero=assumed_zero, assumable_zero=assumable_zero,
-        exact=exact, annual_only=annual_only)
+        exact=exact, annual_only=annual_only,
+        conservative_estimate=conservative_estimate)
     if operating is None or end is None:
         return None
     exact = (_taxonomy_at_end(gaap, end, annual_only=annual_only)
@@ -5558,9 +5586,14 @@ def _net_tangible_operating_assets_fact(
     if missing:
         for label in missing:
             caveats.append(
-                f"{label} was assumed to be 0 at {end.isoformat()} because no "
-                f"{absent_source} reports it; this is the explicit "
-                "assume_absent_zero opt-in")
+                (f"{label} was conservatively bounded at 0 at {end.isoformat()} "
+                 f"because no {absent_source} reports it; the deduction's zero "
+                 "lower bound maximizes net tangible operating assets and "
+                 "therefore produces a lower-bound return estimate")
+                if conservative_estimate else
+                (f"{label} was assumed to be 0 at {end.isoformat()} because no "
+                 f"{absent_source} reports it; this is the explicit "
+                 "assume_absent_zero opt-in"))
             if assumed_zero is not None:
                 assumed_zero.add(names[label])
     deductions = tuple(fact for fact in
@@ -5654,6 +5687,7 @@ def _annual_operating_returns(
     cik: str | None = None,
     years: int = 10,
     assume_absent_zero: bool = False,
+    conservative_missing_zero: bool = False,
     all_facts: dict | None = None,
     fallback_end: date | None = None,
 ) -> dict[int, AnnualOperatingReturn]:
@@ -5665,9 +5699,17 @@ def _annual_operating_returns(
     the strict export. Return denominators are exact averages of beginning and
     ending annual balance sheets.
 
-    The detail-only opt-in is intentionally broader: every absent input, including
-    operating income, tax rate, assets, current liabilities and cash, becomes a
-    visibly disclosed zero. This is never used by the exported screen or grades.
+    The detail/Return Quality convention is intentionally broader: every absent
+    input, including operating income, tax rate, assets, current liabilities and
+    cash, becomes a visibly disclosed zero. It is exported only through a separate
+    discovery overlay and is never used by reported fields or Graham grades.
+
+    ``conservative_missing_zero`` is a separate discovery calculation. It may
+    bound only missing short/noncurrent investments, goodwill and other
+    intangibles at zero. Those fields are deductions from the denominator, so
+    zero maximizes capital and gives the lowest positive return. Core inputs,
+    current debt, lease liabilities, cash and tax remain filing-strict, and the
+    normal denominator plausibility guard remains active.
     """
     gaap = _with_fiscal_calendar(gaap)
     ends = fiscal_year_ends(gaap)
@@ -5776,6 +5818,7 @@ def _annual_operating_returns(
         return None
 
     out: dict[int, AnnualOperatingReturn] = {}
+    optional_zero = assume_absent_zero or conservative_missing_zero
     for year in target_years:
         caveats: list[str] = []
         assumed: set[str] = set()
@@ -5864,18 +5907,20 @@ def _annual_operating_returns(
                     gaap, beginning_end, True, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=beginning_assumable,
-                    exact=beginning_view, annual_only=True)
+                    exact=beginning_view, annual_only=True,
+                    conservative_estimate=conservative_missing_zero)
                 invested_ending = _capital_fact(
                     gaap, flow_end, True, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=ending_assumable,
-                    exact=ending_view, annual_only=True)
+                    exact=ending_view, annual_only=True,
+                    conservative_estimate=conservative_missing_zero)
                 gross_beginning = _capital_fact(
                     gaap, beginning_end, False, caveats,
                     cik=cik,
@@ -5894,36 +5939,40 @@ def _annual_operating_returns(
                     gaap, beginning_end, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=beginning_assumable,
-                    exact=beginning_view, annual_only=True)
+                    exact=beginning_view, annual_only=True,
+                    conservative_estimate=conservative_missing_zero)
                 ntoa_ending = _net_tangible_operating_assets_fact(
                     gaap, flow_end, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=ending_assumable,
-                    exact=ending_view, annual_only=True)
+                    exact=ending_view, annual_only=True,
+                    conservative_estimate=conservative_missing_zero)
                 lease_neutral_ntoa_beginning = _net_tangible_operating_assets_fact(
                     gaap, beginning_end, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=beginning_assumable,
                     exact=beginning_view, annual_only=True,
-                    lease_neutral=True)
+                    lease_neutral=True,
+                    conservative_estimate=conservative_missing_zero)
                 lease_neutral_ntoa_ending = _net_tangible_operating_assets_fact(
                     gaap, flow_end, caveats,
                     cik=cik,
                     assume_absent_debt_zero=assume_absent_zero,
-                    assume_absent_optional_zero=assume_absent_zero,
+                    assume_absent_optional_zero=optional_zero,
                     assume_absent_all_zero=assume_absent_zero,
                     assumed_zero=assumed, assumable_zero=ending_assumable,
                     exact=ending_view, annual_only=True,
-                    lease_neutral=True)
+                    lease_neutral=True,
+                    conservative_estimate=conservative_missing_zero)
 
             if normalized_tax_rate is not None:
                 rate_sources = tuple(
@@ -6030,6 +6079,7 @@ def _annual_operating_returns(
             ronta=ronta,
             lease_neutral_ronta=lease_neutral_ronta,
             assumption_mode=assume_absent_zero,
+            conservative_estimate=conservative_missing_zero,
             assumed_zero=tuple(sorted(assumed)),
             caveats=tuple(dict.fromkeys(caveats)),
         )
@@ -6481,7 +6531,11 @@ def _owner_earnings(gaap: dict, snap_parts: dict, fresh: date | None,
             )
         adjusted_counts[year] = adjusted
 
-    owner_years = {year for year in shared if fy - 9 <= year <= fy}
+    # The panel displays ten fiscal-year slots, but a ten-slot CAGR now uses the
+    # average of slots 9, 10, and 11 as its starting level. Retain that one
+    # additional evidence year; it is support for the calculation, not an
+    # invitation to bridge a missing year or extend the displayed record.
+    owner_years = {year for year in shared if fy - 10 <= year <= fy}
     scale_repairs: list[tuple[int, Decimal]] = []
     for year in sorted(adjusted_counts):
         if year not in owner_years:

@@ -75,6 +75,14 @@ Three operational guards sit across those boundaries:
   histories; both Research and Portfolio consume this one snapshot. A failed
   ticker request retains its previous timestamped quote and adds a warning.
 
+- Discovery estimates are a separate output boundary, not replacements for
+  normalized evidence. The strict row remains authoritative for reported fields,
+  criteria, and verdicts. Company detail defaults to an all-missing-as-zero rebuild,
+  and the static payload carries only the compact inputs needed to rank Return
+  Quality under that same convention. Both list every substituted field and remain
+  switchable/labelled; the older conservative lower-bound output remains a fallback
+  for payloads that predate the broader overlay.
+
 ## Next boundary: entity versus security
 
 Introduce persistent `security` records keyed independently of CIK, carrying the

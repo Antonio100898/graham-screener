@@ -787,6 +787,65 @@ def test_audit_recomputes_historical_nopat_roic_and_ronta():
     assert checks["annual_ratios.2025.lease_neutral_ronta"] == (50.0, 50.0)
 
 
+def test_audit_recomputes_and_guards_conservative_operating_returns():
+    row = {
+        "operating_returns": {"nopat": 75.0, "nopat_roic": None, "ronta": None},
+        "operating_returns_estimate": {
+            "status": "CONSERVATIVE_LOWER_BOUND",
+            "operating_income_for_nopat": 100.0,
+            "normalized_tax_rate": 25.0,
+            "nopat": 75.0,
+            "invested_capital": 250.0,
+            "capital_including_cash": 300.0,
+            "average_net_tangible_operating_assets": 200.0,
+            "nopat_roic": 30.0,
+            "ronta": 37.5,
+            "operating_return_assumptions": ["intangibles"],
+        },
+    }
+
+    checks = {name: (shown, expected) for name, shown, expected, *_ in
+              audit._derived_series(row)}
+    assert checks["operating_returns_estimate.nopat"] == (75.0, 75.0)
+    assert checks["operating_returns_estimate.nopat_roic"] == (30.0, 30.0)
+    assert checks["operating_returns_estimate.ronta"] == (37.5, 37.5)
+    assert checks["operating_returns_estimate.denominator_floor_guard"] == (1, 1)
+    assert checks["operating_returns_estimate.assumption_guard"] == (1, 1)
+    assert checks["operating_returns_estimate.strict_gap_guard"] == (1, 1)
+    assert checks["operating_returns_estimate.positive_guard"] == (1, 1)
+
+
+def test_audit_guards_the_return_quality_assumption_overlay():
+    row = {
+        "profitability": {"on_equity": 30.0},
+        "operating_returns": {"nopat_roic": None, "ronta": 40.0},
+        "debt_to_equity": None,
+        "return_quality_assumption": {
+            "status": "APPLIED",
+            "roe": 30.0,
+            "nopat_roic": 20.0,
+            "ronta": 40.0,
+            "debt_to_equity": 0.0,
+            "applied": ["debt", "intangibles"],
+            "input_assumptions": {
+                "roe": [],
+                "nopat_roic": ["intangibles"],
+                "ronta": [],
+                "debt_to_equity": ["debt"],
+            },
+        },
+    }
+
+    checks = {name: (shown, expected) for name, shown, expected, *_ in
+              audit._derived_series(row)}
+
+    assert checks["return_quality_assumption.status_guard"] == (1, 1)
+    assert checks["return_quality_assumption.disclosure_guard"] == (1, 1)
+    assert checks["return_quality_assumption.roe_strict_guard"] == (1, 1)
+    assert checks["return_quality_assumption.roe.strict_match"] == (30.0, 30.0)
+    assert checks["return_quality_assumption.ronta.strict_match"] == (40.0, 40.0)
+
+
 def test_audit_recomputes_each_displayed_fcf_method_and_spread():
     row = {"owner_earnings": {"fcf_reconciliation": {
         "spread": 2.0,

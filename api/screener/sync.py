@@ -243,6 +243,8 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         annual_share_counts=snap.annual_share_counts,
         annual_gross_profit=snap.annual_gross_profit)
     operating_return_history = _operating_return_history(snap)
+    conservative_return_history = _operating_return_history(
+        snap, snap.conservative_operating_returns)
     for year, values in operating_return_history.items():
         historical_ratios.setdefault(year, {}).update(values)
     latest_operating_return = (
@@ -250,6 +252,34 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
          operating_return_history[max(operating_return_history)].items()
          if key != "operating_return_evidence"}
         if operating_return_history else None)
+    latest_conservative_return = (
+        {key: value for key, value in
+         conservative_return_history[max(conservative_return_history)].items()
+         if key != "operating_return_evidence"}
+        if conservative_return_history else None)
+    # An estimate is useful only when it replaces at least one strict blank. A
+    # separately named payload field prevents the UI (or a downstream consumer)
+    # from confusing this lower bound with a filing-exact operating return.
+    estimated_metrics = ("nopat_roic", "ronta")
+    fills_strict_gap = bool(
+        latest_conservative_return
+        and latest_conservative_return.get("nopat", 0) > 0
+        and latest_conservative_return.get("operating_return_assumptions")
+        and all(latest_conservative_return.get(metric, 0) > 0
+                for metric in estimated_metrics)
+        and any(
+            latest_conservative_return.get(metric, 0) > 0
+            and (latest_operating_return or {}).get(metric) is None
+            for metric in estimated_metrics
+        ))
+    if fills_strict_gap:
+        latest_conservative_return["status"] = "CONSERVATIVE_LOWER_BOUND"
+        latest_conservative_return["note"] = (
+            "Discovery-only lower bound: only absent optional deductions were "
+            "bounded at zero; exact reported returns and Graham verdicts are unchanged."
+        )
+    else:
+        latest_conservative_return = None
     if receipt and receipt.get("ratio"):
         _restate_historical_ratios(historical_ratios, Decimal(str(receipt["ratio"])))
     settled_debt_value = settled_debt(snap)[0]
@@ -329,6 +359,7 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
         # price history lives; the vintage EPS series is their denominator.
         "annual_ratios": historical_ratios,
         "operating_returns": latest_operating_return,
+        "operating_returns_estimate": latest_conservative_return,
         "current_assets": float(snap.current_assets.value) if snap.current_assets else None,
         "current_liabilities": (float(snap.current_liabilities.value)
                                 if snap.current_liabilities else None),
@@ -461,10 +492,65 @@ def _derive(cik: str, ticker: str, facts: dict, quote=None,
 
 def _derive_evidence(bundle: evidence.EvidenceBundle, quote=None, *,
                      assume_absent_zero: bool = False) -> tuple[str, dict | None]:
-    """The sole production entry point from assembled evidence to a snapshot."""
-    return _derive(bundle.cik, bundle.ticker, bundle.facts, quote=quote,
-                   dimensioned=bundle.dimensioned, receipt=bundle.receipt,
-                   assume_absent_zero=assume_absent_zero)
+    """The sole production entry point from assembled evidence to a snapshot.
+
+    Stored dashboard rows remain filing-strict for every Graham criterion.  They
+    also carry a compact, separately labelled all-missing-as-zero calculation for
+    the Return Quality discovery column, matching the detail panel's default
+    assumption mode without allowing those assumptions into a verdict.
+    """
+    result = _derive(
+        bundle.cik, bundle.ticker, bundle.facts, quote=quote,
+        dimensioned=bundle.dimensioned, receipt=bundle.receipt,
+        assume_absent_zero=assume_absent_zero,
+    )
+    status, row = result
+    if assume_absent_zero or row is None or status not in {"ok", "pending_facts"}:
+        return result
+
+    assumed_status, assumed_row = _derive(
+        bundle.cik, bundle.ticker, bundle.facts, quote=quote,
+        dimensioned=bundle.dimensioned, receipt=bundle.receipt,
+        assume_absent_zero=True,
+    )
+    if assumed_row is not None and assumed_status in {"ok", "pending_facts"}:
+        row["return_quality_assumption"] = _return_quality_assumption(assumed_row)
+    else:
+        row["return_quality_assumption"] = {
+            "status": "UNAVAILABLE",
+            "applied": [],
+            "note": "The zero-assumption Return Quality calculation was unavailable.",
+        }
+    return status, row
+
+
+def _return_quality_assumption(row: dict) -> dict:
+    """Compact assumption-mode inputs for client-side Return Quality ranking."""
+    returns = row.get("operating_returns") or {}
+    operating_assumptions = sorted(set(
+        returns.get("operating_return_assumptions") or ()))
+    capital_assumptions = sorted(
+        {"debt", "short_term_debt"} & set(row.get("assumptions") or ()))
+    applied = sorted(set(operating_assumptions) | set(capital_assumptions))
+    return {
+        "status": "APPLIED",
+        "roe": (row.get("profitability") or {}).get("on_equity"),
+        "nopat_roic": returns.get("nopat_roic"),
+        "ronta": returns.get("ronta"),
+        "debt_to_equity": row.get("debt_to_equity"),
+        "applied": applied,
+        "input_assumptions": {
+            "roe": [],
+            "nopat_roic": operating_assumptions,
+            "ronta": operating_assumptions,
+            "debt_to_equity": capital_assumptions,
+        },
+        "note": (
+            "Return Quality uses the same explicit zero-assumption convention as "
+            "the company detail. These values are discovery estimates, not lower "
+            "bounds, and do not change Graham criteria or verdicts."
+        ),
+    }
 
 
 def _restate_historical_ratios(ratios: dict, receipt_ratio: Decimal) -> None:
@@ -759,7 +845,7 @@ def _fcf_reconciliation(snap, oe) -> dict:
     }
 
 
-def _operating_return_history(snap) -> dict[int, dict]:
+def _operating_return_history(snap, returns=None) -> dict[int, dict]:
     """Serialize the independent ten-year NOPAT/ROIC/RONTA record.
 
     Dollar inputs and endpoint denominators remain beside the percentages so
@@ -811,7 +897,8 @@ def _operating_return_history(snap) -> dict[int, dict]:
         }
 
     out: dict[int, dict] = {}
-    for year, item in sorted(snap.annual_operating_returns.items()):
+    returns = snap.annual_operating_returns if returns is None else returns
+    for year, item in sorted(returns.items()):
         caveats = list(item.caveats)
         if pass_through:
             caveats.append(
@@ -900,6 +987,8 @@ def _operating_return_history(snap) -> dict[int, dict]:
             "operating_return_caveats": list(dict.fromkeys(caveats)),
             "operating_return_evidence": sources,
         }
+        if item.conservative_estimate:
+            cell["conservative_estimate"] = True
         out[year] = {
             key: value for key, value in cell.items()
             if value not in (None, [], ())
@@ -918,6 +1007,9 @@ def _strip_detail_only_evidence(row: dict) -> None:
     for cell in (row.get("annual_ratios") or {}).values():
         if isinstance(cell, dict):
             cell.pop("operating_return_evidence", None)
+    estimate = row.get("operating_returns_estimate")
+    if isinstance(estimate, dict):
+        estimate.pop("operating_return_evidence", None)
 
 
 def _owner_earnings_row(snap) -> dict | None:
@@ -960,11 +1052,12 @@ def _owner_earnings_row(snap) -> dict | None:
             "sources": [source_row(source)
                         for source in fact.provenance.components],
         }
-    # The requested view is a calendar of the latest ten fiscal-year slots, not
-    # the latest ten observations. Sparse evidence must produce visible gaps
-    # rather than reaching farther into the past to fill the quota.
+    # Keep the latest eleven fiscal-year slots in the payload. The panel displays
+    # ten; the oldest is calculation support for the three-year averaged start
+    # of its ten-slot CAGR. Sparse evidence stays sparse instead of reaching
+    # farther into the past to fill the quota.
     years = [year for year in sorted(oe.annual)
-             if oe.fiscal_year - 9 <= year <= oe.fiscal_year]
+             if oe.fiscal_year - 10 <= year <= oe.fiscal_year]
     floor_sources = oe.all_capex_floor.provenance.components
     owner_sources = {}
     for name, provenance in zip(
@@ -1206,8 +1299,9 @@ def _owner_earnings_row(snap) -> dict | None:
         # payload by tens of megabytes without adding evidence.
         "sources": owner_sources,
         "caveats": list(oe.caveats),
-        # Ten completed fiscal years, on today's split and traded-security basis.
-        # A missing year is omitted rather than imputed; the UI renders the gap.
+        # Ten displayed fiscal years plus one older CAGR-support year, all on
+        # today's split and traded-security basis. A missing year is omitted
+        # rather than imputed; the UI withholds an incomplete averaged basis.
         "annual_per_share": {str(year): annual_cell(year) for year in years},
     }
 

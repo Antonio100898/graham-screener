@@ -573,9 +573,12 @@ def test_owner_return_is_withheld_without_both_exact_balance_sheets_or_current_d
     assert oe.capital_including_cash is None
 
     no_current_debt_evidence = {k: v for k, v in OE_GAAP.items() if k != "DebtCurrent"}
-    oe = build(no_current_debt_evidence).owner_earnings
+    snapshot = build(no_current_debt_evidence)
+    oe = snapshot.owner_earnings
     assert oe.invested_capital is None and oe.all_capex_return is None
     assert any("short-term-debt fact" in caveat for caveat in oe.caveats)
+    # Discovery estimates may bound optional deductions, never debt.
+    assert snapshot.conservative_operating_returns[2025].nopat_roic is None
 
 
 def test_explicit_absent_debt_opt_in_reaches_owner_capital_and_dashboard_fields():
@@ -1541,6 +1544,27 @@ def test_ten_year_operating_return_history_discloses_each_zero_assumption():
     strict = build_snapshot("TEST", "0000000001", facts_doc(gaap))
     assert strict.annual_operating_returns[2025].nopat_roic is None
     assert strict.annual_operating_returns[2025].ronta is None
+    conservative = strict.conservative_operating_returns[2025]
+    assert conservative.conservative_estimate is True
+    assert conservative.nopat_roic is not None
+    assert conservative.ronta is not None
+    assert set(conservative.assumed_zero) == {
+        "goodwill", "intangibles", "noncurrent_investments",
+        "short_term_investments",
+    }
+    assert any("lower-bound return estimate" in note
+               for note in conservative.caveats)
+
+    status, strict_row = _derive("0000000001", "TEST", facts_doc(gaap))
+    assert status == "ok"
+    estimate = strict_row["operating_returns_estimate"]
+    assert estimate["status"] == "CONSERVATIVE_LOWER_BOUND"
+    assert estimate["conservative_estimate"] is True
+    assert estimate["nopat_roic"] == pytest.approx(
+        float(conservative.nopat_roic))
+    assert estimate["ronta"] == pytest.approx(float(conservative.ronta))
+    assert strict_row["operating_returns"].get("nopat_roic") is None
+    assert strict_row["operating_returns"].get("ronta") is None
 
     assumed = build_snapshot(
         "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
@@ -1579,6 +1603,8 @@ def test_detail_zero_mode_fills_every_missing_operating_return_input():
 
     strict = build_snapshot("TEST", "0000000001", facts_doc(gaap))
     assert strict.annual_operating_returns[2025].nopat is None
+    assert strict.conservative_operating_returns[2025].nopat is None
+    assert strict.conservative_operating_returns[2025].nopat_roic is None
 
     assumed = build_snapshot(
         "TEST", "0000000001", facts_doc(gaap), assume_absent_zero=True)
@@ -1600,6 +1626,49 @@ def test_detail_zero_mode_fills_every_missing_operating_return_input():
             "noncurrent_investments",
         } <= set(annual.assumed_zero)
         assert any("was not reported" in note for note in annual.caveats)
+
+
+def test_negative_nopat_is_not_published_as_a_lower_bound():
+    """A larger denominator lowers a positive return but raises a negative one."""
+    from screener.sync import _derive
+
+    gaap = {k: v for k, v in OE_GAAP.items()
+            if k not in ("Goodwill", "IntangibleAssetsNetExcludingGoodwill",
+                         "ShortTermInvestments")}
+    gaap["OperatingIncomeLoss"] = tagdata("USD", [
+        dur("2025-01-01", "2025-12-31", -10e9,
+            accn="k25", filed="2026-02-15"),
+    ])
+
+    status, row = _derive("0000000001", "TEST", facts_doc(gaap))
+    assert status == "ok"
+    assert row["operating_returns_estimate"] is None
+
+
+def test_denominator_floor_blocks_partial_estimate_from_discovery_payload():
+    """A spectacular RONTA alone must not bypass a correctly withheld ROIC."""
+    from screener.sync import _derive
+
+    gaap = {k: v for k, v in OE_GAAP.items()
+            if k not in ("Goodwill", "IntangibleAssetsNetExcludingGoodwill",
+                         "ShortTermInvestments")}
+    gaap["CashAndCashEquivalentsAtCarryingValue"] = tagdata("USD", [
+        inst("2024-12-31", 840e9, form="10-K", accn="k24", filed="2025-02-15"),
+        inst("2025-12-31", 840e9, form="10-K", accn="k25", filed="2026-02-15"),
+        inst("2026-03-31", 840e9, accn="q126"),
+    ])
+    gaap["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"] = tagdata(
+        "USD", [dur("2025-01-01", "2025-12-31", 100e9,
+                    accn="k25", filed="2026-02-15")])
+    snapshot = build_snapshot("TEST", "0000000001", facts_doc(gaap))
+    candidate = snapshot.conservative_operating_returns[2025]
+    assert candidate.nopat_roic is None
+    assert candidate.ronta is not None
+    assert any("implausibly small" in caveat for caveat in candidate.caveats)
+
+    status, row = _derive("0000000001", "TEST", facts_doc(gaap))
+    assert status == "ok"
+    assert row["operating_returns_estimate"] is None
 
 
 def test_detail_zero_mode_creates_ten_slots_without_annual_filing_history():
@@ -1728,6 +1797,14 @@ def test_ronta_treats_lease_liabilities_as_financing_and_exposes_neutral_view():
         annual.net_tangible_operating_assets_ending.provenance.tag)
     assert "OperatingLeaseRightOfUseAsset" in (
         annual.lease_neutral_net_tangible_operating_assets_ending.provenance.tag)
+
+    # A JNJ-shaped missing current lease split is not a safe zero. It must keep
+    # RONTA blank even in the conservative discovery layer.
+    del gaap["OperatingLeaseLiabilityCurrent"]
+    without_current_lease = build_snapshot(
+        "TEST", "0000000001", facts_doc(gaap))
+    assert without_current_lease.conservative_operating_returns[2025].ronta is None
+    assert without_current_lease.conservative_operating_returns[2025].lease_neutral_ronta is None
 
     from screener.sync import _operating_return_history
     cell = _operating_return_history(snapshot)[2025]
@@ -1923,6 +2000,36 @@ def test_owner_earnings_per_share_keeps_each_complete_audited_year():
     assert payload["sources"]["reported_earnings"]["accn"] == "k25"
     assert payload["sources"]["total_capex"]["tag"].endswith(
         "PaymentsToAcquirePropertyPlantAndEquipment")
+
+
+def test_owner_earnings_keeps_an_eleventh_year_for_the_averaged_cagr_basis():
+    from screener.sync import _owner_earnings_row
+
+    gaap = dict(OE_GAAP)
+    years = range(2015, 2026)
+
+    def annual(tag, unit, value):
+        gaap[tag] = tagdata(unit, [
+            dur(f"{year}-01-01", f"{year}-12-31", value(year),
+                accn=f"k{year}", filed=f"{year + 1}-02-15")
+            for year in years
+        ])
+
+    annual("NetIncomeLoss", "USD", lambda year: (year - 2010) * 1e9)
+    annual("DepreciationDepletionAndAmortization", "USD", lambda year: 1e9)
+    annual("PaymentsToAcquirePropertyPlantAndEquipment", "USD", lambda year: 1e9)
+    annual("NetCashProvidedByUsedInOperatingActivities", "USD",
+           lambda year: (year - 2009) * 1e9)
+    annual("WeightedAverageNumberOfDilutedSharesOutstanding", "shares",
+           lambda year: 1e9)
+
+    snapshot = build(gaap)
+    payload = _owner_earnings_row(snapshot)
+
+    assert sorted(snapshot.owner_earnings.annual) == list(years)
+    assert list(payload["annual_per_share"]) == [str(year) for year in years]
+    assert payload["annual_per_share"]["2015"][
+        "reported_earnings_assumption_per_share"] == 5
 
 
 def test_owner_earnings_retains_proved_same_period_da_scale_fusb_pattern():

@@ -23,8 +23,11 @@ dasd
 - Snapshots are stored without prices. At export, `sync.apply_price()` settles
   criteria 1 and 7. The browser does not recompute them; `priceToPass()` only
   answers what price would clear the tests.
-- Missing data is never zero. Missing evidence remains `INSUFFICIENT`; only
-  `?assume_absent_zero=true` opts out, and that assumption must be disclosed.
+- Missing data is never zero in reported fields or Graham grades: missing evidence
+  remains `INSUFFICIENT`. Company detail defaults to the disclosed
+  `?assume_absent_zero=true` view (with an explicit strict-mode switch), and Return
+  Quality ranks on a separate disclosed zero-assumption overlay; neither may alter
+  the strict stored criteria or verdict.
 - Grade precedence, pinned by `web/test/grade.test.mjs`, is: definitive non-price
   `FAIL` -> `BLOCKED`; any uncomputable criterion -> `UNGRADEABLE`; valuation-only
   failures -> `NEAR-PASS`/`CLOSE`. A measured `FAIL` outranks `INDETERMINATE`.

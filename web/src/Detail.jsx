@@ -5,7 +5,7 @@ import { byN, currentRatio as currentRatioOf, pe3, priceToBook as priceToBookOf,
   recurringDividendPresentation, reportedRate, valuationPrice } from "./screen.js";
 import { profileMeta } from "./Alignment.jsx";
 import EpsCurve from "./EpsCurve.jsx";
-import { ownerEarningsTrend } from "./ownerEarnings.js";
+import { ownerEarningsTrend, ownerMetricTrend } from "./ownerEarnings.js";
 import { payloadWarnings } from "./warnings.js";
 import { quoteStatus, quoteTitle } from "./quote.js";
 import { companyIntrinsicValuePrefill, openIntrinsicValueCalculator } from "./intrinsicValue.js";
@@ -23,8 +23,8 @@ const ENTERPRISING = {
  * then the two Graham frameworks without trend charts or audit-trail clutter. */
 export default function Detail({ row: baseRow, onClose, tracked = false, onToggleTracked, onRecordTrade }) {
   const [assumedRow, setAssumedRow] = useState(null);
-  const [assumptionEnabled, setAssumptionEnabled] = useState(false);
-  const [assumptionLoading, setAssumptionLoading] = useState(false);
+  const [assumptionEnabled, setAssumptionEnabled] = useState(true);
+  const [assumptionLoading, setAssumptionLoading] = useState(true);
   const [assumptionError, setAssumptionError] = useState(null);
   const [assumptionAttempt, setAssumptionAttempt] = useState(0);
 
@@ -128,8 +128,9 @@ export default function Detail({ row: baseRow, onClose, tracked = false, onToggl
         </header>
 
         <DataWarnings row={row} />
+        {tracked && <LatestQuarterlyFiling filing={row.latest_quarterly_filing} />}
         <AnalysisRoutes routes={row.analysis_routes} />
-        <AssumptionControl row={row} active={assumptionActive}
+        <AssumptionControl row={row} enabled={assumptionEnabled} active={assumptionActive}
                            loading={assumptionLoading} error={assumptionError}
                            onEnable={() => setAssumptionEnabled(true)}
                            onDisable={() => setAssumptionEnabled(false)}
@@ -173,8 +174,6 @@ export default function Detail({ row: baseRow, onClose, tracked = false, onToggl
         <Ratios row={row} currentRatio={currentRatio} priceToBook={priceToBook}
                 pe3Value={pe3Value} prof={prof} wcToDebt={wcToDebt} awards={awards} />
 
-        <AssetProtection row={row} />
-
         <EpsCurve annualEps={row.annual_eps} ttmEps={row.ttm_eps} currency={currency} />
 
         <CriteriaSection
@@ -208,7 +207,7 @@ export default function Detail({ row: baseRow, onClose, tracked = false, onToggl
   );
 }
 
-function AssumptionControl({ row, active, loading, error, onEnable, onDisable, onRetry }) {
+function AssumptionControl({ row, enabled, active, loading, error, onEnable, onDisable, onRetry }) {
   const applied = row.assumption_mode?.applied ?? row.assumptions ?? [];
   const details = row.assumption_mode?.details ?? [];
   const labels = applied.map((value) => (
@@ -252,11 +251,12 @@ function AssumptionControl({ row, active, loading, error, onEnable, onDisable, o
           </details>
         )}
       </div>
-      {error
-        ? <button onClick={onRetry}>Retry assumption check</button>
-        : active
-        ? <button onClick={onDisable}>Use strict filing values</button>
-        : !loading && <button onClick={onEnable}>Apply zero assumptions</button>}
+      <div className="assumption-actions">
+        {error && <button onClick={onRetry}>Retry assumption check</button>}
+        {enabled
+          ? <button onClick={onDisable}>Use strict filing values</button>
+          : <button onClick={onEnable}>Apply zero assumptions</button>}
+      </div>
     </section>
   );
 }
@@ -284,6 +284,35 @@ function DataWarnings({ row }) {
   );
 }
 
+function LatestQuarterlyFiling({ filing }) {
+  return (
+    <section className="criteria-section latest-filing-section" aria-label="Latest quarterly filing">
+      <div className="criteria-title">
+        <div>
+          <h3>Latest quarterly filing</h3>
+          <p>The newest interim report currently listed by the SEC. Read the company’s official update.</p>
+        </div>
+      </div>
+      {filing ? (
+        <div className="latest-filing-card">
+          <div>
+            <b>{filing.form}</b>
+            <span> filed {filing.filed}</span>
+            {filing.period && <small>Reporting period ended {filing.period}</small>}
+          </div>
+          {filing.url && (
+            <a href={filing.url} target="_blank" rel="noreferrer">
+              Read the SEC filing{filing.document ? ` (${filing.document})` : ""}
+            </a>
+          )}
+        </div>
+      ) : (
+        <p className="criteria-note">No recent quarterly or interim filing was found in the SEC submissions index.</p>
+      )}
+    </section>
+  );
+}
+
 function AnalysisRoutes({ routes }) {
   if (!routes?.length) return null;
   return (
@@ -304,37 +333,6 @@ function AnalysisRoutes({ routes }) {
   );
 }
 
-function AssetProtection({ row }) {
-  const currency = row.currency ?? "USD";
-  const quoteCurrency = row.quote_currency ?? currency;
-  const quality = row.asset_quality ?? {};
-  const marketCap = row.price != null && row.shares != null ? row.price * row.shares : null;
-  if ([row.bvps, row.tbvps, row.ncavps, quality.common_equity, quality.inventory,
-    quality.receivables, quality.net_cash].every((value) => value == null)) return null;
-  return (
-    <section className="criteria-section" aria-label="Asset protection">
-      <div className="criteria-title"><div><h3>Asset protection</h3>
-        <p>Reported book and NCAV composition. No liquidation haircuts are assumed.</p></div></div>
-      <div className="snapshot-grid">
-        <Metric label="Book value / share" value={moneyPrice(row.bvps, currency)} />
-        <Metric label="Tangible book / share" value={moneyPrice(row.tbvps, currency)} />
-        <Metric label="NCAV / share" value={moneyPrice(row.ncavps, currency)} />
-        <Metric label="Common equity" value={money(quality.common_equity, currency)} />
-        <Metric label="Goodwill / common equity" value={rateOrDash(quality.goodwill_to_common_equity)} />
-        <Metric label="Goodwill + intangibles / equity"
-                value={rateOrDash(quality.goodwill_and_intangibles_to_common_equity)} />
-        <Metric label="Inventory / positive NCAV" value={rateOrDash(quality.inventory_to_ncav)} />
-        <Metric label="Receivables / positive NCAV" value={rateOrDash(quality.receivables_to_ncav)} />
-        <Metric label="Net cash" sub="cash + short investments − reported debt"
-                value={money(quality.net_cash, currency)} />
-        <Metric label="Market cap / positive net cash"
-                sub={marketCap == null ? undefined : `market cap ${money(marketCap, quoteCurrency)}`}
-                value={multiple(quality.market_cap_to_net_cash)} />
-      </div>
-    </section>
-  );
-}
-
 /** Every ratio the panel shows, at today's price and at each of the last ten
  * fiscal year ends. Chapter 13 compares companies by laying the same handful of
  * ratios side by side, and a single current column says how a business looks today
@@ -346,6 +344,10 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
   const history = row.annual_ratios ?? {};
   const assumptionActive = row.assumption_mode?.status === "APPLIED";
   const ownerReturns = row.operating_returns ?? row.owner_earnings ?? {};
+  const estimateReturns = row.operating_returns_estimate?.status === "CONSERVATIVE_LOWER_BOUND"
+    ? row.operating_returns_estimate : {};
+  const estimateFor = (key) => ownerReturns[key] == null
+    && Number.isFinite(estimateReturns[key]) ? estimateReturns[key] : null;
   const returnCaveats = ownerReturns.operating_return_caveats
     ?? ownerReturns.caveats ?? [];
   const nopatMissing = returnCaveats.find((text) => /NOPAT.*withheld|NOPAT and .*withheld/i.test(text))
@@ -373,6 +375,7 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
   const years = latestYear == null
     ? [] : Array.from({ length: 10 }, (_, index) => latestYear - index);
   const hasLeaseNeutral = ownerReturns.lease_neutral_ronta != null
+    || estimateFor("lease_neutral_ronta") != null
     || ownerReturns.lease_neutral_ronta_undefined
     || years.some((year) => history[year]?.lease_neutral_ronta != null
       || history[year]?.lease_neutral_ronta_undefined);
@@ -381,7 +384,6 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
     { label: "P/E", sub: "3-year average EPS", now: pe3Value, key: "pe3", fmt: multiple },
     { label: "P/B", now: priceToBook, key: "pb", fmt: multiple },
     { label: "P/TBV", sub: "criterion 7 \u00b7 under 1.20\u00d7", now: byN(row, 7).value, key: "ptbv", fmt: multiple },
-    { label: "P/NCAV", sub: "Graham buys under 0.67\u00d7", now: priceToNcav(row), key: "pncav", fmt: multiple },
     { label: "Current ratio", sub: "criterion 2 \u00b7 at least 1.50\u00d7", now: currentRatio, key: "current_ratio", fmt: multiple },
     { label: "Debt / equity", sub: "combined interest-bearing debt / common equity · generally under 1.00×",
       now: row.debt_to_equity, key: "debt_to_equity", fmt: multiple },
@@ -399,19 +401,12 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
     { label: "Operating margin", sub: "reported operating income / sales", now: prof.operating,
       key: "operating_margin", fmt: reportedRate,
       missing: "No same-period, filing-reported operating income and revenue pair is available; the screener does not invent an operating-profit subtotal from differently scoped lines." },
-    { label: "Return on book value", sub: "earnings on ending common equity", now: prof.on_book,
-      key: "return_on_book", fmt: rateOrDash },
     { label: "Return on equity (ROE)", sub: "Finkle · net income / average common equity", now: prof.on_equity,
       key: "return_on_equity", fmt: rateOrDash },
-    { label: "Normalized tax rate", sub: "median filing-reported effective rate · current FY and prior two FY",
-      now: ownerReturns.normalized_tax_rate, key: "normalized_tax_rate", fmt: rateOrDash,
-      missing: nopatMissing, operatingReturn: true },
-    { label: "NOPAT", sub: "operating income × (1 − normalized tax rate)",
-      now: ownerReturns.nopat, key: "nopat", fmt: (value) => money(value, currency), missing: nopatMissing,
-      operatingReturn: true },
     { label: "NOPAT ROIC",
       sub: `${ownerReturns.nopat == null ? "normalized NOPAT" : `${money(ownerReturns.nopat, currency)} normalized NOPAT`} / average invested capital excluding cash`,
       now: ownerReturns.nopat_roic, key: "nopat_roic", fmt: rateOrDash, missing: roicMissing,
+      estimated: estimateFor("nopat_roic"),
       undefined: ownerReturns.nopat_roic_undefined,
       operatingReturn: true },
     { label: "NOPAT return including cash", sub: "normalized NOPAT / average capital including cash",
@@ -420,12 +415,14 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
       operatingReturn: true },
     { label: "RONTA", sub: "NOPAT / average net tangible operating assets",
       now: ownerReturns.ronta, key: "ronta", fmt: rateOrDash, missing: rontaMissing,
+      estimated: estimateFor("ronta"),
       undefined: ownerReturns.ronta_undefined,
       operatingReturn: true },
     ...(hasLeaseNeutral ? [{
       label: "Lease-neutral RONTA",
       sub: "historical comparison · removes recognized operating-lease ROU assets",
       now: ownerReturns.lease_neutral_ronta, key: "lease_neutral_ronta", fmt: rateOrDash,
+      estimated: estimateFor("lease_neutral_ronta"),
       missing: leaseNeutralRontaMissing,
       undefined: ownerReturns.lease_neutral_ronta_undefined,
       operatingReturn: true,
@@ -457,9 +454,15 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
               <tr key={line.label + (line.sub ?? "")}>
                 <td><b>{line.label}</b>{line.sub && <small>{line.sub}</small>}</td>
                 <td className="num current"
-                    title={line.undefined ?? (line.now == null ? line.missing : undefined)}>
+                    title={line.undefined
+                      ?? (line.estimated != null
+                        ? [...(estimateReturns.operating_return_caveats ?? []), estimateReturns.note]
+                          .filter(Boolean).join(" ")
+                        : line.now == null ? line.missing : undefined)}>
                   {line.undefined
                     ? "N/M"
+                    : line.estimated != null
+                      ? <span className="estimated-return">≥ {line.fmt(line.estimated)}</span>
                     : assumptionActive && line.now == null
                       ? (line.assumeZero ? line.fmt(0) : "N/M")
                       : line.fmt(line.now)}
@@ -483,6 +486,12 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
           </tbody>
         </table>
       </div>
+      {Object.keys(estimateReturns).length > 0 && <p className="criteria-note estimate-note">
+        <b>Conservative discovery estimate:</b> values marked ≥ are lower bounds used
+        only for ranking. Missing optional deductions were bounded at zero
+        ({(estimateReturns.operating_return_assumptions ?? []).join(", ")}); exact
+        reported ratios and Graham verdicts are unchanged.
+      </p>}
       {hasLeaseNeutral && <p className="criteria-note"><b>Lease treatment:</b> RONTA
         keeps both current and noncurrent operating-lease obligations with financing.
         Lease-neutral RONTA also removes the reported ROU asset, matching the old
@@ -492,20 +501,6 @@ function Ratios({ row, currentRatio, priceToBook, pe3Value, prof, wcToDebt, awar
   );
 }
 
-
-/** Graham's hardest bargain: the price against net current assets alone, with
- * every liability already subtracted and the fixed assets thrown in free. Only
- * meaningful while net current assets are positive — a negative denominator
- * turns "cheap" upside down. */
-function priceToNcav(row) {
-  const price = valuationPrice(row);
-  if (price == null || row.ncavps == null || row.ncavps <= 0) return null;
-  const ratio = price / row.ncavps;
-  // Graham buys under 0.67x. At 6,425,308x the figure has stopped being a
-  // multiple of anything — the net current assets are a rounding error, which is
-  // information the number itself no longer carries.
-  return ratio > 1000 ? null : ratio;
-}
 
 function Metric({ label, sub, value, emphasis = false, title }) {
   return <div className="metric" title={title}><span>{label}{sub && <em>{sub}</em>}</span><b className={emphasis ? "ok" : ""}>{value}</b></div>;
@@ -603,6 +598,14 @@ function OwnerEarnings({ oe, cik, annualEps, annualWeightedShares, currency = "U
   if (!oe) return null;
   const rate = (value) => (value == null ? "—" : `${number(value)}%`);
   const trend = ownerEarningsTrend(oe);
+  const fcfTrend = ownerMetricTrend(
+    oe,
+    "free_cash_flow_per_share",
+    "free_cash_flow",
+  );
+  const cagrBasisLabel = (basis) => basis
+    ? `FY${basis.firstFiscalYear}–FY${basis.lastFiscalYear} average → FY${basis.latestFiscalYear}`
+    : undefined;
   const latest = trend?.rows.find((row) => row.fiscalYear === oe.fiscal_year);
   const years = trend?.rows ?? [];
   const bridgePoint = (cell, key) => {
@@ -708,18 +711,20 @@ function OwnerEarnings({ oe, cik, annualEps, annualWeightedShares, currency = "U
           <Metric label={`FY${oe.fiscal_year} reported earnings / share`}
                   sub="maintenance capex assumed equal to D&A; equals earnings by construction"
                   value={moneyPrice(latest?.perShare, currency)} />
-          <Metric label="10-slot CAGR" sub={`${trend.firstFiscalYear}–${trend.latestFiscalYear}`}
+          <Metric label="Earnings/share 10-slot CAGR" sub={cagrBasisLabel(trend.cagrBasis)}
                   value={rate(trend.cagr)} />
-          <Metric label="5-slot CAGR" value={rate(trend.cagr5)} />
-          <Metric label="3-slot CAGR" value={rate(trend.cagr3)} />
+          <Metric label="Earnings/share 5-slot CAGR" sub={cagrBasisLabel(trend.cagr5Basis)}
+                  value={rate(trend.cagr5)} />
+          <Metric label="Earnings/share 3-slot CAGR" value={rate(trend.cagr3)} />
+          <Metric label="FCF/share 10-slot CAGR"
+                  sub={cagrBasisLabel(fcfTrend.cagrBasis)}
+                  value={rate(fcfTrend.cagr)} />
+          <Metric label="FCF/share 5-slot CAGR" sub={cagrBasisLabel(fcfTrend.cagr5Basis)}
+                  value={rate(fcfTrend.cagr5)} />
           <Metric label="Total earnings CAGR" value={rate(trend.totalCagr)} />
           <Metric label="Diluted-share CAGR" value={rate(trend.shareCountCagr)} />
           <Metric label="10-year median / share" value={moneyPrice(trend.median10, currency)} />
           <Metric label="Latest vs 10-year median" value={signedPercent(trend.latestVsMedian10)} />
-          <Metric label="Worst YoY decline" value={rate(trend.worstYoyDecline)} />
-          <Metric label="Maximum peak-to-trough decline" value={rate(trend.maximumDrawdown)} />
-          <Metric label="Variability" sub="coefficient of variation"
-                  value={rate(trend.variability)} />
           <Metric label="History" value={`${trend.yearsPresent}/${trend.yearsExpected} years · ${trend.yearsProfitable} positive`} />
         </div>
       )}

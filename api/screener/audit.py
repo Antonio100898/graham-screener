@@ -1693,6 +1693,92 @@ def _derived_series(row: dict) -> list[tuple]:
             if nopat is not None and denominator is not None and denominator > 0:
                 check(f"annual_ratios.{year}.{field}", cell.get(field),
                       nopat / denominator * 100, label)
+
+    estimate = row.get("operating_returns_estimate") or {}
+    if estimate:
+        assumptions = set(estimate.get("operating_return_assumptions") or ())
+        allowed = {
+            "short_term_investments", "noncurrent_investments",
+            "goodwill", "intangibles",
+        }
+        strict = row.get("operating_returns") or {}
+        check("operating_returns_estimate.status_guard",
+              int(estimate.get("status") == "CONSERVATIVE_LOWER_BOUND"), 1,
+              "the estimate is explicitly segregated from reported returns")
+        check("operating_returns_estimate.assumption_guard",
+              int(bool(assumptions) and assumptions <= allowed), 1,
+              "only absent optional denominator deductions may be bounded at zero")
+        check("operating_returns_estimate.strict_gap_guard",
+              int(any(strict.get(field) is None and estimate.get(field) is not None
+                      for field in ("nopat_roic", "ronta"))), 1,
+              "an estimate is published only when it fills a strict ROIC/RONTA gap")
+        check("operating_returns_estimate.positive_guard",
+              int(all((estimate.get(field) or 0) > 0
+                      for field in ("nopat", "nopat_roic", "ronta"))), 1,
+              "a zero deduction is a lower bound only for a positive return")
+        operating_income = estimate.get("operating_income_for_nopat")
+        tax_rate = estimate.get("normalized_tax_rate")
+        nopat = estimate.get("nopat")
+        if operating_income is not None and tax_rate is not None:
+            check("operating_returns_estimate.nopat", nopat,
+                  operating_income * (1 - tax_rate / 100),
+                  "operating income x (1 - normalized effective tax rate)")
+        invested = estimate.get("invested_capital")
+        capital_including_cash = estimate.get("capital_including_cash")
+        if invested is not None and capital_including_cash is not None:
+            check("operating_returns_estimate.denominator_floor_guard",
+                  int(invested >= capital_including_cash * 0.02), 1,
+                  "cash-excluded invested capital is at least 2% of capital including cash")
+        for field, denominator, label in (
+            ("nopat_roic", invested,
+             "NOPAT over conservatively bounded average invested capital"),
+            ("ronta", estimate.get("average_net_tangible_operating_assets"),
+             "NOPAT over conservatively bounded average NTOA"),
+            ("lease_neutral_ronta",
+             estimate.get("average_lease_neutral_net_tangible_operating_assets"),
+             "NOPAT over conservatively bounded average lease-neutral NTOA"),
+        ):
+            if nopat is not None and denominator is not None and denominator > 0:
+                check(f"operating_returns_estimate.{field}", estimate.get(field),
+                      nopat / denominator * 100, label)
+        if strict.get("nopat") is not None:
+            check("operating_returns_estimate.nopat_matches_strict", nopat,
+                  strict["nopat"],
+                  "the estimate changes denominator deductions, never NOPAT")
+
+    quality = row.get("return_quality_assumption") or {}
+    if quality:
+        check("return_quality_assumption.status_guard",
+              int(quality.get("status") in {"APPLIED", "UNAVAILABLE"}), 1,
+              "the Return Quality overlay declares whether assumption mode ran")
+        if quality.get("status") == "APPLIED":
+            by_input = quality.get("input_assumptions") or {}
+            disclosed = {
+                assumption
+                for assumptions in by_input.values()
+                for assumption in (assumptions or ())
+            }
+            check("return_quality_assumption.disclosure_guard",
+                  int(disclosed == set(quality.get("applied") or ())), 1,
+                  "every zero substitution is assigned to an affected score input")
+            check("return_quality_assumption.roe_strict_guard",
+                  int(not (by_input.get("roe") or ())), 1,
+                  "ROE remains filing-strict because the ratio table does not invent it")
+            strict_returns = row.get("operating_returns") or {}
+            comparisons = (
+                ("roe", quality.get("roe"),
+                 (row.get("profitability") or {}).get("on_equity")),
+                ("nopat_roic", quality.get("nopat_roic"),
+                 strict_returns.get("nopat_roic")),
+                ("ronta", quality.get("ronta"), strict_returns.get("ronta")),
+                ("debt_to_equity", quality.get("debt_to_equity"),
+                 row.get("debt_to_equity")),
+            )
+            for field, shown, strict_value in comparisons:
+                if strict_value is not None and not (by_input.get(field) or ()):
+                    check(f"return_quality_assumption.{field}.strict_match",
+                          shown, strict_value,
+                          "an input with no substitution matches the strict calculation")
     return out
 
 

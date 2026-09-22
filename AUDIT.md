@@ -2553,3 +2553,215 @@ Final validation of the engine-171 UI payload:
 The exact release payload is retained as
 `tmp/pdfs/jnj-2025-audit/dashboard-engine-171-candidate.json` and is also the current
 `api/screener/static/dashboard.json` consumed by the UI.
+
+## Engine 173 — conservative operating-return discovery bounds (2026-09-10)
+
+The global `assume_absent_zero` proposal was rejected for ranking: debt, tax,
+cash, operating income, core balance-sheet lines, and current lease liabilities
+can all make a return more optimistic when guessed. Engine 173 instead builds a
+separate current-year estimate only when absent short-term investments,
+noncurrent investments, goodwill, or other intangibles can be bounded at zero.
+Those four items are denominator deductions, so zero maximizes positive invested
+capital/NTOA and makes the displayed return a lower bound. Every bounded field is
+listed; exact ratios, annual history, criteria, and verdicts are unchanged.
+
+The publication gate requires positive NOPAT, positive ROIC and RONTA, a strict
+gap actually filled by the estimate, and the existing 2%-of-capital ROIC
+denominator floor. Thus negative-profit cases are not mislabeled as lower bounds,
+and ATAT's denominator-driven RONTA cannot enter the ranking while its ROIC is
+withheld. Missing debt, operating income, tax evidence, cash, assets/current
+liabilities, or an applicable current lease split still produces a dash. Exact
+values always win in the UI; estimated ratios and their harmonic composite are
+prefixed with `≥` and styled as estimates.
+
+Full engine-171-to-173 payload regression recomputed all **6,585 companies**.
+The new field is present for **617 companies (9.4%)**. Return-quality coverage
+increases from **76 exact-scoreable companies to 522**, recovering **446** that
+were previously sorted last. All 617 records use only the four permitted
+assumptions and have positive NOPAT/ROIC/RONTA; none violate the denominator
+floor. WAT, VRT, and TILE receive the intended lower bounds. JNJ stays blank
+because its current lease-liability split is unavailable, LSTR stays blank
+because a material investment disclosure is detected, and ATAT stays blank
+because its ROIC denominator fails the plausibility floor.
+
+No strict financial field, criterion, or verdict moved in the price-held-constant
+engine comparison. Concurrent evidence refreshes explain the other reported
+differences: the current ticker index changed COOL to COOLU and GLTK to GLTKD,
+which also changed six peer-efficiency records; the refreshed price provider
+declared 2026-09-09 split factors for PHGE (10:1) and UCAR (20:1), so their stored
+historical closes and dependent historical multiples were rebased through the
+existing split-evidence guard. The final live-price export changed 15 valuation
+criterion statuses: ten were ordinary threshold crossings and five lost a quote;
+only AMSF and TOL changed overall verdict, both from FAIL to INDETERMINATE after
+criterion 1 crossed below 10 while another criterion remained unavailable.
+The universe remained **6,585 rows**, with unique CIKs and tickers; WILC left the
+current index and LGSP entered it.
+
+Final validation:
+
+- **61,363/61,363** source-value checks and **517,932/517,932** independent
+  arithmetic/guard checks across the full UI payload, zero wrong, zero unchecked.
+- Standard filing spread: **279/279 sourced**, **3,198/3,198 arithmetic**, and
+  **378/378 published-statement** comparisons, zero wrong. A focused eleven-name
+  set covering the estimate leaders and WAT/VRT/TILE/ATAT/LSTR/JNJ produced
+  **140/140**, **1,617/1,617**, and **223/223**, also zero wrong.
+- **650 Python tests** and **93 web tests** pass; the Vite production build passes.
+- The final engine-173 payload is **198,363,333 bytes**, SHA-256
+  `fa838b5cb1036e93d60c56c187e51a9a3b33f30d9024611dc1fc0eea4a13ee69`.
+
+## Engine 174 — default detail and Return Quality zero assumptions (2026-09-15)
+
+Company detail now opens in the explicit `assume_absent_zero` mode for every
+ticker and retains a one-click switch back to strict filing values. The primary
+dashboard row, all reported fields, all six Graham criteria, and every verdict
+remain strict. Return Quality alone receives a compact `return_quality_assumption`
+overlay derived from the same cached filing bundle under the detail convention.
+The overlay names every substituted field and assigns it to ROIC, RONTA, or
+debt/equity; ROE remains filing-strict. Because the broad convention can move a
+return in either direction, these scores are labelled as estimates rather than
+lower bounds. An assumed zero operating return ranks at zero instead of becoming
+an unexplained dash; negative returns and invalid/missing capital structure still
+withhold the composite.
+
+The pre-change UI payload was preserved before recomputation at
+`tmp/baselines/dashboard-before-default-zero-engine-174.json`: **198,542,945
+bytes**, SHA-256
+`3a911e0d5f36362cdc8633ebc7b45d61f6995e158b86b3ca28951aa89c9f3b6a`.
+The full 6,618-company held-price regression reported **65,333 intended nested
+overlay additions**. No strict financial, criterion, verdict, price-derived,
+historical-ratio, profile, alignment, market-cap, or provenance field moved from
+the engine change. Seven other changes came from the current SEC ticker map:
+`HLX` became `HOS` (plus its four now-stale cover/note fields) after the completed
+Hornbeck/Helix merger, and `GSTK` became `CYPA`.
+
+The same full export/enrichment path used by the UI then produced **6,625 unique
+CIKs and tickers**. Seven newly eligible rows entered and none left: CCTSF, SCVE,
+ZOAR, ELEV, ALLN, HFG, and RAFX. Return Quality is computable for **1,580 rows**
+versus **521** in the baseline: 1,277 positive scores and 303 assumed-zero scores.
+All 6,625 rows carry the assumption-mode overlay and 6,505 required at least one
+substitution. The live price/history refresh changed 12 valuation statuses: four
+criterion-7 PASS→FAIL threshold crossings (HTH, RCKT, NB, PUMP), one criterion-7
+FAIL→PASS crossing (RETO), five criterion-1 FAIL→INSUFFICIENT quote/listing losses
+(GTCH, CRNX, NCSM, APGE, ATAI), and two criterion-7
+FAIL→INSUFFICIENT losses (NCSM, ATAI). **No overall verdict changed.** All other
+payload movement was the dated quote, price-history statistic, FX, market-cap,
+historical-price multiple, current SEC name/listing, and directly dependent
+alignment output expected from that refresh.
+
+Final validation:
+
+- **654 Python tests** and **95 web tests** pass; the Vite production build passes.
+- The exact 6,625-row UI payload passes **61,448/61,448 source-value checks** and
+  **544,530/544,530 arithmetic/disclosure checks**, with zero wrong, superseded,
+  or uncheckable.
+- The standard network-backed filing spread passes **279/279 source checks**,
+  **3,307/3,307 arithmetic checks**, and **378/378 published-statement
+  comparisons**, with zero wrong. Sixty-six constructed or differently printed
+  lines remain explicitly classified as not printed and are not counted as
+  passes.
+- The live API returns assumption status `APPLIED` for `/company/ABT/dashboard`
+  without a query parameter; `?assume_absent_zero=false` returns the strict row.
+  API docs and the Vite dashboard both return HTTP 200.
+- The final engine-174 payload is **203,244,372 bytes**, SHA-256
+  `3c8d0f8e3cab433a1e1e0fad3c9e1e7f2ec24c6b55a0641c03c8cb05bf198ac6`.
+
+## Engine 175 — averaged-start Owner Earnings CAGRs and detail cleanup (2026-09-15)
+
+The Company Details panel no longer displays P/NCAV, return on book value,
+normalized tax rate, or the standalone NOPAT row. The Asset Protection section
+has been removed in full. The Owner Earnings summary also removes worst YoY
+decline, maximum peak-to-trough decline, and variability. The underlying
+filing-backed fields remain in the payload and audits; only these detail views
+and unused client calculations were removed.
+
+Five- and ten-slot CAGR starts now use a three-year average centred on the
+nominal starting year. With FY2026 as the latest year, the five-slot calculation
+uses the FY2021–FY2023 average and a four-period exponent; the ten-slot
+calculation uses the FY2016–FY2018 average and a nine-period exponent. This rule
+applies to reported earnings/share, FCF/share, total earnings, and diluted-share
+diagnostics. The three-slot CAGR is unchanged. A missing basis year, a
+non-positive averaged basis, or a non-positive latest value withholds the CAGR.
+The UI still displays ten fiscal years; engine 175 retains an eleventh,
+filing-backed year solely as support for the ten-slot basis and labels every
+displayed averaged range.
+
+The pre-change Engine 174 UI payload is preserved at
+`tmp/baselines/dashboard-before-owner-cagr-engine-175.json`: **203,244,372
+bytes**, SHA-256
+`3c8d0f8e3cab433a1e1e0fad3c9e1e7f2ec24c6b55a0641c03c8cb05bf198ac6`.
+The full 6,625-company held-price regression reported **53,443 changes**, all
+additions beneath the new oldest
+`owner_earnings.annual_per_share.<fiscal-year-minus-10>` slot. No strict
+financial, criterion, verdict, price-derived, profile, alignment, identity, or
+provenance field moved in that engine-only comparison.
+
+The production export contains **53,445 support-field additions across 2,211
+companies** and retains **6,625 unique CIKs and tickers**, with no row, ticker, or
+identity changes. Under the requested formula, 1,447 EPS five-slot, 1,206 EPS
+ten-slot, 1,678 FCF five-slot, and 1,318 FCF ten-slot CAGRs are computable.
+Compared with the prior endpoint formula, the respective availability counts
+were 1,570, 1,249, 1,688, and 1,362; the reduction is the explicit consequence
+of requiring both neighbouring basis years instead of one endpoint.
+
+The concurrent live quote refresh caused 18 valuation-status changes. Criterion
+1 changed PASS→FAIL for APA, LARK, and UAL; FAIL→PASS for BTMD, CF, and ODD; and
+FAIL→INSUFFICIENT for BFNH, CFOO, and GPRE after their quotes became unavailable.
+Criterion 7 changed FAIL→PASS for BMNR, BRR, PUMP, and ULBI, and PASS→FAIL for
+CBKM, MYFW, NMIH, RETO, and RYZ. CBKM consequently changed overall verdict from
+INDETERMINATE to FAIL. All remaining non-support movement is the dated quote,
+session/market-state, price-history statistic, FX, market-cap/net-cash multiple,
+and directly dependent alignment output expected from that refresh.
+
+Final validation:
+
+- **655 Python tests** and **96 web tests** pass; the Vite production build
+  passes.
+- The exact 6,625-row UI payload passes **61,448/61,448 source-value checks**
+  and **558,980/558,980 arithmetic/disclosure checks**, with zero wrong,
+  superseded, or uncheckable.
+- The network-backed filing spread passes **279/279 source checks**,
+  **3,412/3,412 arithmetic checks**, and **378/378 published-statement
+  comparisons**, with zero wrong. Sixty-six constructed or differently printed
+  lines remain explicitly classified as not printed and are not counted as
+  passes.
+- The live API keeps the default assumption status `APPLIED`, the explicit
+  strict route omits assumption mode, API docs and Vite both return HTTP 200,
+  and no dashboard-eligible snapshot remains stale.
+- The final Engine 175 payload is **206,621,136 bytes**, SHA-256
+  `f41030d7eba62d7f1ad6a83549ceeb0221a9272c563bb49113be474652cc179c`.
+
+## Engine 176 — recognize an SEC-standard cash-capex tag (2026-09-20)
+
+The cash-capex allowlist now includes `us-gaap:PaymentsForProceedsFromProductiveAssets`.
+CLMB's 2025 Form 10-K labels this fact **Purchase of equipment and leasehold
+improvements** and reports $1.995 million for FY2025, $5.470 million for FY2024,
+and $4.989 million for FY2023. The prior engine omitted the tag, so CLMB's FCF
+table was withheld even though the filed cash-flow statement supplied the data.
+
+The regenerated CLMB detail now reports FY2025 operating cash flow of $16.604
+million less $1.995 million capex = $14.609 million FCF ($0.8073/share), with
+provenance naming the 2025 10-K accession `0001437749-26-006072`. The change is
+filing-backed and also enables historical FCF rows for other filers using this
+standard element; no criteria or verdict rule was changed.
+
+Validation: `derive` recomputed 7,209 dashboard-eligible snapshots; `export`
+wrote 6,630 rows (207,614,789 bytes, SHA-256
+`2328CF8776FE3ACCCC7AEC2866B32773E8222B233DCD0B37A985BC1BCEC1E839`). Full
+regression against the preserved Engine 175 baseline completed with intended
+Owner Earnings/cash-flow additions only. Exact audit: 61,456 source checks and
+561,957 arithmetic checks OK, 0 wrong. Filing audit: 279 source checks, 3,412
+arithmetic checks, and 378 published-statement comparisons OK; 0 wrong.
+
+## Engine 177 — recognize standard cash-capex subtype tags (2026-09-20)
+
+The allowlist also recognizes `PaymentsToAcquireOtherPropertyPlantAndEquipment`,
+`PaymentsToAcquireMachineryAndEquipment`, and `PaymentsToAcquireOtherProductiveAssets`
+as fallback cash-capex rows. They are used only when the umbrella capex elements
+are absent; the per-year tag precedence prevents double counting. This recovered
+FCF rows for 162 tickers versus the preserved pre-change dashboard, including CLMB.
+
+The Engine 177 export is 209,929,876 bytes, SHA-256
+`7f0c2652a6bcc786973194484cb5817b32fa0c162bbadbc48a72d3b688b326c8`.
+Exact audit: 61,456 source checks and 569,306 arithmetic checks OK, 0 wrong.
+Filing audit remained 279 source checks, 3,412 arithmetic checks, and 378
+published-statement comparisons OK, 0 wrong.

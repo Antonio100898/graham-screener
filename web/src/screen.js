@@ -50,6 +50,87 @@ export function priceToBook(row) {
   return price != null && row.bvps > 0 ? price / row.bvps : null;
 }
 
+/** A discovery score for businesses whose three independently constructed
+ * operating-return measures and capital structure are measurable under the
+ * selected evidence convention. RONTA is not meaningful for some businesses
+ * (for example, when net tangible operating assets are negative); those rows
+ * use the available positive return measures without treating the omitted
+ * metric as zero or otherwise penalising it.
+ *
+ * The harmonic mean is intentionally used instead of a sum/arithmetic mean:
+ * one ratio can explode when its denominator is unusually small (for example,
+ * ROE after large buybacks).  A company ranks highly only when ROE, cash-
+ * excluded NOPAT ROIC and RONTA are strong together.  Dividing that return
+ * score by (1 + debt/equity) then prevents leverage from masquerading as
+ * operating quality. The exported assumption overlay is preferred when present,
+ * matching the detail panel's default; it is kept separate from strict fields so
+ * no Graham criterion or verdict is changed. A zero assumed return produces a
+ * zero score (the harmonic-mean limit), while a negative return, missing leverage,
+ * or a negative-equity denominator still produces no score. */
+export function returnQuality(row) {
+  const assumption = row.return_quality_assumption?.status === "APPLIED"
+    ? row.return_quality_assumption : null;
+  const estimate = !assumption
+    && row.operating_returns_estimate?.status === "CONSERVATIVE_LOWER_BOUND"
+    ? row.operating_returns_estimate : null;
+  const inputAssumptions = assumption?.input_assumptions ?? {};
+  const roe = assumption ? assumption.roe : row.profitability?.on_equity;
+  const metric = (name) => {
+    if (assumption) {
+      const value = assumption[name];
+      return {
+        value: Number.isFinite(value) ? value : null,
+        assumed: (inputAssumptions[name]?.length ?? 0) > 0,
+        estimated: false,
+      };
+    }
+    const exact = row.operating_returns?.[name];
+    if (Number.isFinite(exact)) return { value: exact, assumed: false, estimated: false };
+    const lowerBound = estimate?.[name];
+    return Number.isFinite(lowerBound)
+      ? { value: lowerBound, assumed: false, estimated: true }
+      : { value: null, assumed: false, estimated: false };
+  };
+  const roicMetric = metric("nopat_roic");
+  const rontaMetric = metric("ronta");
+  const roic = roicMetric.value;
+  const ronta = rontaMetric.value;
+  const debtToEquity = assumption ? assumption.debt_to_equity : row.debt_to_equity;
+  const values = [roe, roic, ronta].filter((value) => Number.isFinite(value));
+  const returnsValid = values.length >= 2 && values.every((value) =>
+    assumption ? value >= 0 : value > 0);
+  const complete = returnsValid
+    && Number.isFinite(debtToEquity) && debtToEquity >= 0;
+  const returnScore = complete
+    ? values.some((value) => value === 0)
+      ? 0
+      : values.length / values.reduce((sum, value) => sum + 1 / value, 0)
+    : null;
+  return {
+    score: returnScore == null ? null : returnScore / (1 + debtToEquity),
+    returnScore,
+    roe: Number.isFinite(roe) ? roe : null,
+    roic: Number.isFinite(roic) ? roic : null,
+    ronta: Number.isFinite(ronta) ? ronta : null,
+    debtToEquity: Number.isFinite(debtToEquity) && debtToEquity >= 0 ? debtToEquity : null,
+    assumptionMode: assumption != null,
+    assumptionApplied: (assumption?.applied?.length ?? 0) > 0,
+    assumedInputs: {
+      roe: (inputAssumptions.roe?.length ?? 0) > 0,
+      roic: roicMetric.assumed,
+      ronta: rontaMetric.assumed && Number.isFinite(ronta),
+      debtToEquity: (inputAssumptions.debt_to_equity?.length ?? 0) > 0,
+    },
+    estimated: roicMetric.estimated || rontaMetric.estimated,
+    estimatedInputs: {
+      roic: roicMetric.estimated,
+      ronta: rontaMetric.estimated,
+    },
+    assumptions: assumption?.applied ?? estimate?.operating_return_assumptions ?? [],
+    estimateNote: assumption?.note ?? estimate?.note ?? null,
+  };
+}
+
 /** A missing operating margin is materially different from a zero margin.
  * The filing must provide a same-period operating-income/revenue basis; the UI
  * says when it did not instead of leaving an unexplained dash. */

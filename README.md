@@ -44,7 +44,11 @@ From the dashboard toolbar or the command line — same jobs either way:
 | `make derive-all` | recompute every cached snapshot, including deferred filers |
 
 Raw filings are cached as files; derived snapshots live in SQLite
-(`~/.cache/graham-screener/screener.db`). Missing data is never treated as zero.
+(`~/.cache/graham-screener/screener.db`). Missing data is never treated as zero in
+reported figures, history, or Graham verdicts. Company detail opens with its
+disclosed zero-assumption view and can switch back to strict filing values. Return
+Quality uses the same convention through a separate, labelled discovery overlay;
+every substituted field is listed and the overlay never changes a Graham grade.
 
 ## Run
 
