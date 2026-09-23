@@ -9,6 +9,10 @@ in one identifiable currency and its cover resolves the exact common-equity
 security (including any depositary ratio). For non-USD statements, explicit
 current and fiscal-date FX rates put a USD-listed share price on the reporting
 basis; missing FX leaves valuation unavailable rather than guessed.
+Tokyo-listed companies can also enter from Japan's official EDINET annual XBRL
+reports and complete corrections when their security code matches the current JPX domestic-share list.
+Japanese quotes and statements remain in yen; fields without a verified filing
+concept remain blank.
 
 Six criteria are scored: P/E < 10, current ratio ≥ 1.5, debt ≤ 1.1× net current
 assets, positive EPS in each of the last 5 years, a current dividend, and price
@@ -42,6 +46,11 @@ From the dashboard toolbar or the command line — same jobs either way:
 | `make export` | current RTH/pre/post quotes + 5y weekly closes, rebuild `dashboard.json` |
 | `make derive` | recompute dashboard-eligible snapshots after an engine change — no refetching |
 | `make derive-all` | recompute every cached snapshot, including deferred filers |
+
+For Japanese annual filings, run `cd api && .venv/bin/python -m screener.sync edinet-import --from YYYY-MM-DD --to YYYY-MM-DD`.
+The command asks for the EDINET API key without echoing or saving it. Add
+`--edinet-code 6752` to limit the import to one Tokyo-listed company. Run
+`make export` afterward to update Research.
 
 Raw filings are cached as files; derived snapshots live in SQLite
 (`~/.cache/graham-screener/screener.db`). Missing data is never treated as zero in

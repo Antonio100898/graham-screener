@@ -53,6 +53,8 @@ _QUARTERLY_FORMS = frozenset({"10-Q", "10-Q/A", "6-K", "6-K/A"})
 
 def _latest_quarterly_filing(cik: str) -> dict | None:
     """Return the newest interim/quarterly filing from the SEC submissions index."""
+    if not str(cik).isdigit():
+        return None
     try:
         submissions = _edgar.submissions(cik)
     except Exception:
@@ -81,6 +83,20 @@ def _latest_quarterly_filing(cik: str) -> dict | None:
 
 
 def _snapshot_for(ticker: str, assume_absent_zero: bool = False) -> FinancialSnapshot:
+    wanted = ticker.upper()
+    if wanted.endswith(".T"):
+        conn = store.connect()
+        try:
+            company = conn.execute(
+                "SELECT cik FROM company WHERE ticker = ? AND cik GLOB 'E[0-9]*'",
+                (wanted,),
+            ).fetchone()
+            if company is not None:
+                bundle = evidence.EvidenceLoader(conn, _edgar).load(company["cik"], wanted)
+                return build_snapshot(bundle.ticker, bundle.cik, bundle.facts,
+                                      assume_absent_zero=assume_absent_zero)
+        finally:
+            conn.close()
     try:
         cik = _edgar.cik_for(ticker)
         facts = _edgar.company_facts(cik)
@@ -119,11 +135,12 @@ def _price_stats(hist) -> dict | None:
 
 
 def _market_evidence(ticker: str, snap: FinancialSnapshot, *, history: bool):
-    """Raw US quote/history plus a quote converted to the filing currency."""
-    market = (_prices.history(ticker, expected_currency="USD") if history
-              else _prices.quote(ticker, expected_currency="USD"))
+    """Quote/history in the traded currency, converted when statements differ."""
+    quote_currency = snap.reporting_currency if str(snap.cik).startswith("E") else "USD"
+    market = (_prices.history(ticker, expected_currency=quote_currency) if history
+              else _prices.quote(ticker, expected_currency=quote_currency))
     quote = market.quote if history and market else market
-    if quote is None or snap.reporting_currency == "USD":
+    if quote is None or snap.reporting_currency == quote_currency:
         return market, quote
     fx = _prices.exchange_rate_history("USD", snap.reporting_currency)
     if fx is None:

@@ -138,6 +138,30 @@ test("foreign canonical rows render their reporting currency and workbook source
   assert.doesNotMatch(markup, /sec\.gov\/Archives\/edgar\/data\/NaN/);
 });
 
+test("Japanese filing evidence links to the official EDINET document", async (t) => {
+  const previousWindow = globalThis.window;
+  globalThis.window = { location: { href: "http://localhost/", search: "" } };
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+  const vite = await createServer({ appType: "custom", server: { middlewareMode: true } });
+  t.after(() => vite.close());
+  const { default: Detail } = await vite.ssrLoadModule("/src/Detail.jsx");
+  const row = {
+    ticker: "6752.T", name: "Panasonic Holdings Corporation", cik: "E01772",
+    currency: "JPY", data_source: "edinet_xbrl",
+    criteria: [1, 2, 3, 4, 5, 7].map((n) => ({ n, status: "INSUFFICIENT_DATA", value: null })),
+    sources: { total_assets: {
+      tag: "jpigp_cor:AssetsIFRS", form: "JP-AR", accn: "S100YETA",
+      end: "2026-03-31", document: "S100YETA",
+    } },
+  };
+  const markup = renderToStaticMarkup(React.createElement(Detail, { row, onClose() {} }));
+  assert.match(markup, /disclosure2dl\.edinet-fsa\.go\.jp\/searchdocument\/pdf\/S100YETA\.pdf/);
+  assert.doesNotMatch(markup, /sec\.gov\/Archives\/edgar\/data\/NaN/);
+});
+
 test("the ratios history explains and displays lease-neutral RONTA", async (t) => {
   const previousWindow = globalThis.window;
   globalThis.window = { location: { href: "http://localhost/", search: "" } };

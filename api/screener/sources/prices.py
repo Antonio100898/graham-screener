@@ -35,10 +35,10 @@ class YahooPriceProvider:
 
     def _chart(self, ticker: str, range_: str, interval: str,
                include_pre_post: bool = False) -> dict | None:
-        # A one-letter suffix is a US share class (BRK.B -> BRK-B). A multi-letter
-        # suffix is an exchange code and must remain dotted (ADS.DE).
+        # Alphabetic one-letter classes use a dash (BRK.B -> BRK-B). Numeric
+        # Japanese listings keep their exchange suffix (6752.T).
         symbol = ticker.strip().upper()
-        if re.fullmatch(r"[A-Z0-9]+\.[A-Z]", symbol):
+        if re.fullmatch(r"[A-Z]+\.[A-Z]", symbol):
             symbol = symbol.replace(".", "-")
         try:
             resp = self._http.get(YAHOO_URL.format(

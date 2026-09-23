@@ -40,7 +40,7 @@ class PendingFilingFactsError(UnsupportedFilerError):
 # depositary ratio or an ambiguous statement currency remains unsupported.
 # The form tuples also preserve pre-transition history when a filer moves between
 # foreign and domestic forms.
-ANNUAL_FORMS = ("10-K", "20-F", "40-F", "IFRS-AR")
+ANNUAL_FORMS = ("10-K", "20-F", "40-F", "IFRS-AR", "JP-AR", "JP-AR/A")
 INTERIM_FORMS = ("10-Q", "6-K")
 FINANCIAL_FORMS = ANNUAL_FORMS + INTERIM_FORMS
 _FOREIGN_BALANCE_ANCHORS = (
@@ -637,8 +637,7 @@ def build_snapshot(
     facts = companyfacts.get("facts", {})
     adapter = companyfacts.get("_adapter") or {}
     canonical_adapter = (
-        adapter.get("kind") == "adidas_ifrs_workbook"
-        and adapter.get("statement_basis") == "canonical"
+        adapter.get("statement_basis") == "canonical"
         and isinstance(facts.get("canonical"), dict)
     )
     statement_basis = (

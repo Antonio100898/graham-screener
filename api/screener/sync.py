@@ -20,8 +20,10 @@ have the latest period".
 from __future__ import annotations
 
 import argparse
+import getpass
 import io
 import json
+import os
 import sys
 import zipfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -36,7 +38,9 @@ from . import normalize
 from .normalize import PendingFilingFactsError, UnsupportedFilerError, build_snapshot
 from .screens.enterprising import (PE_MAX, PRICE_TO_TBV_MAX, STALE_FOR_PRICING_DAYS,
                                    YIELD_IMPLAUSIBLE, evaluate, settled_debt)
-from .sources import cover, dera, indexes, ifrs_workbook
+from .sources import cover, dera, indexes, ifrs_workbook, jpx
+from .sources.edinet import EdinetClient, annual_filings
+from .sources.edinet_mapper import ADAPTER_KIND as EDINET_ADAPTER, build_edinet_companyfacts
 from .sources.edgar import EdgarClient, EdgarError, NoXbrlDataError
 from .sources.prices import YahooPriceProvider
 
@@ -1957,6 +1961,113 @@ def import_ifrs_workbooks(
     )
     return result
 
+
+def _merge_edinet_facts(previous: dict | None, incoming: dict) -> dict:
+    """Keep earlier filings while later annual reports can restate their years."""
+    if not previous or (previous.get("_adapter") or {}).get("kind") != EDINET_ADAPTER:
+        return incoming
+    if previous.get("cik") != incoming.get("cik"):
+        raise ValueError("EDINET company identity changed during import")
+    out = previous
+    prior_reports = (out.get("_adapter") or {}).get("reports") or []
+    new_report = incoming["_adapter"]["reports"][0]
+    prior_reports = [report for report in prior_reports
+                     if report["document"] != new_report["document"]]
+    for tagdata in out.get("facts", {}).get("canonical", {}).values():
+        for unit, entries in tagdata.get("units", {}).items():
+            tagdata["units"][unit] = [entry for entry in entries
+                                      if entry.get("accn") != new_report["document"]]
+    for tag, tagdata in incoming["facts"]["canonical"].items():
+        target = out.setdefault("facts", {}).setdefault("canonical", {}) \
+            .setdefault(tag, {"units": {}})["units"]
+        for unit, entries in tagdata["units"].items():
+            target.setdefault(unit, []).extend(entries)
+    out["_adapter"]["reports"] = sorted(
+        [*prior_reports, new_report], key=lambda report: report["published"])
+    if new_report["published"] >= out["_adapter"]["reports"][-1]["published"]:
+        out["_adapter"]["reporting_currency"] = incoming["_adapter"]["reporting_currency"]
+        out["_adapter"]["quote_currency"] = incoming["_adapter"]["quote_currency"]
+        out["_adapter"]["ticker"] = incoming["_adapter"]["ticker"]
+        out["entityName"] = incoming["entityName"]
+    return out
+
+
+def import_edinet(conn, start: date, end: date, *, client: EdinetClient | None = None,
+                  listings: dict | None = None, progress=_print_progress,
+                  limit: int | None = None, only_code: str | None = None,
+                  cache_dir: Path | None = None) -> int:
+    """Import TSE-listed annual EDINET reports into the shared dashboard store."""
+    if end < start:
+        raise ValueError("EDINET end date precedes start date")
+    client = client or EdinetClient()
+    listings = listings if listings is not None else jpx.fetch_listed_companies()
+    cache = Path(cache_dir) if cache_dir is not None else EdgarClient().cache_dir
+    imported = 0
+    skipped = 0
+    day = start
+    while day <= end:
+        records = annual_filings(client.documents_on(day.isoformat()))
+        for record in records:
+            code = record.get("secCode") or ""
+            if len(code) != 5 or not code.endswith("0"):
+                continue
+            local_code = code[:-1]
+            if only_code is not None and local_code != only_code:
+                continue
+            listed = listings.get(local_code)
+            if listed is None:
+                continue
+            ticker = f"{local_code}.T"
+            document_id = record["docID"]
+            archive_path = cache / "edinet" / f"{document_id}.zip"
+            if archive_path.exists():
+                archive = archive_path.read_bytes()
+            else:
+                archive = client.xbrl_archive(document_id)
+            try:
+                source = build_edinet_companyfacts(record, archive, ticker=ticker)
+            except ValueError as exc:
+                skipped += 1
+                progress(f"EDINET {document_id} skipped: {exc}")
+                continue
+            entity_id = source["cik"]
+            destination = cache / f"companyfacts_{entity_id}.json"
+            previous = (json.loads(destination.read_text()) if destination.exists()
+                        else None)
+            bundle = _merge_edinet_facts(previous, source)
+            status, data = _derive_evidence(evidence.EvidenceBundle(
+                cik=entity_id, ticker=ticker, facts=bundle,
+                dimensioned=None, receipt=None))
+            if status != "ok":
+                skipped += 1
+                progress(f"EDINET {document_id} skipped: derivation status {status}")
+                continue
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            if not archive_path.exists():
+                archive_path.write_bytes(archive)
+            temporary = destination.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(bundle, separators=(",", ":")), encoding="utf-8")
+            temporary.replace(destination)
+            store.upsert_company(conn, entity_id, ticker, listed["name"],
+                                 last_filing=record["submitDateTime"][:10],
+                                 facts_synced=True)
+            store.set_metadata(conn, entity_id, sic=None,
+                               industry=listed["industry"], exchange="TSE",
+                               filer_size=None, ticker=ticker, name=listed["name"])
+            conn.execute(
+                "UPDATE company SET listed = 'external', incorporation = ? WHERE cik = ?",
+                ("M0|Japan", entity_id),
+            )
+            store.put_snapshot(conn, entity_id, status, data)
+            conn.commit()
+            imported += 1
+            progress(f"EDINET {ticker}: {document_id} ({status})")
+            if limit is not None and imported >= limit:
+                return imported
+        day += timedelta(days=1)
+    progress(f"imported {imported} EDINET annual reports; skipped {skipped}")
+    return imported
+
 def derive(conn, progress=_print_progress, *, all_snapshots: bool = False,
            workers: int = 4) -> None:
     """Recompute snapshots after an engine change from cached raw facts.
@@ -2734,7 +2845,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("command", choices=["bootstrap", "bulk", "metadata", "daily",
                                         "derive", "export", "quotes", "listing-age", "events",
-                                        "cover", "dera", "ifrs-import", "status"])
+                                        "cover", "dera", "ifrs-import", "edinet-import", "status"])
     ap.add_argument("--limit", type=int)
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--no-prices", action="store_true")
@@ -2742,6 +2853,8 @@ def main(argv=None) -> int:
                     help="with derive, include cached filers that cannot enter the dashboard")
     ap.add_argument("--from", dest="start", help="first quarter for dera, e.g. 2021q1")
     ap.add_argument("--path", help="directory containing IFRS statement workbooks")
+    ap.add_argument("--to", dest="end", help="last EDINET filing date (YYYY-MM-DD)")
+    ap.add_argument("--edinet-code", help="one Japanese four-character security code")
     ap.add_argument("--ticker", default=ifrs_workbook.DEFAULT_TICKER)
     ap.add_argument("--entity-id", default=ifrs_workbook.DEFAULT_ENTITY_ID)
     args = ap.parse_args(argv)
@@ -2769,6 +2882,14 @@ def main(argv=None) -> int:
             ap.error("ifrs-import requires --path")
         import_ifrs_workbooks(
             conn, args.path, ticker=args.ticker, entity_id=args.entity_id)
+    elif args.command == "edinet-import":
+        if not args.start:
+            ap.error("edinet-import requires --from YYYY-MM-DD")
+        client = EdinetClient(os.environ.get("EDINET_API_KEY")
+                              or getpass.getpass("EDINET API key: "))
+        import_edinet(conn, date.fromisoformat(args.start),
+                      date.fromisoformat(args.end or args.start), limit=args.limit,
+                      only_code=args.edinet_code, client=client)
     elif args.command == "export":
         export(conn, not args.no_prices)
     elif args.command == "quotes":

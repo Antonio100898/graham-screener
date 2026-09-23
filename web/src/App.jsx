@@ -287,8 +287,9 @@ export default function App() {
         roic: r.owner_earnings?.all_capex_return ?? null,
         profile: r.graham_profile ?? "REVIEW",
         warnings: payloadWarnings(r),
-        // searched fields, flattened once: ticker, name, sector, and issuer profile
-        hay: [r.ticker, r.name, r.sector, r.industry, r.exchange, r.graham_profile]
+        // searched fields, flattened once: identity, industry, venue, and country
+        hay: [r.ticker, r.name, r.sector, r.industry, r.exchange,
+              r.graham_profile, r.incorporation?.split("|")[1]]
           .filter(Boolean).join(" ").toLowerCase(),
       };
     });
