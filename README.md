@@ -52,6 +52,13 @@ The command asks for the EDINET API key without echoing or saving it. Add
 `--edinet-code 6752` to limit the import to one Tokyo-listed company. Run
 `make export` afterward to update Research.
 
+GitHub Actions can run the same import from **Actions → EDINET sync**. Configure
+the repository Actions secret `EDINET_API_KEY`; scheduled runs then import the
+latest seven-day window on Japanese business days. Manual runs accept an exact
+date range and optional four-digit security code. Each successful run preserves
+the database and filing cache for the next run and publishes the rebuilt
+`dashboard.json` as a 30-day workflow artifact.
+
 Raw filings are cached as files; derived snapshots live in SQLite
 (`~/.cache/graham-screener/screener.db`). Missing data is never treated as zero in
 reported figures, history, or Graham verdicts. Company detail opens with its
