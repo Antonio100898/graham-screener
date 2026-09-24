@@ -16,7 +16,8 @@ export function unfilteredView() {
     minCap: 0,
     minMet: 0,
     minPositiveEps: 0,
-    minRoic: 0,
+    maxPe: 0,
+    maxPe3: 0,
     trackedOnly: false,
     hideNA: false,
     hideNoApply: false,
@@ -38,7 +39,8 @@ export function hasActiveFilters(view) {
     || view.minCap > 0
     || view.minMet > 0
     || view.minPositiveEps > 0
-    || view.minRoic > 0
+    || view.maxPe > 0
+    || view.maxPe3 > 0
     || Boolean(view.trackedOnly)
     || Boolean(view.hideNA)
     || Boolean(view.hideNoApply)

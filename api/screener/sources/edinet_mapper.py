@@ -116,7 +116,9 @@ def build_edinet_companyfacts(
     document_id = record["docID"]
     entity_id = record["edinetCode"]
     security_code = record["secCode"]
-    period_end = record["periodEnd"]
+    period_end = record.get("periodEnd")
+    if not isinstance(period_end, str) or not period_end:
+        raise ValueError("EDINET annual filing has no period end")
     date.fromisoformat(period_end)
     filed = _filing_date(record)
     raw = xbrl_facts(archive, document_id)

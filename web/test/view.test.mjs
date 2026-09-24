@@ -24,6 +24,8 @@ test("a first visit shows the full universe", () => {
   assert.equal(v.gaps, "ALL");
   assert.deepEqual(v.sort, { key: "fit", dir: 1 });
   assert.equal(v.minCap, 0);
+  assert.equal(v.maxPe, 0);
+  assert.equal(v.maxPe3, 0);
   assert.equal(v.hideNoApply, false);
   assert.equal(v.scroll, 0);
   assert.equal(hasActiveFilters(v), false);
@@ -33,7 +35,8 @@ test("filters, sort, lens and Enterprising gaps survive a reload", () => {
   saveView({
     q: "steel", lens: "ENTERPRISING", fit: "BLOCKED", gaps: "ONE_GAP",
     profiles: ["OPERATING"], sectors: ["Energy"], venues: ["NYSE"],
-    minMet: 5, minPositiveEps: 9, trackedOnly: true, sort: { key: "eps10", dir: 1 },
+    minMet: 5, minPositiveEps: 9, maxPe: 15, maxPe3: 20,
+    trackedOnly: true, sort: { key: "eps10", dir: 1 },
   });
   const v = loadView();
   assert.equal(v.q, "steel");
@@ -45,6 +48,8 @@ test("filters, sort, lens and Enterprising gaps survive a reload", () => {
   assert.deepEqual(v.venues, ["NYSE"]);
   assert.equal(v.minMet, 5);
   assert.equal(v.minPositiveEps, 9);
+  assert.equal(v.maxPe, 15);
+  assert.equal(v.maxPe3, 20);
   assert.equal(v.trackedOnly, true);
   assert.deepEqual(v.sort, { key: "eps10", dir: 1 });
   assert.equal(v.minCap, 0, "settings that were not touched keep their value");
@@ -88,7 +93,7 @@ test("clear-all values disable every table filter", () => {
     { lens: "DEFENSIVE" }, { fit: "BLOCKED" }, { gaps: "ONE_GAP" },
     { profiles: ["OPERATING"] }, { sectors: ["Energy"] }, { venues: ["NYSE"] },
     { indexes: ["S&P 500"] }, { minCap: 500e6 }, { minMet: 1 },
-    { minPositiveEps: 5 }, { minRoic: 6 }, { trackedOnly: true },
+    { minPositiveEps: 5 }, { maxPe: 15 }, { maxPe3: 20 }, { trackedOnly: true },
     { hideNA: true }, { hideNoApply: true }, { belowNcav: true },
   ]) assert.equal(hasActiveFilters({ ...cleared, ...patch }), true, JSON.stringify(patch));
 });

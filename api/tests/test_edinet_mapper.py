@@ -39,6 +39,15 @@ def _entry(bundle, concept, unit="JPY"):
     return bundle["facts"]["canonical"][concept]["units"][unit][0]
 
 
+def test_missing_period_end_is_an_unsupported_filing(monkeypatch):
+    record = _record("S100WK02", "E00001", "11110")
+    record["periodEnd"] = None
+    monkeypatch.setattr(edinet_mapper, "xbrl_facts", lambda archive, doc: [])
+
+    with pytest.raises(ValueError, match="no period end"):
+        edinet_mapper.build_edinet_companyfacts(record, b"archive", ticker="1111.T")
+
+
 def test_panasonic_ifrs_concepts_keep_filing_evidence_and_prefer_statement(monkeypatch):
     raw = [
         _fact("jpcrp_cor", "RevenueIFRSSummaryOfBusinessResults", 8048722000000),

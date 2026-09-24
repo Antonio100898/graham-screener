@@ -39,6 +39,7 @@ const DESCENDING_BY_DEFAULT = new Set([
   "returns",
 ]);
 const EPS_POSITIVE_FLOORS = [5, 6, 7, 9, 10];
+const PE_MAXIMUMS = [10, 15, 20, 25, 30];
 const LENSES = ["BOTH", "ENTERPRISING", "DEFENSIVE"];
 const FITS = ["ALL", "ALIGNED", "EVIDENCE_INCOMPLETE", "BLOCKED"];
 const PROFILE_NAMES = {
@@ -107,7 +108,8 @@ export default function App() {
   // criteria would now match nothing, so it is clamped to what exists today
   const [minMet, setMinMet] = useState(Math.min(saved.minMet, TOTAL_CRITERIA));
   const [minPositiveEps, setMinPositiveEps] = useState(saved.minPositiveEps);
-  const [minRoic, setMinRoic] = useState(saved.minRoic); // return on capital, 0 = no floor
+  const [maxPe, setMaxPe] = useState(saved.maxPe);       // 0 = no ceiling
+  const [maxPe3, setMaxPe3] = useState(saved.maxPe3);    // 0 = no ceiling
   const [selected, setSelected] = useState(null);
   const [tracked, setTracked] = useState(new Set());
   const [trackingError, setTrackingError] = useState(null);
@@ -157,9 +159,11 @@ export default function App() {
     saveView({
       q, lens, fit, gaps, sectors: [...sectors_], profiles: [...profiles], venues: [...venues],
       indexes: [...idxSel],
-      minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort,
+      minCap, minMet, minPositiveEps, maxPe, maxPe3,
+      hideNA, hideNoApply, belowNcav, trackedOnly, sort,
     });
-  }, [q, lens, fit, gaps, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, sort]);
+  }, [q, lens, fit, gaps, sectors_, profiles, venues, idxSel, minCap, minMet,
+    minPositiveEps, maxPe, maxPe3, hideNA, hideNoApply, belowNcav, trackedOnly, sort]);
 
   useEffect(() => {
     const onScroll = () => saveView({ scroll: window.scrollY });
@@ -231,7 +235,8 @@ export default function App() {
     setMinCap(empty.minCap);
     setMinMet(empty.minMet);
     setMinPositiveEps(empty.minPositiveEps);
-    setMinRoic(empty.minRoic);
+    setMaxPe(empty.maxPe);
+    setMaxPe3(empty.maxPe3);
     setTrackedOnly(empty.trackedOnly);
     setHideNA(empty.hideNA);
     setHideNoApply(empty.hideNoApply);
@@ -330,8 +335,13 @@ export default function App() {
     // Uses the same completed FY(L-9)..FY(L) evidence window shown in the table.
     // Missing years stay missing; they are never silently filled with zero.
     if (minPositiveEps) out = out.filter((r) => r.eps10?.positive >= minPositiveEps);
-    // a company whose return on capital could not be computed cannot clear a floor
-    if (minRoic) out = out.filter((r) => r.roic != null && r.roic >= minRoic);
+    // A maximum multiple is meaningful only for positive earnings. Missing or
+    // non-positive multiples stay missing; they never sneak under the ceiling.
+    if (maxPe) out = out.filter((r) => {
+      const value = byN(r, 1).value;
+      return value != null && value > 0 && value <= maxPe;
+    });
+    if (maxPe3) out = out.filter((r) => r.pe3 != null && r.pe3 > 0 && r.pe3 <= maxPe3);
     if (hideNoApply) out = out.filter((r) => !r.inapplicable);
     if (hideNA) out = out.filter((r) => !r.unjudged);
     if (belowNcav) out = out.filter((r) => r.netNet);
@@ -365,7 +375,9 @@ export default function App() {
       return 0;
     };
     return out.sort((a, b) => compareRows(a, b, sort, val));
-  }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet, minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
+  }, [rows, q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap,
+    minMet, minPositiveEps, maxPe, maxPe3, hideNA, hideNoApply, belowNcav,
+    trackedOnly, tracked]);
 
   // Keep the initial DOM small, then append another page when the reader reaches
   // the end. Filtering/sorting starts a fresh window; the sentinel below handles
@@ -373,7 +385,7 @@ export default function App() {
   useEffect(() => {
     setVisibleCount(300);
   }, [q, lens, fit, gaps, sort, sectors_, profiles, venues, idxSel, minCap, minMet,
-    minPositiveEps, minRoic, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
+    minPositiveEps, maxPe, maxPe3, hideNA, hideNoApply, belowNcav, trackedOnly, tracked]);
   useEffect(() => {
     const node = loadMoreRef.current;
     if (!node || visibleCount >= view.length || typeof IntersectionObserver === "undefined") return undefined;
@@ -447,7 +459,8 @@ export default function App() {
   }, [rows, q]);
   const activeFilters = hasActiveFilters({
     lens, fit, gaps, profiles, sectors: sectors_, venues, indexes: idxSel,
-    minCap, minMet, minPositiveEps, minRoic, trackedOnly, hideNA, hideNoApply, belowNcav,
+    minCap, minMet, minPositiveEps, maxPe, maxPe3,
+    trackedOnly, hideNA, hideNoApply, belowNcav,
   });
 
 
@@ -563,12 +576,19 @@ export default function App() {
             </option>
           ))}
         </select>
-        <select className="mincap" value={minRoic} onChange={(e) => setMinRoic(Number(e.target.value))}
-                title="Reported earnings plus D&A less total capital expenditure, divided by invested capital. This is a conservative floor, not definitive Buffett owner earnings.">
-          <option value={0}>Any all-capex return</option>
-          <option value={15}>15%+ all-capex return</option>
-          <option value={10}>10%+ all-capex return</option>
-          <option value={6}>6%+ all-capex return</option>
+        <select className="mincap" value={maxPe} onChange={(e) => setMaxPe(Number(e.target.value))}
+                title="Maximum positive trailing P/E. Companies with missing or non-positive earnings are excluded when a maximum is selected.">
+          <option value={0}>Any P/E</option>
+          {PE_MAXIMUMS.map((maximum) => (
+            <option key={maximum} value={maximum}>P/E ≤ {maximum}</option>
+          ))}
+        </select>
+        <select className="mincap" value={maxPe3} onChange={(e) => setMaxPe3(Number(e.target.value))}
+                title="Maximum price divided by average EPS for the latest three completed fiscal years. Missing or non-positive averages are excluded.">
+          <option value={0}>Any P/E3</option>
+          {PE_MAXIMUMS.map((maximum) => (
+            <option key={maximum} value={maximum}>P/E3 ≤ {maximum}</option>
+          ))}
         </select>
         <select className="mincap" value={minCap} onChange={(e) => setMinCap(Number(e.target.value))}>
           <option value={0}>Any size</option>
